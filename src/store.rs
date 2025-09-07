@@ -195,6 +195,76 @@ impl PgStore {
         }
         Ok(out)
     }
+
+    pub async fn find_by_subdoc(&self, db: &str, coll: &str, subdoc: &serde_json::Value, limit: i64) -> Result<Vec<bson::Document>> {
+        let schema = schema_name(db);
+        let q_schema = q_ident(&schema);
+        let q_table = q_ident(coll);
+        let sql = format!(
+            "SELECT doc_bson, doc FROM {}.{} WHERE doc @> $1::jsonb ORDER BY id ASC LIMIT $2",
+            q_schema, q_table
+        );
+        let rows = self.client.query(&sql, &[&subdoc, &limit]).await.map_err(err_msg)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let bson_bytes: Option<Vec<u8>> = r.try_get(0).ok();
+            if let Some(bytes) = bson_bytes {
+                if let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes)) {
+                    out.push(doc);
+                    continue;
+                }
+            }
+            let json: serde_json::Value = r.get(1);
+            let b = bson::to_bson(&json).unwrap_or(bson::Bson::Document(bson::Document::new()));
+            let doc = match b { bson::Bson::Document(d) => d, _ => bson::Document::new() };
+            out.push(doc);
+        }
+        Ok(out)
+    }
+
+    pub async fn create_index_single_field(&self, db: &str, coll: &str, name: &str, field: &str, _order: i32, spec: &serde_json::Value) -> Result<()> {
+        // Create an expression index on the extracted text value
+        let schema = schema_name(db);
+        let q_schema = q_ident(&schema);
+        let q_table = q_ident(coll);
+        let q_idx = q_ident(name);
+        let field_escaped = field.replace("'", "''");
+        let expr = format!("(doc->>'{}')", field_escaped);
+        let ddl = format!("CREATE INDEX IF NOT EXISTS {} ON {}.{} {} {}", q_idx, q_schema, q_table, "USING btree", expr);
+        self.client.batch_execute(&ddl).await.map_err(err_msg)?;
+        // Persist metadata
+        self.client
+            .execute(
+                "INSERT INTO mdb_meta.indexes(db, coll, name, spec, sql) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (db, coll, name) DO UPDATE SET spec = EXCLUDED.spec, sql = EXCLUDED.sql",
+                &[&db, &coll, &name, &spec, &ddl],
+            )
+            .await
+            .map_err(err_msg)?;
+        Ok(())
+    }
+
+    pub async fn drop_index(&self, db: &str, coll: &str, name: &str) -> Result<bool> {
+        let schema = schema_name(db);
+        let q_schema = q_ident(&schema);
+        let q_idx = q_ident(name);
+        let ddl = format!("DROP INDEX IF EXISTS {}.{}", q_schema, q_idx);
+        self.client.batch_execute(&ddl).await.map_err(err_msg)?;
+        let n = self
+            .client
+            .execute("DELETE FROM mdb_meta.indexes WHERE db=$1 AND coll=$2 AND name=$3", &[&db, &coll, &name])
+            .await
+            .map_err(err_msg)?;
+        Ok(n > 0)
+    }
+
+    pub async fn list_index_names(&self, db: &str, coll: &str) -> Result<Vec<String>> {
+        let rows = self
+            .client
+            .query("SELECT name FROM mdb_meta.indexes WHERE db=$1 AND coll=$2", &[&db, &coll])
+            .await
+            .map_err(err_msg)?;
+        Ok(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
+    }
 }
 
 fn schema_name(db: &str) -> String {

@@ -146,6 +146,9 @@ async fn handle_command(state: &AppState, db: Option<&str>, mut cmd: Document) -
         "insert" => insert_reply(state, db, &mut cmd).await,
         "find" => find_reply(state, db, &cmd).await,
         "getMore" => get_more_reply(state, &cmd).await,
+        "createIndexes" => create_indexes_reply(state, db, &cmd).await,
+        "dropIndexes" => drop_indexes_reply(state, db, &cmd).await,
+        "killCursors" => kill_cursors_reply(state, &cmd).await,
         _ => {
             tracing::debug!(cmd = ?cmd, "unrecognized command; replying ok:0");
             error_doc(59, format!("Command '{}' not implemented", cmd_name))
@@ -349,6 +352,12 @@ async fn find_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Docum
         let docs: Vec<Document> = if let Some(f) = filter {
             if let Some(idb) = f.get("_id").and_then(|v| id_bytes_bson(v)) {
                 match pg.find_by_id_docs(dbname, coll, &idb, first_batch_limit).await { Ok(v) => v, Err(e) => { tracing::warn!("find_by_id failed: {}", e); Vec::new() } }
+            } else if is_simple_equality_filter(f) {
+                let json = match bson::to_bson(f) {
+                    Ok(b) => match serde_json::to_value(&b) { Ok(v) => v, Err(e) => { tracing::warn!("filter to json failed: {}", e); serde_json::json!({}) } },
+                    Err(e) => { tracing::warn!("bson to_bson failed: {}", e); serde_json::json!({}) }
+                };
+                match pg.find_by_subdoc(dbname, coll, &json, first_batch_limit * 10).await { Ok(v) => v, Err(e) => { tracing::warn!("find_by_subdoc failed: {}", e); Vec::new() } }
             } else {
                 match pg.find_simple_docs(dbname, coll, first_batch_limit * 10).await { Ok(v) => v, Err(e) => { tracing::warn!("find_simple failed: {}", e); Vec::new() } }
             }
@@ -393,6 +402,20 @@ fn id_bytes_bson(b: &bson::Bson) -> Option<Vec<u8>> {
     }
 }
 
+fn is_simple_equality_filter(f: &Document) -> bool {
+    // Accept filters where no key starts with '$' and no nested document has operator keys
+    for (k, v) in f.iter() {
+        if k.starts_with('$') { return false; }
+        if let bson::Bson::Document(d) = v {
+            for (k2, _) in d.iter() {
+                if k2.starts_with('$') { return false; }
+            }
+        }
+        // Arrays and scalars are okay
+    }
+    true
+}
+
 // (second duplicate removed)
 
 static CURSOR_SEQ: AtomicI32 = AtomicI32::new(1000);
@@ -423,4 +446,79 @@ async fn get_more_reply(state: &AppState, cmd: &Document) -> Document {
     let ns = match cmd.get_str("collection") { Ok(c) => c.to_string(), Err(_) => String::new() };
     let empty: Vec<Document> = Vec::new();
     doc! { "cursor": {"id": 0i64, "ns": ns, "nextBatch": empty }, "ok": 1.0 }
+}
+
+async fn kill_cursors_reply(state: &AppState, cmd: &Document) -> Document {
+    let cursors = match cmd.get_array("cursors") { Ok(a) => a, Err(_) => return error_doc(9, "Missing cursors") };
+    let mut killed: Vec<i64> = Vec::new();
+    let mut not_found: Vec<i64> = Vec::new();
+    let mut map = state.cursors.lock().await;
+    for b in cursors {
+        let id_opt = match b {
+            bson::Bson::Int64(v) => Some(*v),
+            bson::Bson::Int32(v) => Some(*v as i64),
+            _ => None,
+        };
+        if let Some(id) = id_opt {
+            if map.remove(&id).is_some() { killed.push(id); } else { not_found.push(id); }
+        }
+    }
+    doc!{
+        "cursorsKilled": killed,
+        "cursorsNotFound": not_found,
+        "cursorsAlive": Vec::<i32>::new(),
+        "cursorsUnknown": Vec::<i32>::new(),
+        "ok": 1.0
+    }
+}
+
+async fn create_indexes_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Document {
+    let dbname = match db { Some(d) => d, None => return error_doc(59, "Missing $db") };
+    let coll = match cmd.get_str("createIndexes") { Ok(c) => c, Err(_) => return error_doc(9, "Invalid createIndexes") };
+    let indexes = match cmd.get_array("indexes") { Ok(a) => a, Err(_) => return error_doc(9, "Missing indexes") };
+    if state.store.is_none() { return error_doc(13, "No storage configured"); }
+    let pg = state.store.as_ref().unwrap();
+    let mut created = 0i32;
+    for spec_b in indexes {
+        let spec_doc = match spec_b { bson::Bson::Document(d) => d, _ => continue };
+        let name = match spec_doc.get_str("name") { Ok(n) => n, Err(_) => continue };
+        let key = match spec_doc.get_document("key") { Ok(k) => k, Err(_) => continue };
+        // Only support single-field for now
+        if key.len() != 1 { continue; }
+        let (field, order_b) = key.iter().next().unwrap();
+        let order = match order_b { bson::Bson::Int32(n) => *n, bson::Bson::Int64(n) => *n as i32, _ => 1 };
+        // Persist a JSON spec of the index
+        let spec_json = match bson::to_bson(spec_doc) {
+            Ok(b) => match serde_json::to_value(&b) { Ok(v) => v, Err(_) => serde_json::json!({}) },
+            Err(_) => serde_json::json!({})
+        };
+        if let Err(e) = pg.create_index_single_field(dbname, coll, name, field, order, &spec_json).await {
+            tracing::warn!("create_index failed: {}", e);
+        } else {
+            created += 1;
+        }
+    }
+    doc! { "createdIndexes": created, "ok": 1.0 }
+}
+
+async fn drop_indexes_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Document {
+    let dbname = match db { Some(d) => d, None => return error_doc(59, "Missing $db") };
+    let coll = match cmd.get_str("dropIndexes") { Ok(c) => c, Err(_) => return error_doc(9, "Invalid dropIndexes") };
+    if state.store.is_none() { return error_doc(13, "No storage configured"); }
+    let pg = state.store.as_ref().unwrap();
+    if let Ok(name) = cmd.get_str("index") {
+        if name == "*" {
+            // drop all metadata-managed indexes for the collection
+            // fetch names
+            // For simplicity, try to drop names known in metadata; ignore failure
+            let names = pg.list_index_names(dbname, coll).await.unwrap_or_default();
+            let mut dropped: Vec<String> = Vec::new();
+            for n in names { if pg.drop_index(dbname, coll, &n).await.unwrap_or(false) { dropped.push(n); } }
+            return doc! { "nIndexesWas": (dropped.len() as i32), "msg": "dropped metadata indexes", "ok": 1.0 };
+        } else {
+            let ok = pg.drop_index(dbname, coll, name).await.unwrap_or(false);
+            return doc! { "nIndexesWas": (if ok { 1 } else { 0 }), "ok": 1.0 };
+        }
+    }
+    error_doc(9, "Missing index name")
 }
