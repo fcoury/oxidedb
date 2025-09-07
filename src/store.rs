@@ -228,9 +228,11 @@ impl PgStore {
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
         let q_idx = q_ident(name);
-        let field_escaped = field.replace("'", "''");
-        let expr = format!("(doc->>'{}')", field_escaped);
-        let ddl = format!("CREATE INDEX IF NOT EXISTS {} ON {}.{} {} {}", q_idx, q_schema, q_table, "USING btree", expr);
+        let field_escaped = field.replace('"', "\"\"");
+        // Expression index requires parentheses around the expression inside the list parentheses
+        // e.g., USING btree ((doc->>'field'))
+        let expr = format!("((doc->>'{}'))", field_escaped);
+        let ddl = format!("CREATE INDEX IF NOT EXISTS {} ON {}.{} USING btree {}", q_idx, q_schema, q_table, expr);
         self.client.batch_execute(&ddl).await.map_err(err_msg)?;
         // Persist metadata
         self.client
@@ -264,6 +266,31 @@ impl PgStore {
             .await
             .map_err(err_msg)?;
         Ok(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
+    }
+
+    pub async fn create_index_compound(&self, db: &str, coll: &str, name: &str, fields: &[(String, i32)], spec: &serde_json::Value) -> Result<()> {
+        let schema = schema_name(db);
+        let q_schema = q_ident(&schema);
+        let q_table = q_ident(coll);
+        let q_idx = q_ident(name);
+        let mut elems: Vec<String> = Vec::with_capacity(fields.len());
+        for (field, order) in fields.iter() {
+            let field_escaped = field.replace('"', "\"\"");
+            let ord = if *order < 0 { "DESC" } else { "ASC" };
+            // expression index elem
+            elems.push(format!("((doc->>'{}')) {}", field_escaped, ord));
+        }
+        let elems_joined = elems.join(", ");
+        let ddl = format!("CREATE INDEX IF NOT EXISTS {} ON {}.{} USING btree ({})", q_idx, q_schema, q_table, elems_joined);
+        self.client.batch_execute(&ddl).await.map_err(err_msg)?;
+        self.client
+            .execute(
+                "INSERT INTO mdb_meta.indexes(db, coll, name, spec, sql) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (db, coll, name) DO UPDATE SET spec = EXCLUDED.spec, sql = EXCLUDED.sql",
+                &[&db, &coll, &name, &spec, &ddl],
+            )
+            .await
+            .map_err(err_msg)?;
+        Ok(())
     }
 }
 

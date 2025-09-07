@@ -483,19 +483,25 @@ async fn create_indexes_reply(state: &AppState, db: Option<&str>, cmd: &Document
         let spec_doc = match spec_b { bson::Bson::Document(d) => d, _ => continue };
         let name = match spec_doc.get_str("name") { Ok(n) => n, Err(_) => continue };
         let key = match spec_doc.get_document("key") { Ok(k) => k, Err(_) => continue };
-        // Only support single-field for now
-        if key.len() != 1 { continue; }
-        let (field, order_b) = key.iter().next().unwrap();
-        let order = match order_b { bson::Bson::Int32(n) => *n, bson::Bson::Int64(n) => *n as i32, _ => 1 };
-        // Persist a JSON spec of the index
         let spec_json = match bson::to_bson(spec_doc) {
             Ok(b) => match serde_json::to_value(&b) { Ok(v) => v, Err(_) => serde_json::json!({}) },
             Err(_) => serde_json::json!({})
         };
-        if let Err(e) = pg.create_index_single_field(dbname, coll, name, field, order, &spec_json).await {
-            tracing::warn!("create_index failed: {}", e);
+        if key.len() == 1 {
+            let (field, order_b) = key.iter().next().unwrap();
+            let order = match order_b { bson::Bson::Int32(n) => *n, bson::Bson::Int64(n) => *n as i32, _ => 1 };
+            if let Err(e) = pg.create_index_single_field(dbname, coll, name, field, order, &spec_json).await {
+                tracing::warn!("create_index(single) failed: {}", e);
+            } else { created += 1; }
         } else {
-            created += 1;
+            let mut fields: Vec<(String, i32)> = Vec::with_capacity(key.len());
+            for (k, v) in key.iter() {
+                let ord = match v { bson::Bson::Int32(n) => *n, bson::Bson::Int64(n) => *n as i32, _ => 1 };
+                fields.push((k.to_string(), ord));
+            }
+            if let Err(e) = pg.create_index_compound(dbname, coll, name, &fields, &spec_json).await {
+                tracing::warn!("create_index(compound) failed: {}", e);
+            } else { created += 1; }
         }
     }
     doc! { "createdIndexes": created, "ok": 1.0 }
