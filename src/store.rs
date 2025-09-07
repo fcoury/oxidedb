@@ -289,7 +289,7 @@ impl PgStore {
         if !eq_obj.is_empty() {
             let json = serde_json::Value::Object(eq_obj);
             let json_str = json.to_string();
-            where_clauses.push(format!("doc @> '{} '::jsonb", escape_single(&json_str)));
+            where_clauses.push(format!("doc @> '{}'::jsonb", escape_single(&json_str)));
         }
 
         let where_sql = if where_clauses.is_empty() {
@@ -318,6 +318,56 @@ impl PgStore {
             out.push(doc);
         }
         Ok(out)
+    }
+
+    /// General find with optional sort and projection pushdown (simple top-level includes).
+    pub async fn find_docs(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: Option<&bson::Document>,
+        sort: Option<&bson::Document>,
+        projection: Option<&bson::Document>,
+        limit: i64,
+    ) -> Result<Vec<bson::Document>> {
+        let schema = schema_name(db);
+        let q_schema = q_ident(&schema);
+        let q_table = q_ident(coll);
+        let where_sql = filter.map(build_where_from_filter).unwrap_or_else(|| "TRUE".to_string());
+        let order_sql = build_order_by(sort);
+
+        if let Some(proj_sql) = projection_pushdown_sql(projection) {
+            let sql = format!(
+                "SELECT {} AS doc FROM {}.{} WHERE {} {} LIMIT {}",
+                proj_sql, q_schema, q_table, where_sql, order_sql, limit
+            );
+            let rows = self.client.query(&sql, &[]).await.map_err(err_msg)?;
+            let mut out = Vec::with_capacity(rows.len());
+            for r in rows {
+                let json: serde_json::Value = r.get(0);
+                out.push(to_doc_from_json(json));
+            }
+            Ok(out)
+        } else {
+            let sql = format!(
+                "SELECT doc_bson, doc FROM {}.{} WHERE {} {} LIMIT {}",
+                q_schema, q_table, where_sql, order_sql, limit
+            );
+            let rows = self.client.query(&sql, &[]).await.map_err(err_msg)?;
+            let mut out = Vec::with_capacity(rows.len());
+            for r in rows {
+                let bson_bytes: Option<Vec<u8>> = r.try_get(0).ok();
+                if let Some(bytes) = bson_bytes {
+                    if let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes)) {
+                        out.push(doc);
+                        continue;
+                    }
+                }
+                let json: serde_json::Value = r.get(1);
+                out.push(to_doc_from_json(json));
+            }
+            Ok(out)
+        }
     }
     pub async fn find_by_subdoc(&self, db: &str, coll: &str, subdoc: &serde_json::Value, limit: i64) -> Result<Vec<bson::Document>> {
         let schema = schema_name(db);
@@ -476,4 +526,101 @@ fn bson_to_json_value(v: &bson::Bson) -> Option<serde_json::Value> {
         bson::Bson::String(s) => Some(serde_json::Value::String(s.clone())),
         _ => None,
     }
+}
+
+fn build_where_from_filter(filter: &bson::Document) -> String {
+    let mut where_clauses: Vec<String> = Vec::new();
+    let mut eq_obj = serde_json::Map::new();
+    for (k, v) in filter.iter() {
+        if k == "_id" { continue; }
+        match v {
+            bson::Bson::Document(d) => {
+                for (op, val) in d.iter() {
+                    match op.as_str() {
+                        "$exists" => {
+                            let exists = matches!(val, bson::Bson::Boolean(true));
+                            let clause = if exists { format!("doc ? '{}'", escape_single(k)) } else { format!("NOT (doc ? '{}')", escape_single(k)) };
+                            where_clauses.push(clause);
+                        }
+                        "$in" => {
+                            if let bson::Bson::Array(arr) = val {
+                                if arr.is_empty() { where_clauses.push("FALSE".to_string()); continue; }
+                                if all_numeric(arr) {
+                                    let list = join_numeric_array(arr);
+                                    where_clauses.push(format!("((doc->>'{}')::double precision) = ANY(ARRAY[{}]::double precision[])", escape_single(k), list));
+                                } else if all_strings(arr) {
+                                    let list = join_string_array(arr);
+                                    where_clauses.push(format!("(doc->>'{}') = ANY(ARRAY[{}]::text[])", escape_single(k), list));
+                                }
+                            }
+                        }
+                        "$gt" | "$gte" | "$lt" | "$lte" => {
+                            let op_sql = match op.as_str() { "$gt" => ">", "$gte" => ">=", "$lt" => "<", "$lte" => "<=", _ => unreachable!() };
+                            if let Some(num) = as_f64(val) {
+                                where_clauses.push(format!("((doc->>'{}')::double precision) {} {}", escape_single(k), op_sql, num));
+                            } else if let Some(s) = val.as_str() {
+                                let val_sql = format!("'{}'", escape_single(s));
+                                where_clauses.push(format!("(doc->>'{}') {} {}", escape_single(k), op_sql, val_sql));
+                            }
+                        }
+                        "$eq" => {
+                            if let Some(json_val) = bson_to_json_value(val) { eq_obj.insert(k.clone(), json_val); }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {
+                if let Some(json_val) = bson_to_json_value(v) { eq_obj.insert(k.clone(), json_val); }
+            }
+        }
+    }
+    if !eq_obj.is_empty() {
+        let json = serde_json::Value::Object(eq_obj);
+        let json_str = json.to_string();
+        where_clauses.push(format!("doc @> '{}'::jsonb", escape_single(&json_str)));
+    }
+    if where_clauses.is_empty() { String::from("TRUE") } else { where_clauses.join(" AND ") }
+}
+
+fn build_order_by(sort: Option<&bson::Document>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut has_id = false;
+    if let Some(spec) = sort {
+        for (k, v) in spec.iter() {
+            let dir = match v { bson::Bson::Int32(n) => *n, bson::Bson::Int64(n) => *n as i32, bson::Bson::Double(f) => if *f < 0.0 { -1 } else { 1 }, _ => 1 };
+            let ord = if dir < 0 { "DESC" } else { "ASC" };
+            if k == "_id" { has_id = true; parts.push(format!("id {}", ord)); }
+            else { parts.push(format!("(doc->>'{}') {}", escape_single(k), ord)); }
+        }
+    }
+    if !has_id { parts.push("id ASC".to_string()); }
+    format!("ORDER BY {}", parts.join(", "))
+}
+
+fn projection_pushdown_sql(projection: Option<&bson::Document>) -> Option<String> {
+    let proj = projection?;
+    if proj.is_empty() { return None; }
+    // only allow inclusive projections with possible _id exclusion
+    let mut include_fields: Vec<String> = Vec::new();
+    let mut include_id = true;
+    for (k, v) in proj.iter() {
+        if k == "_id" {
+            match v { bson::Bson::Int32(n) if *n == 0 => include_id = false, bson::Bson::Boolean(b) if !*b => include_id = false, _ => {} }
+            continue;
+        }
+        let on = match v { bson::Bson::Int32(n) => *n != 0, bson::Bson::Boolean(b) => *b, _ => false };
+        if on { include_fields.push(k.clone()); } else { return None; }
+    }
+    if include_fields.is_empty() && include_id { return None; }
+    let mut elems: Vec<String> = Vec::new();
+    if include_id { elems.push("'_id', doc->'_id'".to_string()); }
+    for f in include_fields { elems.push(format!("'{}', doc->'{}'", escape_single(&f), escape_single(&f))); }
+    if elems.is_empty() { return None; }
+    Some(format!("jsonb_build_object({})", elems.join(", ")))
+}
+
+fn to_doc_from_json(json: serde_json::Value) -> bson::Document {
+    let b = bson::to_bson(&json).unwrap_or(bson::Bson::Document(bson::Document::new()));
+    match b { bson::Bson::Document(d) => d, _ => bson::Document::new() }
 }

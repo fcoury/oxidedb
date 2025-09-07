@@ -349,14 +349,11 @@ async fn find_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Docum
     let filter = cmd.get_document("filter").ok();
 
     if let Some(ref pg) = state.store {
-        let docs: Vec<Document> = if let Some(f) = filter {
-            if let Some(idb) = f.get("_id").and_then(|v| id_bytes_bson(v)) {
-                match pg.find_by_id_docs(dbname, coll, &idb, first_batch_limit).await { Ok(v) => v, Err(e) => { tracing::warn!("find_by_id failed: {}", e); Vec::new() } }
-            } else {
-                match pg.find_with_top_level_filter(dbname, coll, f, first_batch_limit * 10).await { Ok(v) => v, Err(e) => { tracing::warn!("find_with_top_level_filter failed: {}", e); Vec::new() } }
-            }
-        } else {
-            match pg.find_simple_docs(dbname, coll, first_batch_limit * 10).await { Ok(v) => v, Err(e) => { tracing::warn!("find_simple failed: {}", e); Vec::new() } }
+        let sort = cmd.get_document("sort").ok();
+        let projection = cmd.get_document("projection").ok();
+        let docs: Vec<Document> = match pg.find_docs(dbname, coll, filter, sort, projection, first_batch_limit * 10).await {
+            Ok(v) => v,
+            Err(e) => { tracing::warn!("find_docs failed: {}", e); Vec::new() }
         };
 
         let mut first_batch: Vec<Document> = Vec::new();
