@@ -359,12 +359,13 @@ impl PgStore {
                 let bson_bytes: Option<Vec<u8>> = r.try_get(0).ok();
                 if let Some(bytes) = bson_bytes {
                     if let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes)) {
-                        out.push(doc);
+                        out.push(if let Some(p) = projection { project_document(&doc, p) } else { doc });
                         continue;
                     }
                 }
                 let json: serde_json::Value = r.get(1);
-                out.push(to_doc_from_json(json));
+                let d = to_doc_from_json(json);
+                out.push(if let Some(p) = projection { project_document(&d, p) } else { d });
             }
             Ok(out)
         }
@@ -651,4 +652,94 @@ fn json_literal_from_bson(v: &bson::Bson) -> Option<String> {
         bson::Bson::String(s) => Some(format!("{}", serde_json::to_string(s).ok()?)),
         _ => None,
     }
+}
+
+fn project_document(doc: &bson::Document, projection: &bson::Document) -> bson::Document {
+    // Determine include/exclude mode
+    let mut include_mode = false;
+    let mut include_id = true;
+    for (k, v) in projection.iter() {
+        if k == "_id" {
+            match v { bson::Bson::Int32(n) if *n == 0 => include_id = false, bson::Bson::Boolean(b) if !*b => include_id = false, _ => {} }
+        } else if matches!(v, bson::Bson::Int32(n) if *n != 0) || matches!(v, bson::Bson::Boolean(true)) {
+            include_mode = true;
+        }
+    }
+
+    if include_mode {
+        let mut out = bson::Document::new();
+        if include_id {
+            if let Some(idv) = doc.get("_id").cloned() { out.insert("_id", idv); }
+        }
+        for (k, v) in projection.iter() {
+            if k == "_id" { continue; }
+            let on = match v { bson::Bson::Int32(n) => *n != 0, bson::Bson::Boolean(b) => *b, _ => false };
+            if on {
+                if let Some(val) = get_path(doc, k) { set_path(&mut out, k, val); }
+            }
+        }
+        out
+    } else {
+        // Exclusion mode: start with full doc and remove fields
+        let mut out = doc.clone();
+        for (k, v) in projection.iter() {
+            if k == "_id" { continue; }
+            let off = match v { bson::Bson::Int32(n) => *n == 0, bson::Bson::Boolean(b) => !*b, _ => false };
+            if off { remove_path(&mut out, k); }
+        }
+        if !include_id { out.remove("_id"); }
+        out
+    }
+}
+
+fn get_path(doc: &bson::Document, path: &str) -> Option<bson::Bson> {
+    let mut cur = bson::Bson::Document(doc.clone());
+    let mut segs = path.split('.').peekable();
+    while let Some(seg) = segs.next() {
+        match cur {
+            bson::Bson::Document(ref d) => {
+                if let Some(v) = d.get(seg) {
+                    if segs.peek().is_some() {
+                        cur = v.clone();
+                    } else {
+                        return Some(v.clone());
+                    }
+                } else { return None; }
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn set_path(doc: &mut bson::Document, path: &str, value: bson::Bson) {
+    let mut segments: Vec<&str> = path.split('.').collect();
+    if segments.is_empty() { return; }
+    let last = segments.pop().unwrap();
+    let mut cur = doc;
+    for seg in segments {
+        if !cur.contains_key(seg) {
+            cur.insert(seg, bson::Bson::Document(bson::Document::new()));
+        }
+        let entry = cur.get_mut(seg).unwrap();
+        if !entry.as_document().is_some() {
+            *entry = bson::Bson::Document(bson::Document::new());
+        }
+        cur = entry.as_document_mut().unwrap();
+    }
+    cur.insert(last, value);
+}
+
+fn remove_path(doc: &mut bson::Document, path: &str) {
+    let mut segments: Vec<&str> = path.split('.').collect();
+    if segments.is_empty() { return; }
+    let last = segments.pop().unwrap();
+    let mut cur = doc;
+    for seg in segments {
+        match cur.get_mut(seg) {
+            Some(bson::Bson::Document(d)) => { cur = d; }
+            _ => return,
+        }
+    }
+    cur.remove(last);
 }
