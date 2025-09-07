@@ -603,8 +603,15 @@ fn build_order_by(sort: Option<&bson::Document>) -> String {
             let ord = if dir < 0 { "DESC" } else { "ASC" };
             if k == "_id" { has_id = true; parts.push(format!("id {}", ord)); }
             else {
-                // Use JSONPath value as text for ordering; keep simple cast
-                parts.push(format!("(doc->>'{}') {}", escape_single(k), ord));
+                let f = escape_single(k);
+                // Heuristic: numbers before strings, then numeric ASC/DESC, then text ASC/DESC
+                let numeric_re = format!("(doc->>'{}') ~ '^[+-]?[0-9]+(\\.[0-9]+)?$'", f);
+                let num_first = format!("(CASE WHEN {} THEN 0 ELSE 1 END) ASC", numeric_re);
+                let num_val = format!("(CASE WHEN {} THEN (doc->>'{}')::double precision END) {}", numeric_re, f, ord);
+                let text_val = format!("(doc->>'{}') {}", f, ord);
+                parts.push(num_first);
+                parts.push(num_val);
+                parts.push(text_val);
             }
         }
     }

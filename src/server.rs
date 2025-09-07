@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use bson::{doc, Document};
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 static REQ_ID: AtomicI32 = AtomicI32::new(1);
 
@@ -18,6 +18,7 @@ struct CursorEntry {
     ns: String,
     docs: Vec<Document>,
     pos: usize,
+    last_access: Instant,
 }
 
 pub struct AppState {
@@ -48,6 +49,17 @@ pub async fn run(cfg: Config) -> Result<()> {
         AppState { store: None, started_at: Instant::now(), cursors: Mutex::new(HashMap::new()) }
     };
     let state = Arc::new(state);
+
+    // Spawn cursor sweeper
+    let ttl = Duration::from_secs(cfg.cursor_timeout_secs.unwrap_or(300));
+    let sweep_interval = Duration::from_secs(cfg.cursor_sweep_interval_secs.unwrap_or(30));
+    let sweeper_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(sweep_interval).await;
+            prune_cursors_once(&sweeper_state, ttl).await;
+        }
+    });
 
     loop {
         let (socket, addr) = listener.accept().await?;
@@ -401,7 +413,7 @@ static CURSOR_SEQ: AtomicI32 = AtomicI32::new(1000);
 
 async fn new_cursor(state: &AppState, ns: String, docs: Vec<Document>) -> i64 {
     let id = CURSOR_SEQ.fetch_add(1, Ordering::Relaxed) as i64;
-    let entry = CursorEntry { ns, docs, pos: 0 };
+    let entry = CursorEntry { ns, docs, pos: 0, last_access: Instant::now() };
     let mut map = state.cursors.lock().await;
     map.insert(id, entry);
     id
@@ -418,6 +430,7 @@ async fn get_more_reply(state: &AppState, cmd: &Document) -> Document {
         let mut next_batch = Vec::with_capacity(end - start);
         for d in &entry.docs[start..end] { next_batch.push(d.clone()); }
         entry.pos = end;
+        entry.last_access = Instant::now();
         let id = if entry.pos >= entry.docs.len() { map.remove(&cursor_id); 0i64 } else { cursor_id };
         return doc! { "cursor": {"id": id, "ns": ns, "nextBatch": next_batch}, "ok": 1.0 };
     }
@@ -425,6 +438,34 @@ async fn get_more_reply(state: &AppState, cmd: &Document) -> Document {
     let ns = match cmd.get_str("collection") { Ok(c) => c.to_string(), Err(_) => String::new() };
     let empty: Vec<Document> = Vec::new();
     doc! { "cursor": {"id": 0i64, "ns": ns, "nextBatch": empty }, "ok": 1.0 }
+}
+
+async fn prune_cursors_once(state: &AppState, ttl: Duration) {
+    let now = Instant::now();
+    let mut map = state.cursors.lock().await;
+    let before = map.len();
+    map.retain(|_, e| now.duration_since(e.last_access) <= ttl);
+    let after = map.len();
+    if before != after {
+        tracing::debug!(removed = before - after, remaining = after, "pruned idle cursors");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn prune_removes_idle_cursors() {
+        let state = AppState { store: None, started_at: Instant::now(), cursors: Mutex::new(HashMap::new()) };
+        {
+            let mut map = state.cursors.lock().await;
+            map.insert(1, CursorEntry { ns: "db.coll".into(), docs: vec![], pos: 0, last_access: Instant::now() - Duration::from_secs(100) });
+        }
+        prune_cursors_once(&state, Duration::from_secs(10)).await;
+        let map = state.cursors.lock().await;
+        assert!(map.is_empty());
+    }
 }
 
 async fn kill_cursors_reply(state: &AppState, cmd: &Document) -> Document {

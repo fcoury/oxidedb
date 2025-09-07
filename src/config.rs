@@ -7,6 +7,8 @@ pub struct Config {
     pub listen_addr: String,
     pub postgres_url: Option<String>,
     pub log_level: Option<String>,
+    pub cursor_timeout_secs: Option<u64>,
+    pub cursor_sweep_interval_secs: Option<u64>,
 }
 
 impl Default for Config {
@@ -16,6 +18,8 @@ impl Default for Config {
             listen_addr: "127.0.0.1:27017".to_string(),
             postgres_url: None,
             log_level: None,
+            cursor_timeout_secs: Some(300),
+            cursor_sweep_interval_secs: Some(30),
         }
     }
 }
