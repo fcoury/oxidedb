@@ -196,6 +196,129 @@ impl PgStore {
         Ok(out)
     }
 
+    /// Limited top-level filter support: equality, $gt, $gte, $lt, $lte, $in, $exists (true/false)
+    /// Comparisons operate on strings or double precision numbers based on value type.
+    pub async fn find_with_top_level_filter(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &bson::Document,
+        limit: i64,
+    ) -> Result<Vec<bson::Document>> {
+        let schema = schema_name(db);
+        let q_schema = q_ident(&schema);
+        let q_table = q_ident(coll);
+
+        let mut where_clauses: Vec<String> = Vec::new();
+        let mut eq_obj = serde_json::Map::new();
+
+        for (k, v) in filter.iter() {
+            // skip _id here; server handles id fast path
+            if k == "_id" { continue; }
+            match v {
+                bson::Bson::Document(d) => {
+                    // operators
+                    for (op, val) in d.iter() {
+                        match op.as_str() {
+                            "$exists" => {
+                                let exists = matches!(val, bson::Bson::Boolean(true));
+                                let clause = if exists {
+                                    format!("doc ? '{}'", escape_single(k))
+                                } else {
+                                    format!("NOT (doc ? '{}')", escape_single(k))
+                                };
+                                where_clauses.push(clause);
+                            }
+                            "$in" => {
+                                if let bson::Bson::Array(arr) = val {
+                                    if arr.is_empty() { where_clauses.push("FALSE".to_string()); continue; }
+                                    if all_numeric(arr) {
+                                        let list = join_numeric_array(arr);
+                                        where_clauses.push(format!(
+                                            "((doc->>'{}')::double precision) = ANY(ARRAY[{}]::double precision[])",
+                                            escape_single(k), list
+                                        ));
+                                    } else if all_strings(arr) {
+                                        let list = join_string_array(arr);
+                                        where_clauses.push(format!(
+                                            "(doc->>'{}') = ANY(ARRAY[{}]::text[])",
+                                            escape_single(k), list
+                                        ));
+                                    }
+                                }
+                            }
+                            "$gt" | "$gte" | "$lt" | "$lte" => {
+                                let (op_sql, _is_inclusive) = match op.as_str() {
+                                    "$gt" => (">", false),
+                                    "$gte" => (">=", true),
+                                    "$lt" => ("<", false),
+                                    "$lte" => ("<=", true),
+                                    _ => unreachable!(),
+                                };
+                                if let Some(num) = as_f64(val) {
+                                    where_clauses.push(format!(
+                                        "((doc->>'{}')::double precision) {} {}",
+                                        escape_single(k), op_sql, num
+                                    ));
+                                } else if let Some(s) = val.as_str() {
+                                    let val_sql = format!("'{}'", escape_single(s));
+                                    where_clauses.push(format!(
+                                        "(doc->>'{}') {} {}",
+                                        escape_single(k), op_sql, val_sql
+                                    ));
+                                }
+                            }
+                            "$eq" => {
+                                if let Some(json_val) = bson_to_json_value(val) {
+                                    eq_obj.insert(k.clone(), json_val);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                // equality on scalar
+                _ => {
+                    if let Some(json_val) = bson_to_json_value(v) {
+                        eq_obj.insert(k.clone(), json_val);
+                    }
+                }
+            }
+        }
+
+        if !eq_obj.is_empty() {
+            let json = serde_json::Value::Object(eq_obj);
+            let json_str = json.to_string();
+            where_clauses.push(format!("doc @> '{} '::jsonb", escape_single(&json_str)));
+        }
+
+        let where_sql = if where_clauses.is_empty() {
+            String::from("TRUE")
+        } else {
+            where_clauses.join(" AND ")
+        };
+
+        let sql = format!(
+            "SELECT doc_bson, doc FROM {}.{} WHERE {} ORDER BY id ASC LIMIT {}",
+            q_schema, q_table, where_sql, limit
+        );
+        let rows = self.client.query(&sql, &[]).await.map_err(err_msg)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let bson_bytes: Option<Vec<u8>> = r.try_get(0).ok();
+            if let Some(bytes) = bson_bytes {
+                if let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes)) {
+                    out.push(doc);
+                    continue;
+                }
+            }
+            let json: serde_json::Value = r.get(1);
+            let b = bson::to_bson(&json).unwrap_or(bson::Bson::Document(bson::Document::new()));
+            let doc = match b { bson::Bson::Document(d) => d, _ => bson::Document::new() };
+            out.push(doc);
+        }
+        Ok(out)
+    }
     pub async fn find_by_subdoc(&self, db: &str, coll: &str, subdoc: &serde_json::Value, limit: i64) -> Result<Vec<bson::Document>> {
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
@@ -309,4 +432,48 @@ fn q_string(s: &str) -> String {
 
 fn err_msg<E: std::fmt::Display>(e: E) -> Error {
     Error::Msg(e.to_string())
+}
+
+fn escape_single(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "''")
+}
+
+fn all_numeric(arr: &Vec<bson::Bson>) -> bool { arr.iter().all(|v| as_f64(v).is_some()) }
+fn all_strings(arr: &Vec<bson::Bson>) -> bool { arr.iter().all(|v| matches!(v, bson::Bson::String(_))) }
+
+fn join_numeric_array(arr: &Vec<bson::Bson>) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(arr.len());
+    for v in arr {
+        parts.push(as_f64(v).unwrap().to_string());
+    }
+    parts.join(",")
+}
+
+fn join_string_array(arr: &Vec<bson::Bson>) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(arr.len());
+    for v in arr {
+        if let bson::Bson::String(s) = v { parts.push(format!("'{}'", escape_single(s))); }
+    }
+    parts.join(",")
+}
+
+fn as_f64(v: &bson::Bson) -> Option<f64> {
+    match v {
+        bson::Bson::Int32(n) => Some(*n as f64),
+        bson::Bson::Int64(n) => Some(*n as f64),
+        bson::Bson::Double(n) => Some(*n),
+        _ => None,
+    }
+}
+
+fn bson_to_json_value(v: &bson::Bson) -> Option<serde_json::Value> {
+    match v {
+        bson::Bson::Null => Some(serde_json::Value::Null),
+        bson::Bson::Boolean(b) => Some(serde_json::Value::Bool(*b)),
+        bson::Bson::Int32(n) => Some(serde_json::Value::Number((*n).into())),
+        bson::Bson::Int64(n) => serde_json::Number::from_f64(*n as f64).map(serde_json::Value::Number),
+        bson::Bson::Double(n) => serde_json::Number::from_f64(*n).map(serde_json::Value::Number),
+        bson::Bson::String(s) => Some(serde_json::Value::String(s.clone())),
+        _ => None,
+    }
 }

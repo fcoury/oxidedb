@@ -352,14 +352,8 @@ async fn find_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Docum
         let docs: Vec<Document> = if let Some(f) = filter {
             if let Some(idb) = f.get("_id").and_then(|v| id_bytes_bson(v)) {
                 match pg.find_by_id_docs(dbname, coll, &idb, first_batch_limit).await { Ok(v) => v, Err(e) => { tracing::warn!("find_by_id failed: {}", e); Vec::new() } }
-            } else if is_simple_equality_filter(f) {
-                let json = match bson::to_bson(f) {
-                    Ok(b) => match serde_json::to_value(&b) { Ok(v) => v, Err(e) => { tracing::warn!("filter to json failed: {}", e); serde_json::json!({}) } },
-                    Err(e) => { tracing::warn!("bson to_bson failed: {}", e); serde_json::json!({}) }
-                };
-                match pg.find_by_subdoc(dbname, coll, &json, first_batch_limit * 10).await { Ok(v) => v, Err(e) => { tracing::warn!("find_by_subdoc failed: {}", e); Vec::new() } }
             } else {
-                match pg.find_simple_docs(dbname, coll, first_batch_limit * 10).await { Ok(v) => v, Err(e) => { tracing::warn!("find_simple failed: {}", e); Vec::new() } }
+                match pg.find_with_top_level_filter(dbname, coll, f, first_batch_limit * 10).await { Ok(v) => v, Err(e) => { tracing::warn!("find_with_top_level_filter failed: {}", e); Vec::new() } }
             }
         } else {
             match pg.find_simple_docs(dbname, coll, first_batch_limit * 10).await { Ok(v) => v, Err(e) => { tracing::warn!("find_simple failed: {}", e); Vec::new() } }
@@ -402,19 +396,7 @@ fn id_bytes_bson(b: &bson::Bson) -> Option<Vec<u8>> {
     }
 }
 
-fn is_simple_equality_filter(f: &Document) -> bool {
-    // Accept filters where no key starts with '$' and no nested document has operator keys
-    for (k, v) in f.iter() {
-        if k.starts_with('$') { return false; }
-        if let bson::Bson::Document(d) = v {
-            for (k2, _) in d.iter() {
-                if k2.starts_with('$') { return false; }
-            }
-        }
-        // Arrays and scalars are okay
-    }
-    true
-}
+// removed: is_simple_equality_filter; find_with_top_level_filter handles equality and ops now
 
 // (second duplicate removed)
 
