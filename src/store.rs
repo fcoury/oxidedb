@@ -530,55 +530,55 @@ fn bson_to_json_value(v: &bson::Bson) -> Option<serde_json::Value> {
 
 fn build_where_from_filter(filter: &bson::Document) -> String {
     let mut where_clauses: Vec<String> = Vec::new();
-    let mut eq_obj = serde_json::Map::new();
     for (k, v) in filter.iter() {
         if k == "_id" { continue; }
+        let path = jsonpath_path(k);
         match v {
             bson::Bson::Document(d) => {
                 for (op, val) in d.iter() {
                     match op.as_str() {
                         "$exists" => {
-                            let exists = matches!(val, bson::Bson::Boolean(true));
-                            let clause = if exists { format!("doc ? '{}'", escape_single(k)) } else { format!("NOT (doc ? '{}')", escape_single(k)) };
+                            let clause = if matches!(val, bson::Bson::Boolean(true)) {
+                                format!("jsonb_path_exists(doc, '{}')", escape_single(&path))
+                            } else {
+                                format!("NOT jsonb_path_exists(doc, '{}')", escape_single(&path))
+                            };
                             where_clauses.push(clause);
                         }
                         "$in" => {
                             if let bson::Bson::Array(arr) = val {
-                                if arr.is_empty() { where_clauses.push("FALSE".to_string()); continue; }
-                                if all_numeric(arr) {
-                                    let list = join_numeric_array(arr);
-                                    where_clauses.push(format!("((doc->>'{}')::double precision) = ANY(ARRAY[{}]::double precision[])", escape_single(k), list));
-                                } else if all_strings(arr) {
-                                    let list = join_string_array(arr);
-                                    where_clauses.push(format!("(doc->>'{}') = ANY(ARRAY[{}]::text[])", escape_single(k), list));
+                                let mut preds: Vec<String> = Vec::new();
+                                for item in arr {
+                                    if let Some(lit) = json_literal_from_bson(item) { preds.push(format!("@ == {}", lit)); }
+                                }
+                                if preds.is_empty() { where_clauses.push("FALSE".to_string()); }
+                                else {
+                                    let predicate = preds.join(" || ");
+                                    where_clauses.push(format!("jsonb_path_exists(doc, '{} ? ({}))", escape_single(&path), predicate));
                                 }
                             }
                         }
                         "$gt" | "$gte" | "$lt" | "$lte" => {
                             let op_sql = match op.as_str() { "$gt" => ">", "$gte" => ">=", "$lt" => "<", "$lte" => "<=", _ => unreachable!() };
-                            if let Some(num) = as_f64(val) {
-                                where_clauses.push(format!("((doc->>'{}')::double precision) {} {}", escape_single(k), op_sql, num));
-                            } else if let Some(s) = val.as_str() {
-                                let val_sql = format!("'{}'", escape_single(s));
-                                where_clauses.push(format!("(doc->>'{}') {} {}", escape_single(k), op_sql, val_sql));
+                            if let Some(lit) = json_literal_from_bson(val) {
+                                where_clauses.push(format!("jsonb_path_exists(doc, '{} ? (@ {} {}))", escape_single(&path), op_sql, lit));
                             }
                         }
                         "$eq" => {
-                            if let Some(json_val) = bson_to_json_value(val) { eq_obj.insert(k.clone(), json_val); }
+                            if let Some(lit) = json_literal_from_bson(val) {
+                                where_clauses.push(format!("jsonb_path_exists(doc, '{} ? (@ == {}))", escape_single(&path), lit));
+                            }
                         }
                         _ => {}
                     }
                 }
             }
             _ => {
-                if let Some(json_val) = bson_to_json_value(v) { eq_obj.insert(k.clone(), json_val); }
+                if let Some(lit) = json_literal_from_bson(v) {
+                    where_clauses.push(format!("jsonb_path_exists(doc, '{} ? (@ == {}))", escape_single(&path), lit));
+                }
             }
         }
-    }
-    if !eq_obj.is_empty() {
-        let json = serde_json::Value::Object(eq_obj);
-        let json_str = json.to_string();
-        where_clauses.push(format!("doc @> '{}'::jsonb", escape_single(&json_str)));
     }
     if where_clauses.is_empty() { String::from("TRUE") } else { where_clauses.join(" AND ") }
 }
@@ -591,7 +591,10 @@ fn build_order_by(sort: Option<&bson::Document>) -> String {
             let dir = match v { bson::Bson::Int32(n) => *n, bson::Bson::Int64(n) => *n as i32, bson::Bson::Double(f) => if *f < 0.0 { -1 } else { 1 }, _ => 1 };
             let ord = if dir < 0 { "DESC" } else { "ASC" };
             if k == "_id" { has_id = true; parts.push(format!("id {}", ord)); }
-            else { parts.push(format!("(doc->>'{}') {}", escape_single(k), ord)); }
+            else {
+                // Use JSONPath value as text for ordering; keep simple cast
+                parts.push(format!("(doc->>'{}') {}", escape_single(k), ord));
+            }
         }
     }
     if !has_id { parts.push("id ASC".to_string()); }
@@ -623,4 +626,29 @@ fn projection_pushdown_sql(projection: Option<&bson::Document>) -> Option<String
 fn to_doc_from_json(json: serde_json::Value) -> bson::Document {
     let b = bson::to_bson(&json).unwrap_or(bson::Bson::Document(bson::Document::new()));
     match b { bson::Bson::Document(d) => d, _ => bson::Document::new() }
+}
+
+fn jsonpath_path(key: &str) -> String {
+    // Build $."a"."b" style path for dotted keys
+    let mut out = String::from("$");
+    for seg in key.split('.') {
+        let esc = seg.replace('"', "\\\"");
+        out.push_str(".\"");
+        out.push_str(&esc);
+        out.push('"');
+    }
+    out
+}
+
+fn json_literal_from_bson(v: &bson::Bson) -> Option<String> {
+    // Only simple scalar types for now
+    match v {
+        bson::Bson::Null => Some("null".to_string()),
+        bson::Bson::Boolean(b) => Some(if *b { "true".into() } else { "false".into() }),
+        bson::Bson::Int32(n) => Some(n.to_string()),
+        bson::Bson::Int64(n) => Some(n.to_string()),
+        bson::Bson::Double(n) => Some(n.to_string()),
+        bson::Bson::String(s) => Some(format!("{}", serde_json::to_string(s).ok()?)),
+        _ => None,
+    }
 }
