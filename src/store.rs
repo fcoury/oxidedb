@@ -538,6 +538,16 @@ fn build_where_from_filter(filter: &bson::Document) -> String {
             bson::Bson::Document(d) => {
                 for (op, val) in d.iter() {
                     match op.as_str() {
+                        "$elemMatch" => {
+                            if let bson::Bson::Document(em) = val {
+                                if let Some(pred) = build_elem_match_pred(&path, em) {
+                                    where_clauses.push(format!(
+                                        "jsonb_path_exists(doc, '{}[*] ? ({}))",
+                                        escape_single(&path), pred
+                                    ));
+                                }
+                            }
+                        }
                         "$exists" => {
                             let clause = if matches!(val, bson::Bson::Boolean(true)) {
                                 format!("jsonb_path_exists(doc, '{}')", escape_single(&path))
@@ -651,6 +661,57 @@ fn json_literal_from_bson(v: &bson::Bson) -> Option<String> {
         bson::Bson::Double(n) => Some(n.to_string()),
         bson::Bson::String(s) => Some(format!("{}", serde_json::to_string(s).ok()?)),
         _ => None,
+    }
+}
+
+fn build_elem_match_pred(path: &str, em: &bson::Document) -> Option<String> {
+    // Two forms supported:
+    // 1) Scalar operators on array of scalars: { $gt: 5 }
+    // 2) Equality/ops on subdocument fields: { x: 2, y: { $gt: 3 } }
+    if em.iter().all(|(k, _)| k.starts_with('$')) {
+        // scalar ops on @
+        let mut clauses: Vec<String> = Vec::new();
+        for (op, val) in em.iter() {
+            let (sql_op, lit) = match op.as_str() {
+                "$gt" => (">", json_literal_from_bson(val)),
+                "$gte" => (">=", json_literal_from_bson(val)),
+                "$lt" => ("<", json_literal_from_bson(val)),
+                "$lte" => ("<=", json_literal_from_bson(val)),
+                "$eq" => ("==", json_literal_from_bson(val)),
+                _ => ("", None),
+            };
+            if sql_op.is_empty() || lit.is_none() { continue; }
+            clauses.push(format!("@ {} {}", sql_op, lit.unwrap()));
+        }
+        if clauses.is_empty() { None } else { Some(clauses.join(" && ")) }
+    } else {
+        // subdocument fields
+        let mut clauses: Vec<String> = Vec::new();
+        for (k, v) in em.iter() {
+            let attr = format!("@.\"{}\"", k.replace('"', "\\\""));
+            match v {
+                bson::Bson::Document(d) => {
+                    for (op, val) in d.iter() {
+                        let (sql_op, lit) = match op.as_str() {
+                            "$gt" => (">", json_literal_from_bson(val)),
+                            "$gte" => (">=", json_literal_from_bson(val)),
+                            "$lt" => ("<", json_literal_from_bson(val)),
+                            "$lte" => ("<=", json_literal_from_bson(val)),
+                            "$eq" => ("==", json_literal_from_bson(val)),
+                            _ => ("", None),
+                        };
+                        if sql_op.is_empty() || lit.is_none() { continue; }
+                        clauses.push(format!("{} {} {}", attr, sql_op, lit.unwrap()));
+                    }
+                }
+                _ => {
+                    if let Some(lit) = json_literal_from_bson(v) {
+                        clauses.push(format!("{} == {}", attr, lit));
+                    }
+                }
+            }
+        }
+        if clauses.is_empty() { None } else { Some(clauses.join(" && ")) }
     }
 }
 
