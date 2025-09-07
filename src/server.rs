@@ -1,64 +1,426 @@
 use crate::config::Config;
-use crate::error::{Error, Result};
-use crate::protocol::{MessageHeader, OP_MSG};
+use crate::error::Result;
+use crate::protocol::{decode_op_msg_section0, decode_op_query, encode_op_msg, encode_op_reply, MessageHeader, OP_MSG, OP_QUERY};
+use crate::store::PgStore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use bson::{doc, Document};
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::Instant;
+
+static REQ_ID: AtomicI32 = AtomicI32::new(1);
+
+use std::sync::Arc;
+use std::collections::HashMap;
+use tokio::sync::Mutex;
+
+struct CursorEntry {
+    ns: String,
+    docs: Vec<Document>,
+    pos: usize,
+}
+
+pub struct AppState {
+    pub store: Option<PgStore>,
+    pub started_at: Instant,
+    pub cursors: Mutex<HashMap<i64, CursorEntry>>,
+}
+
 
 pub async fn run(cfg: Config) -> Result<()> {
     let listener = TcpListener::bind(&cfg.listen_addr).await?;
     tracing::info!(listen_addr = %cfg.listen_addr, "oxidedb listening");
 
+    let state = if let Some(url) = cfg.postgres_url.clone() {
+        match PgStore::connect(&url).await {
+            Ok(pg) => {
+                if let Err(e) = pg.bootstrap().await {
+                    tracing::error!(error = %format!("{e:?}"), "failed to bootstrap metadata");
+                }
+                AppState { store: Some(pg), started_at: Instant::now(), cursors: Mutex::new(HashMap::new()) }
+            }
+            Err(e) => {
+                tracing::error!(error = %format!("{e:?}"), "failed to connect to postgres; continuing without store");
+                AppState { store: None, started_at: Instant::now(), cursors: Mutex::new(HashMap::new()) }
+            }
+        }
+    } else {
+        AppState { store: None, started_at: Instant::now(), cursors: Mutex::new(HashMap::new()) }
+    };
+    let state = Arc::new(state);
+
     loop {
         let (socket, addr) = listener.accept().await?;
         tracing::debug!(%addr, "accepted connection");
+        let state = state.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(socket).await {
+            if let Err(e) = handle_connection(state, socket).await {
                 tracing::debug!(error = %format!("{e:?}"), "connection closed with error");
             }
         });
     }
 }
 
-async fn handle_connection(mut socket: TcpStream) -> Result<()> {
-    // Read a single message header to observe op code (best-effort)
-    let mut header_buf = [0u8; 16];
-    let n = socket.read(&mut header_buf).await?;
-    if n == 0 {
-        return Ok(());
-    }
-    if let Some((hdr, _)) = MessageHeader::parse(&header_buf[..n]) {
-        tracing::trace!(?hdr, "received header");
+async fn handle_connection(state: Arc<AppState>, mut socket: TcpStream) -> Result<()> {
+    loop {
+        // Read header
+        let mut header_buf = [0u8; 16];
+        if let Err(e) = socket.read_exact(&mut header_buf).await {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof || e.kind() == std::io::ErrorKind::UnexpectedEof {
+                break;
+            } else {
+                return Err(e.into());
+            }
+        }
+        let (hdr, _) = match MessageHeader::parse(&header_buf) {
+            Some(h) => h,
+            None => {
+                tracing::warn!("invalid message header");
+                break;
+            }
+        };
+        if hdr.message_length < 16 {
+            tracing::warn!(?hdr, "invalid message length");
+            break;
+        }
+        let body_len = (hdr.message_length as usize).saturating_sub(16);
+        let mut body = vec![0u8; body_len];
+        if body_len > 0 {
+            socket.read_exact(&mut body).await?;
+        }
+
         match hdr.op_code {
             OP_MSG => {
-                // For now, we don't parse the body; just drain it and noop.
-                // In the next iteration, we will parse the BSON command document and respond to hello/ping.
-                drain(&mut socket, hdr.message_length as usize - 16).await?;
+                let reply_doc = match decode_op_msg_section0(&body) {
+                    Some((_flags, cmd)) => {
+                        let db = cmd.get_str("$db").ok().map(|s| s.to_string());
+                        handle_command(&state, db.as_deref(), cmd).await
+                    }
+                    None => {
+                        tracing::warn!("malformed OP_MSG body; sending ok:0");
+                        error_doc(1, "Malformed OP_MSG body")
+                    }
+                };
+                let request_id = REQ_ID.fetch_add(1, Ordering::Relaxed);
+                let resp = encode_op_msg(&reply_doc, hdr.request_id, request_id);
+                socket.write_all(&resp).await?;
+                socket.flush().await?;
+            }
+            OP_QUERY => {
+                match decode_op_query(&body) {
+                    Some((_flags, fqn, _skip, _nret, cmd)) => {
+                        let db = parse_db_from_fqn(&fqn);
+                        let reply_doc = handle_command(&state, db.as_deref(), cmd).await;
+                        let request_id = REQ_ID.fetch_add(1, Ordering::Relaxed);
+                        let resp = encode_op_reply(&[reply_doc], hdr.request_id, request_id);
+                        socket.write_all(&resp).await?;
+                        socket.flush().await?;
+                    }
+                    None => {
+                        tracing::warn!("malformed OP_QUERY body; ignoring");
+                    }
+                }
             }
             _ => {
                 tracing::warn!(op_code = hdr.op_code, "unsupported op code");
-                // Attempt to drain whatever remains to keep the connection stable
-                if hdr.message_length > 16 {
-                    let _ = drain(&mut socket, hdr.message_length as usize - 16).await;
-                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_command(state: &AppState, db: Option<&str>, mut cmd: Document) -> Document {
+    // command name is the first key in the doc
+    let cmd_name = cmd.iter().next().map(|(k, _)| k.as_str()).unwrap_or("");
+    match cmd_name {
+        "hello" | "ismaster" | "isMaster" => hello_reply(),
+        "ping" => doc! { "ok": 1.0 },
+        "buildInfo" | "buildinfo" => build_info_reply(),
+        "listDatabases" => list_databases_reply(state, &cmd).await,
+        "listCollections" => list_collections_reply(state, db).await,
+        "serverStatus" => server_status_reply(state).await,
+        "create" => create_collection_reply(state, db, &cmd).await,
+        "drop" => drop_collection_reply(state, db, &cmd).await,
+        "dropDatabase" => drop_database_reply(state, db).await,
+        "insert" => insert_reply(state, db, &mut cmd).await,
+        "find" => find_reply(state, db, &cmd).await,
+        "getMore" => get_more_reply(state, &cmd).await,
+        _ => {
+            tracing::debug!(cmd = ?cmd, "unrecognized command; replying ok:0");
+            error_doc(59, format!("Command '{}' not implemented", cmd_name))
+        }
+    }
+}
+
+fn hello_reply() -> Document {
+    doc! {
+        "ismaster": true,
+        "isWritablePrimary": true,
+        "helloOk": true,
+        "minWireVersion": 0i32,
+        // Advertise a minimally compatible wire version for modern drivers
+        // (MongoDB 4.0+ expects >= 7)
+        "maxWireVersion": 7i32,
+        "maxBsonObjectSize": 16_777_216i32, // 16MB
+        "maxMessageSizeBytes": 48_000_000i32,
+        "maxWriteBatchSize": 100_000i32,
+        "logicalSessionTimeoutMinutes": 30i32,
+        "ok": 1.0
+    }
+}
+
+fn error_doc(code: i32, msg: impl Into<String>) -> Document {
+    doc! { "ok": 0.0, "errmsg": msg.into(), "code": code }
+}
+
+fn build_info_reply() -> Document {
+    doc! {
+        "version": env!("CARGO_PKG_VERSION"),
+        "gitVersion": "",
+        "sysInfo": "oxidedb",
+        "loaderFlags": "",
+        "compilerFlags": "",
+        "allocator": "system",
+        "javascriptEngine": "none",
+        "bits": 64i32,
+        "debug": false,
+        "maxBsonObjectSize": 16_777_216i32,
+        "ok": 1.0
+    }
+}
+
+async fn list_databases_reply(state: &AppState, cmd: &Document) -> Document {
+    // If Postgres is connected, read from metadata; otherwise, return empty list
+    let names = if let Some(ref pg) = state.store {
+        match pg.list_databases().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:?}"), "list_databases failed; returning empty");
+                Vec::new()
             }
         }
     } else {
-        tracing::warn!("incomplete or invalid header");
+        Vec::new()
+    };
+    let name_only = cmd.get_bool("nameOnly").unwrap_or(false);
+    let mut dbs = Vec::with_capacity(names.len());
+    for n in names {
+        if name_only {
+            dbs.push(doc! { "name": n });
+        } else {
+            dbs.push(doc! { "name": n, "sizeOnDisk": 0i64, "empty": true });
+        }
     }
-
-    // Politely close for now
-    let _ = socket.shutdown().await;
-    Ok(())
+    let mut reply = doc! { "databases": dbs, "ok": 1.0 };
+    if !name_only { reply.insert("totalSize", 0i64); }
+    reply
 }
 
-async fn drain(stream: &mut TcpStream, mut remaining: usize) -> Result<()> {
-    let mut buf = [0u8; 4096];
-    while remaining > 0 {
-        let to_read = remaining.min(buf.len());
-        let n = stream.read(&mut buf[..to_read]).await?;
-        if n == 0 { break; }
-        remaining -= n;
+async fn list_collections_reply(state: &AppState, db: Option<&str>) -> Document {
+    let dbname = db.unwrap_or("");
+    let names = if let Some(ref pg) = state.store {
+        match pg.list_collections(dbname).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:?}"), "list_collections failed; returning empty");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let mut first_batch = Vec::with_capacity(names.len());
+    for n in names {
+        first_batch.push(doc! {
+            "name": n,
+            "type": "collection",
+            "options": doc!{},
+            "info": doc!{"readOnly": false},
+        });
     }
-    Ok(())
+    let ns = format!("{}.$cmd.listCollections", dbname);
+    doc! {
+        "cursor": {"id": 0i64, "ns": ns, "firstBatch": first_batch},
+        "ok": 1.0
+    }
 }
 
+fn parse_db_from_fqn(fqn: &str) -> Option<String> {
+    // format: "<db>.$cmd" or "<db>.<coll>"
+    fqn.split('.').next().map(|s| s.to_string())
+}
+
+async fn server_status_reply(state: &AppState) -> Document {
+    let uptime = state.started_at.elapsed().as_secs_f64();
+    doc! {
+        "version": env!("CARGO_PKG_VERSION"),
+        "process": "oxidedb",
+        "uptime": uptime,
+        "ok": 1.0
+    }
+}
+
+async fn create_collection_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Document {
+    let dbname = match db { Some(d) => d, None => return error_doc(59, "Missing $db") };
+    let coll = match cmd.get_str("create") { Ok(c) => c, Err(_) => return error_doc(9, "Invalid create") };
+    if let Some(ref pg) = state.store {
+        match pg.ensure_collection(dbname, coll).await {
+            Ok(_) => doc!{ "ok": 1.0 },
+            Err(e) => error_doc(59, format!("create failed: {}", e)),
+        }
+    } else {
+        error_doc(13, "No storage configured")
+    }
+}
+
+async fn drop_collection_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Document {
+    let dbname = match db { Some(d) => d, None => return error_doc(59, "Missing $db") };
+    let coll = match cmd.get_str("drop") { Ok(c) => c, Err(_) => return error_doc(9, "Invalid drop") };
+    if let Some(ref pg) = state.store {
+        match pg.drop_collection(dbname, coll).await {
+            Ok(_) => doc!{ "nIndexesWas": 0i32, "ns": format!("{}.{}", dbname, coll), "ok": 1.0 },
+            Err(e) => error_doc(59, format!("drop failed: {}", e)),
+        }
+    } else {
+        error_doc(13, "No storage configured")
+    }
+}
+
+async fn drop_database_reply(state: &AppState, db: Option<&str>) -> Document {
+    let dbname = match db { Some(d) => d, None => return error_doc(59, "Missing $db") };
+    if let Some(ref pg) = state.store {
+        match pg.drop_database(dbname).await {
+            Ok(_) => doc!{ "dropped": dbname, "ok": 1.0 },
+            Err(e) => error_doc(59, format!("dropDatabase failed: {}", e)),
+        }
+    } else {
+        error_doc(13, "No storage configured")
+    }
+}
+
+async fn insert_reply(state: &AppState, db: Option<&str>, cmd: &mut Document) -> Document {
+    let dbname = match db { Some(d) => d, None => return error_doc(59, "Missing $db") };
+    let coll: String = match cmd.get_str("insert") { Ok(c) => c.to_string(), Err(_) => return error_doc(9, "Invalid insert") };
+    let docs_bson: Vec<bson::Bson> = match cmd.get_array("documents") { Ok(a) => a.clone(), Err(_) => return error_doc(9, "Missing documents") };
+    if let Some(ref pg) = state.store {
+        let mut inserted = 0u32;
+        let mut write_errors: Vec<Document> = Vec::new();
+        for (i, b) in docs_bson.iter().enumerate() {
+            if let bson::Bson::Document(d0) = b {
+                let mut d = d0.clone();
+                ensure_id(&mut d);
+                match id_bytes(d.get("_id")) {
+                    Some(idb) => {
+                        let json = match serde_json::to_value(&d) { Ok(v) => v, Err(e) => { write_errors.push(doc!{"index": i as i32, "code": 2, "errmsg": e.to_string()}); continue; } };
+                        let bson_bytes = match bson::to_vec(&d) { Ok(v) => v, Err(e) => { write_errors.push(doc!{"index": i as i32, "code": 2, "errmsg": e.to_string()}); continue; } };
+                        match pg.insert_one(dbname, &coll, &idb, &bson_bytes, &json).await {
+                            Ok(n) => {
+                                if n == 1 { inserted += 1; } else {
+                                    write_errors.push(doc!{"index": i as i32, "code": 11000i32, "errmsg": "duplicate key"});
+                                }
+                            }
+                            Err(e) => write_errors.push(doc!{"index": i as i32, "code": 59i32, "errmsg": e.to_string()}),
+                        }
+                    }
+                    None => write_errors.push(doc!{"index": i as i32, "code": 2i32, "errmsg": "unsupported _id type"}),
+                }
+            } else {
+                write_errors.push(doc!{"index": i as i32, "code": 2i32, "errmsg": "document must be object"});
+            }
+        }
+        let mut reply = doc!{ "n": inserted as i32, "ok": 1.0 };
+        if !write_errors.is_empty() { reply.insert("writeErrors", write_errors); }
+        reply
+    } else {
+        error_doc(13, "No storage configured")
+    }
+}
+
+async fn find_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Document {
+    let dbname = match db { Some(d) => d, None => return error_doc(59, "Missing $db") };
+    let coll = match cmd.get_str("find") { Ok(c) => c, Err(_) => return error_doc(9, "Invalid find") };
+    let limit = cmd.get_i64("limit").unwrap_or(0);
+    let batch_size = cmd.get_i64("batchSize").unwrap_or(0);
+    let first_batch_limit = if limit > 0 { limit } else if batch_size > 0 { batch_size } else { 101 };
+    let filter = cmd.get_document("filter").ok();
+
+    if let Some(ref pg) = state.store {
+        let docs: Vec<Document> = if let Some(f) = filter {
+            if let Some(idb) = f.get("_id").and_then(|v| id_bytes_bson(v)) {
+                match pg.find_by_id_docs(dbname, coll, &idb, first_batch_limit).await { Ok(v) => v, Err(e) => { tracing::warn!("find_by_id failed: {}", e); Vec::new() } }
+            } else {
+                match pg.find_simple_docs(dbname, coll, first_batch_limit * 10).await { Ok(v) => v, Err(e) => { tracing::warn!("find_simple failed: {}", e); Vec::new() } }
+            }
+        } else {
+            match pg.find_simple_docs(dbname, coll, first_batch_limit * 10).await { Ok(v) => v, Err(e) => { tracing::warn!("find_simple failed: {}", e); Vec::new() } }
+        };
+
+        let mut first_batch: Vec<Document> = Vec::new();
+        let mut remainder: Vec<Document> = Vec::new();
+        for (idx, d) in docs.into_iter().enumerate() {
+            if (idx as i64) < first_batch_limit { first_batch.push(d); } else { remainder.push(d); }
+        }
+        let ns = format!("{}.{}", dbname, coll);
+        let mut cursor_doc = doc!{ "ns": ns.clone(), "firstBatch": first_batch };
+        let cursor_id = if !remainder.is_empty() { new_cursor(state, ns, remainder).await } else { 0i64 };
+        cursor_doc.insert("id", cursor_id);
+        doc! { "cursor": cursor_doc, "ok": 1.0 }
+    } else {
+        error_doc(13, "No storage configured")
+    }
+}
+
+fn ensure_id(doc: &mut Document) {
+    if !doc.contains_key("_id") {
+        doc.insert("_id", bson::Bson::ObjectId(bson::oid::ObjectId::new()));
+    }
+}
+
+fn id_bytes(opt: Option<&bson::Bson>) -> Option<Vec<u8>> {
+    match opt? {
+        bson::Bson::ObjectId(oid) => Some(oid.bytes().to_vec()),
+        bson::Bson::String(s) => Some(s.as_bytes().to_vec()),
+        _ => None,
+    }
+}
+
+fn id_bytes_bson(b: &bson::Bson) -> Option<Vec<u8>> {
+    match b {
+        bson::Bson::ObjectId(oid) => Some(oid.bytes().to_vec()),
+        bson::Bson::String(s) => Some(s.as_bytes().to_vec()),
+        _ => None,
+    }
+}
+
+// (second duplicate removed)
+
+static CURSOR_SEQ: AtomicI32 = AtomicI32::new(1000);
+
+async fn new_cursor(state: &AppState, ns: String, docs: Vec<Document>) -> i64 {
+    let id = CURSOR_SEQ.fetch_add(1, Ordering::Relaxed) as i64;
+    let entry = CursorEntry { ns, docs, pos: 0 };
+    let mut map = state.cursors.lock().await;
+    map.insert(id, entry);
+    id
+}
+
+async fn get_more_reply(state: &AppState, cmd: &Document) -> Document {
+    let cursor_id = match cmd.get_i64("getMore") { Ok(v) => v, Err(_) => return error_doc(9, "Invalid getMore") };
+    let batch_size = cmd.get_i32("batchSize").unwrap_or(101) as usize;
+    let mut map = state.cursors.lock().await;
+    if let Some(entry) = map.get_mut(&cursor_id) {
+        let ns = entry.ns.clone();
+        let start = entry.pos;
+        let end = (start + batch_size).min(entry.docs.len());
+        let mut next_batch = Vec::with_capacity(end - start);
+        for d in &entry.docs[start..end] { next_batch.push(d.clone()); }
+        entry.pos = end;
+        let id = if entry.pos >= entry.docs.len() { map.remove(&cursor_id); 0i64 } else { cursor_id };
+        return doc! { "cursor": {"id": id, "ns": ns, "nextBatch": next_batch}, "ok": 1.0 };
+    }
+    // Unknown cursor id
+    let ns = match cmd.get_str("collection") { Ok(c) => c.to_string(), Err(_) => String::new() };
+    let empty: Vec<Document> = Vec::new();
+    doc! { "cursor": {"id": 0i64, "ns": ns, "nextBatch": empty }, "ok": 1.0 }
+}
