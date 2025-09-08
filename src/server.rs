@@ -590,38 +590,86 @@ async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
     let coll = match cmd.get_str("update") { Ok(c) => c, Err(_) => return error_doc(9, "Invalid update") };
     let updates = match cmd.get_array("updates") { Ok(a) => a, Err(_) => return error_doc(9, "Missing updates") };
     if updates.is_empty() { return error_doc(9, "Empty updates"); }
-    let first = match &updates[0] { bson::Bson::Document(d) => d, _ => return error_doc(9, "Invalid update spec") };
-    let filter = match first.get_document("q") { Ok(d) => d.clone(), Err(_) => return error_doc(9, "Missing q") };
-    let udoc = match first.get_document("u") { Ok(d) => d.clone(), Err(_) => return error_doc(9, "Missing u") };
-    let multi = first.get_bool("multi").unwrap_or(false);
-    let upsert = first.get_bool("upsert").unwrap_or(false);
-    if multi { return error_doc(9, "multi updates not supported"); }
-    if upsert { return error_doc(9, "upsert not supported"); }
     if state.store.is_none() { return error_doc(13, "No storage configured"); }
     let pg = state.store.as_ref().unwrap();
-    // Only support $set updates for now
-    let set_doc = if let Ok(sd) = udoc.get_document("$set") { sd.clone() } else { return error_doc(9, "Only $set supported"); };
-    // Find a matching doc
-    let found = match pg.find_one_for_update(dbname, coll, &filter).await {
-        Ok(v) => v,
-        Err(e) => return error_doc(59, format!("find failed: {}", e)),
-    };
-    if let Some((idb, mut doc0)) = found {
-        // Apply top-level $set
-        for (k, v) in set_doc.iter() {
-            doc0.insert(k.clone(), v.clone());
-        }
-        // Preserve _id
-        if let Some(idv) = filter.get("_id").cloned() { doc0.insert("_id", idv); }
-        match pg.update_doc_by_id(dbname, coll, &idb, &doc0).await {
-            Ok(n) => {
-                let modified = if n > 0 { 1 } else { 0 };
-                doc!{"n": 1i32, "nModified": modified as i32, "ok": 1.0}
+
+    let mut matched_total = 0i32;
+    let mut modified_total = 0i32;
+
+    for upd_b in updates {
+        let spec = match upd_b { bson::Bson::Document(d) => d, _ => return error_doc(9, "Invalid update spec") };
+        let filter = match spec.get_document("q") { Ok(d) => d.clone(), Err(_) => return error_doc(9, "Missing q") };
+        let udoc = match spec.get_document("u") { Ok(d) => d.clone(), Err(_) => return error_doc(9, "Missing u") };
+        let multi = spec.get_bool("multi").unwrap_or(false);
+        let upsert = spec.get_bool("upsert").unwrap_or(false);
+        if upsert { return error_doc(9, "upsert not supported"); }
+        let set_doc = if let Ok(sd) = udoc.get_document("$set") { sd.clone() } else { return error_doc(9, "Only $set supported"); };
+
+        if multi {
+            // Fetch docs by filter and update each
+            let docs = match pg.find_docs(dbname, coll, Some(&filter), None, None, 10_000).await {
+                Ok(v) => v,
+                Err(e) => return error_doc(59, format!("find failed: {}", e)),
+            };
+            if docs.is_empty() { continue; }
+            for mut d in docs {
+                let idb = match d.get("_id").and_then(|b| id_bytes_bson(b)) { Some(v) => v, None => continue };
+                // apply nested $set
+                for (k, v) in set_doc.iter() {
+                    set_path_nested(&mut d, k, v.clone());
+                }
+                if let Err(e) = pg.update_doc_by_id(dbname, coll, &idb, &d).await {
+                    tracing::warn!("update_doc_by_id failed: {}", e);
+                } else {
+                    matched_total += 1;
+                    modified_total += 1;
+                }
             }
-            Err(e) => error_doc(59, format!("update failed: {}", e)),
+        } else {
+            // Single
+            let found = match pg.find_one_for_update(dbname, coll, &filter).await {
+                Ok(v) => v,
+                Err(e) => return error_doc(59, format!("find failed: {}", e)),
+            };
+            if let Some((idb, mut doc0)) = found {
+                for (k, v) in set_doc.iter() { set_path_nested(&mut doc0, k, v.clone()); }
+                match pg.update_doc_by_id(dbname, coll, &idb, &doc0).await {
+                    Ok(n) => {
+                        matched_total += 1;
+                        if n > 0 { modified_total += 1; }
+                    }
+                    Err(e) => return error_doc(59, format!("update failed: {}", e)),
+                }
+            }
         }
-    } else {
-        doc!{"n": 0i32, "nModified": 0i32, "ok": 1.0}
+    }
+
+    doc!{"n": matched_total, "nModified": modified_total, "ok": 1.0}
+}
+
+fn set_path_nested(doc: &mut Document, path: &str, value: bson::Bson) {
+    let mut cur = doc;
+    let mut segs = path.split('.').peekable();
+    while let Some(seg) = segs.next() {
+        let is_last = segs.peek().is_none();
+        if is_last {
+            cur.insert(seg.to_string(), value.clone());
+            return;
+        } else {
+            let need_create = match cur.get(seg) {
+                Some(bson::Bson::Document(_)) => false,
+                _ => true,
+            };
+            if need_create {
+                cur.insert(seg.to_string(), bson::Bson::Document(Document::new()));
+            }
+            if let Some(bson::Bson::Document(d)) = cur.get_mut(seg) {
+                cur = d;
+            } else {
+                // Shouldn't happen, but bail out to avoid panic
+                return;
+            }
+        }
     }
 }
 
@@ -682,9 +730,30 @@ async fn find_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Docum
     if let Some(ref pg) = state.store {
         let sort = cmd.get_document("sort").ok();
         let projection = cmd.get_document("projection").ok();
-        let docs: Vec<Document> = match pg.find_docs(dbname, coll, filter, sort, projection, first_batch_limit * 10).await {
-            Ok(v) => v,
-            Err(e) => { tracing::warn!("find_docs failed: {}", e); Vec::new() }
+        let docs: Vec<Document> = if let Some(f) = filter {
+            if let Some(idv) = f.get("_id") {
+                if let Some(idb) = id_bytes_bson(idv) {
+                    match pg.find_by_id_docs(dbname, coll, &idb, first_batch_limit * 10).await {
+                        Ok(v) => v,
+                        Err(e) => { tracing::warn!("find_by_id failed: {}", e); Vec::new() }
+                    }
+                } else {
+                    match pg.find_docs(dbname, coll, Some(f), sort, projection, first_batch_limit * 10).await {
+                        Ok(v) => v,
+                        Err(e) => { tracing::warn!("find_docs failed: {}", e); Vec::new() }
+                    }
+                }
+            } else {
+                match pg.find_docs(dbname, coll, Some(f), sort, projection, first_batch_limit * 10).await {
+                    Ok(v) => v,
+                    Err(e) => { tracing::warn!("find_docs failed: {}", e); Vec::new() }
+                }
+            }
+        } else {
+            match pg.find_docs(dbname, coll, None, sort, projection, first_batch_limit * 10).await {
+                Ok(v) => v,
+                Err(e) => { tracing::warn!("find_docs failed: {}", e); Vec::new() }
+            }
         };
 
         let mut first_batch: Vec<Document> = Vec::new();

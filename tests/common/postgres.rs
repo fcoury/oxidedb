@@ -52,8 +52,10 @@ impl Drop for TestDb {
                     .await;
             }
         };
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.block_on(fut);
+        if tokio::runtime::Handle::try_current().is_ok() {
+            // Already inside a runtime; spawn cleanup and return.
+            // This avoids blocking a runtime thread.
+            tokio::spawn(fut);
         } else if let Ok(rt) = tokio::runtime::Runtime::new() {
             rt.block_on(fut);
         }
@@ -86,4 +88,3 @@ fn replace_db_name(url: &str, new_db: &str) -> String {
     if let Some(q) = query { out.push('?'); out.push_str(q); }
     out
 }
-
