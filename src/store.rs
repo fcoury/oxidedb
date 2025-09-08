@@ -524,6 +524,17 @@ impl PgStore {
         let n = self.client.execute(&del_sql, &[&id]).await.map_err(err_msg)?;
         Ok(n)
     }
+
+    /// Delete many rows matching filter; returns number of rows deleted.
+    pub async fn delete_many_by_filter(&self, db: &str, coll: &str, filter: &bson::Document) -> Result<u64> {
+        let schema = schema_name(db);
+        let q_schema = q_ident(&schema);
+        let q_table = q_ident(coll);
+        let where_sql = build_where_from_filter(filter);
+        let sql = format!("DELETE FROM {}.{} WHERE {}", q_schema, q_table, where_sql);
+        let n = self.client.execute(&sql, &[]).await.map_err(err_msg)?;
+        Ok(n)
+    }
 }
 
 fn schema_name(db: &str) -> String {

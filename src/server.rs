@@ -603,7 +603,9 @@ async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
         let multi = spec.get_bool("multi").unwrap_or(false);
         let upsert = spec.get_bool("upsert").unwrap_or(false);
         if upsert { return error_doc(9, "upsert not supported"); }
-        let set_doc = if let Ok(sd) = udoc.get_document("$set") { sd.clone() } else { return error_doc(9, "Only $set supported"); };
+        let set_doc = udoc.get_document("$set").ok().cloned();
+        let unset_doc = udoc.get_document("$unset").ok().cloned();
+        if set_doc.is_none() && unset_doc.is_none() { return error_doc(9, "Only $set/$unset supported"); }
 
         if multi {
             // Fetch docs by filter and update each
@@ -615,8 +617,11 @@ async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
             for mut d in docs {
                 let idb = match d.get("_id").and_then(|b| id_bytes_bson(b)) { Some(v) => v, None => continue };
                 // apply nested $set
-                for (k, v) in set_doc.iter() {
-                    set_path_nested(&mut d, k, v.clone());
+                if let Some(ref sets) = set_doc {
+                    for (k, v) in sets.iter() { set_path_nested(&mut d, k, v.clone()); }
+                }
+                if let Some(ref unsets) = unset_doc {
+                    for (k, _v) in unsets.iter() { unset_path_nested(&mut d, k); }
                 }
                 if let Err(e) = pg.update_doc_by_id(dbname, coll, &idb, &d).await {
                     tracing::warn!("update_doc_by_id failed: {}", e);
@@ -632,7 +637,8 @@ async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
                 Err(e) => return error_doc(59, format!("find failed: {}", e)),
             };
             if let Some((idb, mut doc0)) = found {
-                for (k, v) in set_doc.iter() { set_path_nested(&mut doc0, k, v.clone()); }
+                if let Some(ref sets) = set_doc { for (k, v) in sets.iter() { set_path_nested(&mut doc0, k, v.clone()); } }
+                if let Some(ref unsets) = unset_doc { for (k, _v) in unsets.iter() { unset_path_nested(&mut doc0, k); } }
                 match pg.update_doc_by_id(dbname, coll, &idb, &doc0).await {
                     Ok(n) => {
                         matched_total += 1;
@@ -648,26 +654,77 @@ async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
 }
 
 fn set_path_nested(doc: &mut Document, path: &str, value: bson::Bson) {
-    let mut cur = doc;
-    let mut segs = path.split('.').peekable();
-    while let Some(seg) = segs.next() {
-        let is_last = segs.peek().is_none();
-        if is_last {
-            cur.insert(seg.to_string(), value.clone());
-            return;
-        } else {
-            let need_create = match cur.get(seg) {
-                Some(bson::Bson::Document(_)) => false,
-                _ => true,
-            };
-            if need_create {
-                cur.insert(seg.to_string(), bson::Bson::Document(Document::new()));
+    // Implement via a generic BSON walker that supports arrays and documents
+    let mut root = bson::Bson::Document(doc.clone());
+    let segments: Vec<&str> = path.split('.').collect();
+    set_path_bson(&mut root, &segments, value);
+    if let bson::Bson::Document(updated) = root { *doc = updated; }
+}
+
+fn seg_is_index(seg: &str) -> Option<usize> { seg.parse::<usize>().ok() }
+
+fn set_path_bson(cur: &mut bson::Bson, segs: &[&str], value: bson::Bson) {
+    if segs.is_empty() { *cur = value; return; }
+    let seg = segs[0];
+    let next_is_index = segs.get(1).and_then(|s| seg_is_index(s)).is_some();
+    match seg_is_index(seg) {
+        Some(idx) => {
+            // Ensure array
+            if !matches!(cur, bson::Bson::Array(_)) { *cur = bson::Bson::Array(Vec::new()); }
+            if let bson::Bson::Array(arr) = cur {
+                let desired_len = idx + 1;
+                if arr.len() < desired_len {
+                    let pad = desired_len - arr.len();
+                    arr.extend(std::iter::repeat(bson::Bson::Null).take(pad));
+                }
+                if segs.len() == 1 { arr[idx] = value; }
+                else {
+                    // Choose default element type for deeper path
+                    if matches!(arr[idx], bson::Bson::Null) {
+                        arr[idx] = if next_is_index { bson::Bson::Array(Vec::new()) } else { bson::Bson::Document(Document::new()) };
+                    }
+                    set_path_bson(&mut arr[idx], &segs[1..], value);
+                }
             }
-            if let Some(bson::Bson::Document(d)) = cur.get_mut(seg) {
-                cur = d;
-            } else {
-                // Shouldn't happen, but bail out to avoid panic
-                return;
+        }
+        None => {
+            // Document key
+            if !matches!(cur, bson::Bson::Document(_)) { *cur = bson::Bson::Document(Document::new()); }
+            if let bson::Bson::Document(d) = cur {
+                if segs.len() == 1 { d.insert(seg.to_string(), value); }
+                else {
+                    let entry = d.entry(seg.to_string()).or_insert_with(|| if next_is_index { bson::Bson::Array(Vec::new()) } else { bson::Bson::Document(Document::new()) });
+                    set_path_bson(entry, &segs[1..], value);
+                }
+            }
+        }
+    }
+}
+
+fn unset_path_nested(doc: &mut Document, path: &str) {
+    let mut root = bson::Bson::Document(doc.clone());
+    let segments: Vec<&str> = path.split('.').collect();
+    unset_path_bson(&mut root, &segments);
+    if let bson::Bson::Document(updated) = root { *doc = updated; }
+}
+
+fn unset_path_bson(cur: &mut bson::Bson, segs: &[&str]) {
+    if segs.is_empty() { return; }
+    let seg = segs[0];
+    let is_last = segs.len() == 1;
+    match seg_is_index(seg) {
+        Some(idx) => {
+            if let bson::Bson::Array(arr) = cur {
+                if idx < arr.len() {
+                    if is_last { arr[idx] = bson::Bson::Null; }
+                    else { unset_path_bson(&mut arr[idx], &segs[1..]); }
+                }
+            }
+        }
+        None => {
+            if let bson::Bson::Document(d) = cur {
+                if is_last { d.remove(seg); }
+                else if let Some(child) = d.get_mut(seg) { unset_path_bson(child, &segs[1..]); }
             }
         }
     }
@@ -681,12 +738,20 @@ async fn delete_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
     let first = match &deletes[0] { bson::Bson::Document(d) => d, _ => return error_doc(9, "Invalid delete spec") };
     let filter = match first.get_document("q") { Ok(d) => d.clone(), Err(_) => return error_doc(9, "Missing q") };
     let limit = first.get_i32("limit").unwrap_or(1);
-    if limit != 1 { return error_doc(9, "Only limit=1 supported"); }
     if state.store.is_none() { return error_doc(13, "No storage configured"); }
     let pg = state.store.as_ref().unwrap();
-    match pg.delete_one_by_filter(dbname, coll, &filter).await {
-        Ok(n) => doc!{"n": (n as i32), "ok": 1.0},
-        Err(e) => error_doc(59, format!("delete failed: {}", e)),
+    if limit == 0 {
+        match pg.delete_many_by_filter(dbname, coll, &filter).await {
+            Ok(n) => doc!{"n": (n as i32), "ok": 1.0},
+            Err(e) => error_doc(59, format!("delete failed: {}", e)),
+        }
+    } else if limit == 1 {
+        match pg.delete_one_by_filter(dbname, coll, &filter).await {
+            Ok(n) => doc!{"n": (n as i32), "ok": 1.0},
+            Err(e) => error_doc(59, format!("delete failed: {}", e)),
+        }
+    } else {
+        error_doc(9, "Only limit 0 (many) or 1 supported")
     }
 }
 
@@ -696,16 +761,22 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
     let pipeline = match cmd.get_array("pipeline") { Ok(a) => a, Err(_) => return error_doc(9, "Missing pipeline") };
     let cursor_spec = cmd.get_document("cursor").unwrap_or(&doc!{}).clone();
     let batch_size = cursor_spec.get_i32("batchSize").unwrap_or(101) as i64;
-    // Minimal support: $match only (first stage)
+    // Minimal pipeline support: $match, $sort, $project, $limit in order
     let mut filter: Option<bson::Document> = None;
-    if !pipeline.is_empty() {
-        if let bson::Bson::Document(stage) = &pipeline[0] {
-            if let Ok(m) = stage.get_document("$match") { filter = Some(m.clone()); }
+    let mut sort: Option<bson::Document> = None;
+    let mut project: Option<bson::Document> = None;
+    let mut limit: Option<i64> = None;
+    for st in pipeline {
+        if let bson::Bson::Document(stage) = st {
+            if let Ok(m) = stage.get_document("$match") { filter = Some(m.clone()); continue; }
+            if let Ok(s) = stage.get_document("$sort") { sort = Some(s.clone()); continue; }
+            if let Ok(p) = stage.get_document("$project") { project = Some(p.clone()); continue; }
+            if let Some(l) = stage.get_i64("$limit").ok().or(stage.get_i32("$limit").ok().map(|v| v as i64)) { limit = Some(l); continue; }
         }
     }
     if state.store.is_none() { return error_doc(13, "No storage configured"); }
     let pg = state.store.as_ref().unwrap();
-    let docs = match pg.find_docs(dbname, coll, filter.as_ref(), None, None, batch_size * 10).await {
+    let docs = match pg.find_docs(dbname, coll, filter.as_ref(), sort.as_ref(), project.as_ref(), limit.unwrap_or(batch_size * 10)).await {
         Ok(v) => v,
         Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
     };

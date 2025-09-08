@@ -93,6 +93,46 @@ async fn e2e_update_and_delete_one() {
 }
 
 #[tokio::test]
+async fn e2e_delete_many_limit_zero() {
+    let testdb = match pg::TestDb::provision_from_env().await { Some(db) => db, None => { eprintln!("skipping: set OXIDEDB_TEST_POSTGRES_URL"); return; } };
+
+    let mut cfg = Config::default();
+    cfg.listen_addr = "127.0.0.1:0".into();
+    cfg.postgres_url = Some(testdb.url.clone());
+
+    let (_state, addr, shutdown, handle) = spawn_with_shutdown(cfg).await.unwrap();
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    let dbname = format!("del_many_{}", rand_suffix(6));
+
+    let create = doc!{"create": "u", "$db": &dbname};
+    let msg = encode_op_msg(&create, 0, 1);
+    stream.write_all(&msg).await.unwrap();
+    let _ = read_one_op_msg(&mut stream).await;
+
+    let docs = vec![
+        doc!{"_id": "a", "group": "x"},
+        doc!{"_id": "b", "group": "x"},
+        doc!{"_id": "c", "group": "y"},
+    ];
+    let ins = doc!{"insert": "u", "documents": docs, "$db": &dbname};
+    let msg = encode_op_msg(&ins, 0, 2);
+    stream.write_all(&msg).await.unwrap();
+    let _ = read_one_op_msg(&mut stream).await;
+
+    let d_spec = doc!{"q": {"group": "x"}, "limit": 0i32};
+    let del = doc!{"delete": "u", "deletes": [d_spec], "$db": &dbname};
+    let msg = encode_op_msg(&del, 0, 3);
+    stream.write_all(&msg).await.unwrap();
+    let doc = read_one_op_msg(&mut stream).await;
+    assert_eq!(doc.get_f64("ok").unwrap_or(0.0), 1.0);
+    assert_eq!(doc.get_i32("n").unwrap_or(0), 2);
+
+    let _ = shutdown.send(true);
+    let _ = handle.await.unwrap();
+}
+
+#[tokio::test]
 async fn e2e_update_nested_and_multi() {
     let testdb = match pg::TestDb::provision_from_env().await { Some(db) => db, None => { eprintln!("skipping: set OXIDEDB_TEST_POSTGRES_URL"); return; } };
 
