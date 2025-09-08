@@ -631,11 +631,14 @@ async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
             }
         }
         if let Some(ref ren) = rename_doc {
+            let mut pairs: Vec<(String, String)> = Vec::new();
             for (from, to_b) in ren.iter() {
                 if path_has_negative_index(from) { return error_doc(2, "Negative array indexes not supported"); }
                 let to = match to_b { bson::Bson::String(s) => s, _ => return error_doc(2, "$rename target must be string path") };
                 if path_has_negative_index(to) { return error_doc(2, "Negative array indexes not supported"); }
+                pairs.push((from.to_string(), to.to_string()));
             }
+            if let Some(err) = validate_rename_pairs(&pairs) { return err; }
         }
         if let Some(ref pushes) = push_doc {
             for (k, _v) in pushes.iter() {
@@ -772,6 +775,25 @@ fn path_has_negative_index(path: &str) -> bool {
     false
 }
 
+fn is_ancestor_path(a: &str, b: &str) -> bool {
+    b.starts_with(a) && (b.len() == a.len() || b.as_bytes().get(a.len()) == Some(&b'.'))
+}
+
+fn validate_rename_pairs(pairs: &[(String, String)]) -> Option<Document> {
+    // Disallow renaming a field to itself or ancestor/descendant paths; disallow target duplicates
+    // Collect targets to detect duplicates
+    use std::collections::HashSet;
+    let mut targets: HashSet<&str> = HashSet::new();
+    for (from, to) in pairs {
+        if from == to { return Some(error_doc(2, "$rename from and to cannot be the same")); }
+        if is_ancestor_path(from, to) || is_ancestor_path(to, from) {
+            return Some(error_doc(2, "$rename cannot target ancestor/descendant path"));
+        }
+        if !targets.insert(to.as_str()) { return Some(error_doc(2, "$rename duplicate target path")); }
+    }
+    None
+}
+
 fn parse_path<'a>(path: &'a str) -> Vec<&'a str> { path.split('.').collect() }
 
 fn get_path_bson_value(doc: &Document, path: &str) -> Option<bson::Bson> {
@@ -802,18 +824,44 @@ fn number_as_f64(b: &bson::Bson) -> Option<f64> {
 }
 
 fn apply_inc(doc: &mut Document, path: &str, delta: bson::Bson) -> bool {
-    let d = match number_as_f64(&delta) { Some(x) => x, None => return false };
+    // Determine delta type
+    let delta_num = match &delta {
+        bson::Bson::Int32(n) => (Some(*n as i64), None),
+        bson::Bson::Int64(n) => (Some(*n), None),
+        bson::Bson::Double(f) => (None, Some(*f)),
+        _ => return false,
+    };
     let existing = get_path_bson_value(doc, path);
     if let Some(curv) = existing {
-        if let Some(cur) = number_as_f64(&curv) {
-            let sum = cur + d;
-            set_path_nested(doc, path, bson::Bson::Double(sum));
-            true
-        } else {
-            false
+        match curv {
+            bson::Bson::Int32(ci) => {
+                if let Some(di) = delta_num.0 { // int
+                    let sum = (ci as i64) + di;
+                    if sum >= i32::MIN as i64 && sum <= i32::MAX as i64 {
+                        set_path_nested(doc, path, bson::Bson::Int32(sum as i32));
+                    } else {
+                        set_path_nested(doc, path, bson::Bson::Int64(sum));
+                    }
+                    true
+                } else if let Some(df) = delta_num.1 { // double
+                    let sum = (ci as f64) + df;
+                    set_path_nested(doc, path, bson::Bson::Double(sum));
+                    true
+                } else { false }
+            }
+            bson::Bson::Int64(cl) => {
+                if let Some(di) = delta_num.0 { set_path_nested(doc, path, bson::Bson::Int64(cl + di)); true }
+                else if let Some(df) = delta_num.1 { set_path_nested(doc, path, bson::Bson::Double((cl as f64) + df)); true }
+                else { false }
+            }
+            bson::Bson::Double(cd) => {
+                let add = if let Some(di) = delta_num.0 { di as f64 } else { delta_num.1.unwrap() };
+                set_path_nested(doc, path, bson::Bson::Double(cd + add)); true
+            }
+            _ => false,
         }
     } else {
-        // treat missing as 0
+        // Missing: set to delta as-is, preferring numeric type given
         set_path_nested(doc, path, delta);
         true
     }
@@ -884,6 +932,82 @@ fn apply_pull(doc: &mut Document, path: &str, criterion: bson::Bson) {
     if let bson::Bson::Document(updated) = root { *doc = updated; }
 }
 
+fn eval_expr(doc: &Document, v: &bson::Bson) -> Option<bson::Bson> {
+    match v {
+        bson::Bson::String(s) if s.starts_with('$') => {
+            let path = &s[1..];
+            get_path_bson_value(doc, path)
+        }
+        bson::Bson::Document(d) => {
+            if let Some(arr) = d.get_array("$add").ok() {
+                let mut sum = 0.0f64;
+                for op in arr {
+                    let ev = eval_expr(doc, op)?;
+                    let n = number_as_f64(&ev)?;
+                    sum += n;
+                }
+                Some(bson::Bson::Double(sum))
+            } else if let Some(arr) = d.get_array("$subtract").ok() {
+                if arr.len() != 2 { return None; }
+                let a = number_as_f64(&eval_expr(doc, &arr[0])?)?;
+                let b = number_as_f64(&eval_expr(doc, &arr[1])?)?;
+                Some(bson::Bson::Double(a - b))
+            } else if let Some(arr) = d.get_array("$multiply").ok() {
+                let mut prod = 1.0f64;
+                for op in arr { prod *= number_as_f64(&eval_expr(doc, op)?)?; }
+                Some(bson::Bson::Double(prod))
+            } else if let Some(arr) = d.get_array("$divide").ok() {
+                if arr.len() != 2 { return None; }
+                let a = number_as_f64(&eval_expr(doc, &arr[0])?)?;
+                let b = number_as_f64(&eval_expr(doc, &arr[1])?)?;
+                Some(bson::Bson::Double(a / b))
+            } else {
+                None
+            }
+        }
+        _ => Some(v.clone()),
+    }
+}
+
+fn apply_project_with_expr(input: &Document, proj: &Document) -> Document {
+    // If spec contains computed fields or includes, build output accordingly.
+    let mut include_mode = false;
+    let mut include_id = true;
+    for (k, v) in proj.iter() {
+        if k == "_id" {
+            match v { bson::Bson::Int32(n) if *n == 0 => include_id = false, bson::Bson::Boolean(b) if !*b => include_id = false, _ => {} }
+        } else if matches!(v, bson::Bson::Int32(n) if *n != 0) || matches!(v, bson::Bson::Boolean(true)) {
+            include_mode = true;
+        }
+    }
+
+    let mut out = Document::new();
+    if include_mode && include_id {
+        if let Some(idv) = input.get("_id").cloned() { out.insert("_id", idv); }
+    }
+
+    for (k, v) in proj.iter() {
+        if k == "_id" { continue; }
+        match v {
+            bson::Bson::Int32(n) => {
+                if *n != 0 {
+                    if let Some(val) = get_path_bson_value(input, k) { set_path_nested(&mut out, k, val); }
+                }
+            }
+            bson::Bson::Boolean(b) => {
+                if *b { if let Some(val) = get_path_bson_value(input, k) { set_path_nested(&mut out, k, val); } }
+            }
+            other => {
+                // computed expression
+                let val = eval_expr(input, other).unwrap_or(bson::Bson::Null);
+                out.insert(k.to_string(), val);
+            }
+        }
+    }
+
+    out
+}
+
 fn unset_path_bson(cur: &mut bson::Bson, segs: &[&str]) {
     if segs.is_empty() { return; }
     let seg = segs[0];
@@ -945,11 +1069,16 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
     let mut skip: Option<i64> = None;
     let mut add_fields: Option<bson::Document> = None;
     let mut count_field: Option<String> = None;
+    let mut computed_project = false;
     for st in pipeline {
         if let bson::Bson::Document(stage) = st {
             if let Ok(m) = stage.get_document("$match") { filter = Some(m.clone()); continue; }
             if let Ok(s) = stage.get_document("$sort") { sort = Some(s.clone()); continue; }
-            if let Ok(p) = stage.get_document("$project") { project = Some(p.clone()); continue; }
+            if let Ok(p) = stage.get_document("$project") {
+                computed_project = p.iter().any(|(_k, v)| !matches!(v, bson::Bson::Int32(n) if *n == 0 || *n == 1) && !matches!(v, bson::Bson::Boolean(b) if *b || !*b));
+                project = Some(p.clone());
+                continue;
+            }
             if let Some(l) = stage.get_i64("$limit").ok().or(stage.get_i32("$limit").ok().map(|v| v as i64)) { limit = Some(l); continue; }
             if let Some(sk) = stage.get_i64("$skip").ok().or(stage.get_i32("$skip").ok().map(|v| v as i64)) { skip = Some(sk); continue; }
             if let Ok(af) = stage.get_document("$addFields").or(stage.get_document("$set")) { add_fields = Some(af.clone()); continue; }
@@ -973,7 +1102,9 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
     }
 
     let fetch_limit = skip.unwrap_or(0) + limit.unwrap_or(batch_size * 10);
-    let mut docs = match pg.find_docs(dbname, coll, filter.as_ref(), sort.as_ref(), project.as_ref(), fetch_limit).await {
+    // Disable projection pushdown if project has computed fields
+    let pushdown_project = if computed_project { None } else { project.as_ref() };
+    let mut docs = match pg.find_docs(dbname, coll, filter.as_ref(), sort.as_ref(), pushdown_project, fetch_limit).await {
         Ok(v) => v,
         Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
     };
@@ -982,7 +1113,20 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
     // Apply addFields/$set
     if let Some(af) = add_fields.as_ref() {
         for d in docs.iter_mut() {
-            for (k, v) in af.iter() { set_path_nested(d, k, v.clone()); }
+            for (k, v) in af.iter() {
+                let val = eval_expr(d, v).unwrap_or(bson::Bson::Null);
+                set_path_nested(d, k, val);
+            }
+        }
+    }
+
+    // Apply project expressions if present and disable pushdown was used
+    if let Some(ref proj) = project.as_ref() {
+        if computed_project {
+            for d in docs.iter_mut() {
+                let out = apply_project_with_expr(d, proj);
+                *d = out;
+            }
         }
     }
     let (first_batch, remainder): (Vec<_>, Vec<_>) = docs.into_iter().enumerate().partition(|(i, _)| (*i as i64) < batch_size);
