@@ -602,10 +602,22 @@ async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
         let udoc = match spec.get_document("u") { Ok(d) => d.clone(), Err(_) => return error_doc(9, "Missing u") };
         let multi = spec.get_bool("multi").unwrap_or(false);
         let upsert = spec.get_bool("upsert").unwrap_or(false);
-        if upsert { return error_doc(9, "upsert not supported"); }
+        if upsert { return error_doc(20, "upsert not supported"); }
         let set_doc = udoc.get_document("$set").ok().cloned();
         let unset_doc = udoc.get_document("$unset").ok().cloned();
         if set_doc.is_none() && unset_doc.is_none() { return error_doc(9, "Only $set/$unset supported"); }
+
+        // Validate array index segments (disallow negative indexes)
+        if let Some(ref sets) = set_doc {
+            for (k, _v) in sets.iter() {
+                if path_has_negative_index(k) { return error_doc(2, "Negative array indexes not supported"); }
+            }
+        }
+        if let Some(ref unsets) = unset_doc {
+            for (k, _v) in unsets.iter() {
+                if path_has_negative_index(k) { return error_doc(2, "Negative array indexes not supported"); }
+            }
+        }
 
         if multi {
             // Fetch docs by filter and update each
@@ -708,6 +720,13 @@ fn unset_path_nested(doc: &mut Document, path: &str) {
     if let bson::Bson::Document(updated) = root { *doc = updated; }
 }
 
+fn path_has_negative_index(path: &str) -> bool {
+    for seg in path.split('.') {
+        if let Ok(n) = seg.parse::<i32>() { if n < 0 { return true; } }
+    }
+    false
+}
+
 fn unset_path_bson(cur: &mut bson::Bson, segs: &[&str]) {
     if segs.is_empty() { return; }
     let seg = segs[0];
@@ -751,7 +770,7 @@ async fn delete_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
             Err(e) => error_doc(59, format!("delete failed: {}", e)),
         }
     } else {
-        error_doc(9, "Only limit 0 (many) or 1 supported")
+        error_doc(2, "Only limit 0 (many) or 1 supported")
     }
 }
 
@@ -772,6 +791,18 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
             if let Ok(s) = stage.get_document("$sort") { sort = Some(s.clone()); continue; }
             if let Ok(p) = stage.get_document("$project") { project = Some(p.clone()); continue; }
             if let Some(l) = stage.get_i64("$limit").ok().or(stage.get_i32("$limit").ok().map(|v| v as i64)) { limit = Some(l); continue; }
+            if let Some(sk) = stage.get_i64("$skip").ok().or(stage.get_i32("$skip").ok().map(|v| v as i64)) { /* we'll post-skip */
+                // encode skip in limit behavior by fetching skip+limit and trimming later
+                let cur_lim = limit.unwrap_or(101);
+                limit = Some(sk + cur_lim);
+                // encode skip by stashing in project as a special marker (we'll do trimming below)
+                project = project.map(|mut p| { p.insert("__skip_marker__", sk); p }).or_else(|| Some(doc!{"__skip_marker__": sk}));
+                continue;
+            }
+            // Unknown $stage: error
+            if stage.keys().any(|k| k.starts_with('$')) {
+                return error_doc(9, format!("Unsupported pipeline stage: {}", stage.keys().next().unwrap()));
+            }
         }
     }
     if state.store.is_none() { return error_doc(13, "No storage configured"); }
@@ -780,6 +811,10 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
         Ok(v) => v,
         Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
     };
+    // Apply skip trimming if requested
+    let mut docs = docs;
+    let skip_val = project.as_ref().and_then(|p| p.get_i64("__skip_marker__").ok());
+    if let Some(sk) = skip_val { if sk as usize <= docs.len() { docs.drain(0..(sk as usize)); } else { docs.clear(); } }
     let (first_batch, remainder): (Vec<_>, Vec<_>) = docs.into_iter().enumerate().partition(|(i, _)| (*i as i64) < batch_size);
     let first_docs: Vec<Document> = first_batch.into_iter().map(|(_, d)| d).collect();
     let rest_docs: Vec<Document> = remainder.into_iter().map(|(_, d)| d).collect();
