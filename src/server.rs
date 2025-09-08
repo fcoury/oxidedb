@@ -939,6 +939,24 @@ fn eval_expr(doc: &Document, v: &bson::Bson) -> Option<bson::Bson> {
             get_path_bson_value(doc, path)
         }
         bson::Bson::Document(d) => {
+            if let Some(arg) = d.get("$toString") {
+                // Support either scalar or single-element array
+                let val = if let bson::Bson::Array(arr) = arg { if arr.len() == 1 { eval_expr(doc, &arr[0]) } else { None } } else { eval_expr(doc, arg) };
+                let val = val.unwrap_or(bson::Bson::Null);
+                return Some(bson::Bson::String(bson_to_string(&val)));
+            }
+            if let Some(arr) = d.get_array("$ifNull").ok() {
+                if arr.len() == 2 {
+                    let first = eval_expr(doc, &arr[0]);
+                    match first {
+                        Some(bson::Bson::Null) | None => {
+                            let second = eval_expr(doc, &arr[1]).unwrap_or(bson::Bson::Null);
+                            return Some(second);
+                        }
+                        Some(v) => { return Some(v); }
+                    }
+                }
+            }
             if let Some(arr) = d.get_array("$add").ok() {
                 let mut sum = 0.0f64;
                 for op in arr {
@@ -961,11 +979,33 @@ fn eval_expr(doc: &Document, v: &bson::Bson) -> Option<bson::Bson> {
                 let a = number_as_f64(&eval_expr(doc, &arr[0])?)?;
                 let b = number_as_f64(&eval_expr(doc, &arr[1])?)?;
                 Some(bson::Bson::Double(a / b))
+            } else if let Some(arr) = d.get_array("$concat").ok() {
+                let mut out = String::new();
+                for op in arr {
+                    let ev = eval_expr(doc, op).unwrap_or(bson::Bson::Null);
+                    out.push_str(&bson_to_string(&ev));
+                }
+                Some(bson::Bson::String(out))
             } else {
                 None
             }
         }
         _ => Some(v.clone()),
+    }
+}
+
+fn bson_to_string(b: &bson::Bson) -> String {
+    match b {
+        bson::Bson::String(s) => s.clone(),
+        bson::Bson::Int32(n) => n.to_string(),
+        bson::Bson::Int64(n) => n.to_string(),
+        bson::Bson::Double(f) => {
+            let s = format!("{}", f);
+            s
+        }
+        bson::Bson::Boolean(v) => if *v { "true".into() } else { "false".into() },
+        bson::Bson::Null => String::new(),
+        other => format!("{:?}", other),
     }
 }
 
