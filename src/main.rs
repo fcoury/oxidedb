@@ -1,5 +1,6 @@
 use clap::Parser;
 use oxidedb::{config::Config, server};
+use clap::ArgAction;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -42,6 +43,11 @@ async fn main() -> anyhow::Result<()> {
         cli.listen_addr.clone(),
         cli.postgres_url.clone(),
         cli.log_level.clone(),
+        cli.shadow_enabled,
+        cli.shadow_addr.clone(),
+        cli.shadow_db_prefix.clone(),
+        cli.shadow_timeout_ms,
+        cli.shadow_sample_rate,
     );
     tracing::info!(listen_addr = %cfg.listen_addr, "starting oxidedb");
 
@@ -70,4 +76,24 @@ struct Cli {
     /// Log level or filter spec (e.g., info or info,oxidedb=debug)
     #[arg(long = "log-level", env = "OXIDEDB_LOG_LEVEL")]
     log_level: Option<String>,
+
+    /// Shadow: enable/disable upstream comparison
+    #[arg(long = "shadow-enabled", env = "OXIDEDB_SHADOW_ENABLED")]
+    shadow_enabled: Option<bool>,
+
+    /// Shadow: upstream MongoDB address (host:port)
+    #[arg(long = "shadow-addr", env = "OXIDEDB_SHADOW_ADDR")]
+    shadow_addr: Option<String>,
+
+    /// Shadow: optional DB prefix for upstream ($db becomes <prefix>_<db>)
+    #[arg(long = "shadow-db-prefix", env = "OXIDEDB_SHADOW_DB_PREFIX")]
+    shadow_db_prefix: Option<String>,
+
+    /// Shadow: request timeout in milliseconds
+    #[arg(long = "shadow-timeout-ms", env = "OXIDEDB_SHADOW_TIMEOUT_MS")]
+    shadow_timeout_ms: Option<u64>,
+
+    /// Shadow: sampling rate between 0.0 and 1.0
+    #[arg(long = "shadow-sample-rate", env = "OXIDEDB_SHADOW_SAMPLE_RATE")]
+    shadow_sample_rate: Option<f64>,
 }

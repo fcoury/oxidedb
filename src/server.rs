@@ -1,12 +1,14 @@
-use crate::config::Config;
+use crate::config::{Config, ShadowConfig};
 use crate::error::Result;
 use crate::protocol::{decode_op_msg_section0, decode_op_query, encode_op_msg, encode_op_reply, MessageHeader, OP_MSG, OP_QUERY};
+use crate::shadow::{compare_docs, ShadowSession};
 use crate::store::PgStore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use bson::{doc, Document};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
+use rand::Rng;
 
 static REQ_ID: AtomicI32 = AtomicI32::new(1);
 
@@ -25,6 +27,7 @@ pub struct AppState {
     pub store: Option<PgStore>,
     pub started_at: Instant,
     pub cursors: Mutex<HashMap<i64, CursorEntry>>,
+    pub shadow: Option<std::sync::Arc<ShadowConfig>>,
 }
 
 
@@ -38,15 +41,15 @@ pub async fn run(cfg: Config) -> Result<()> {
                 if let Err(e) = pg.bootstrap().await {
                     tracing::error!(error = %format!("{e:?}"), "failed to bootstrap metadata");
                 }
-                AppState { store: Some(pg), started_at: Instant::now(), cursors: Mutex::new(HashMap::new()) }
+                AppState { store: Some(pg), started_at: Instant::now(), cursors: Mutex::new(HashMap::new()), shadow: cfg.shadow.as_ref().map(|s| std::sync::Arc::new(s.clone())) }
             }
             Err(e) => {
                 tracing::error!(error = %format!("{e:?}"), "failed to connect to postgres; continuing without store");
-                AppState { store: None, started_at: Instant::now(), cursors: Mutex::new(HashMap::new()) }
+                AppState { store: None, started_at: Instant::now(), cursors: Mutex::new(HashMap::new()), shadow: cfg.shadow.as_ref().map(|s| std::sync::Arc::new(s.clone())) }
             }
         }
     } else {
-        AppState { store: None, started_at: Instant::now(), cursors: Mutex::new(HashMap::new()) }
+        AppState { store: None, started_at: Instant::now(), cursors: Mutex::new(HashMap::new()), shadow: cfg.shadow.as_ref().map(|s| std::sync::Arc::new(s.clone())) }
     };
     let state = Arc::new(state);
 
@@ -74,6 +77,8 @@ pub async fn run(cfg: Config) -> Result<()> {
 }
 
 async fn handle_connection(state: Arc<AppState>, mut socket: TcpStream) -> Result<()> {
+    // Per-connection shadow session (lazy connect)
+    let shadow_session = state.shadow.as_ref().and_then(|cfg| if cfg.enabled { Some(ShadowSession::new(cfg.clone())) } else { None });
     loop {
         // Read header
         let mut header_buf = [0u8; 16];
@@ -103,30 +108,104 @@ async fn handle_connection(state: Arc<AppState>, mut socket: TcpStream) -> Resul
 
         match hdr.op_code {
             OP_MSG => {
-                let reply_doc = match decode_op_msg_section0(&body) {
+                let (reply_doc, cmd_opt) = match decode_op_msg_section0(&body) {
                     Some((_flags, cmd)) => {
                         let db = cmd.get_str("$db").ok().map(|s| s.to_string());
-                        handle_command(&state, db.as_deref(), cmd).await
+                        (handle_command(&state, db.as_deref(), cmd.clone()).await, Some(cmd))
                     }
                     None => {
                         tracing::warn!("malformed OP_MSG body; sending ok:0");
-                        error_doc(1, "Malformed OP_MSG body")
+                        (error_doc(1, "Malformed OP_MSG body"), None)
                     }
                 };
                 let request_id = REQ_ID.fetch_add(1, Ordering::Relaxed);
                 let resp = encode_op_msg(&reply_doc, hdr.request_id, request_id);
                 socket.write_all(&resp).await?;
                 socket.flush().await?;
+
+                // Shadow forwarding (non-blocking)
+                if let Some(sh) = &shadow_session {
+                    let cfg = sh.cfg.clone();
+                    let header_bytes = header_buf.clone();
+                    let body_bytes = body.clone();
+                    let ours = reply_doc.clone();
+                    let cmd_name = cmd_opt.as_ref().and_then(|d| d.iter().next().map(|(k, _)| k.clone())).unwrap_or_else(|| "".to_string());
+                    let sample = rand::random::<f64>() < cfg.sample_rate;
+                    if sample {
+                        let sh = sh.clone();
+                        tokio::spawn(async move {
+                            let start = Instant::now();
+                            let res = tokio::time::timeout(Duration::from_millis(cfg.timeout_ms), sh.forward_and_read_doc(&hdr, &header_bytes, &body_bytes)).await;
+                            match res {
+                                Err(_) => {
+                                    tracing::debug!(command=%cmd_name, elapsed_ms=%start.elapsed().as_millis(), "shadow timeout");
+                                }
+                                Ok(Err(e)) => {
+                                    tracing::debug!(command=%cmd_name, error=%e, "shadow error");
+                                }
+                                Ok(Ok(up_doc_opt)) => {
+                                    if let Some(up_doc) = up_doc_opt {
+                                        let diff = compare_docs(&ours, &up_doc, &cfg.compare);
+                                        if diff.matched {
+                                            tracing::debug!(command=%cmd_name, elapsed_ms=%start.elapsed().as_millis(), "shadow match");
+                                        } else {
+                                            tracing::info!(command=%cmd_name, elapsed_ms=%start.elapsed().as_millis(), summary=%diff.summary, details=?diff.details, "shadow mismatch");
+                                        }
+                                    } else {
+                                        tracing::debug!(command=%cmd_name, elapsed_ms=%start.elapsed().as_millis(), "shadow unsupported reply op");
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
             }
             OP_QUERY => {
                 match decode_op_query(&body) {
                     Some((_flags, fqn, _skip, _nret, cmd)) => {
                         let db = parse_db_from_fqn(&fqn);
+                        let cmd_name = cmd.iter().next().map(|(k, _)| k.clone()).unwrap_or_else(|| "".to_string());
                         let reply_doc = handle_command(&state, db.as_deref(), cmd).await;
                         let request_id = REQ_ID.fetch_add(1, Ordering::Relaxed);
-                        let resp = encode_op_reply(&[reply_doc], hdr.request_id, request_id);
+                        let resp = encode_op_reply(&[reply_doc.clone()], hdr.request_id, request_id);
                         socket.write_all(&resp).await?;
                         socket.flush().await?;
+
+                        // Shadow forwarding (non-blocking)
+                        if let Some(sh) = &shadow_session {
+                            let cfg = sh.cfg.clone();
+                            let header_bytes = header_buf.clone();
+                            let body_bytes = body.clone();
+                            let ours = reply_doc.clone();
+                            let sample = rand::random::<f64>() < cfg.sample_rate;
+                            if sample {
+                                let sh = sh.clone();
+                                tokio::spawn(async move {
+                                    let start = Instant::now();
+                                    let res = tokio::time::timeout(Duration::from_millis(cfg.timeout_ms), sh.forward_and_read_doc(&hdr, &header_bytes, &body_bytes)).await;
+                                    match res {
+                                        Err(_) => {
+                                            tracing::debug!(command=%cmd_name, elapsed_ms=%start.elapsed().as_millis(), "shadow timeout");
+                                        }
+                                        Ok(Err(e)) => {
+                                            tracing::debug!(command=%cmd_name, error=%e, "shadow error");
+                                        }
+                                        Ok(Ok(up_doc_opt)) => {
+                                            if let Some(up_doc) = up_doc_opt {
+                                                let diff = compare_docs(&ours, &up_doc, &cfg.compare);
+                                                if diff.matched {
+                                                    tracing::debug!(command=%cmd_name, elapsed_ms=%start.elapsed().as_millis(), "shadow match");
+                                                } else {
+                                                    tracing::info!(command=%cmd_name, elapsed_ms=%start.elapsed().as_millis(), summary=%diff.summary, details=?diff.details, "shadow mismatch");
+                                                }
+                                            } else {
+                                                tracing::debug!(command=%cmd_name, elapsed_ms=%start.elapsed().as_millis(), "shadow unsupported reply op");
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                        }
                     }
                     None => {
                         tracing::warn!("malformed OP_QUERY body; ignoring");
@@ -457,7 +536,7 @@ mod tests {
 
     #[tokio::test]
     async fn prune_removes_idle_cursors() {
-        let state = AppState { store: None, started_at: Instant::now(), cursors: Mutex::new(HashMap::new()) };
+        let state = AppState { store: None, started_at: Instant::now(), cursors: Mutex::new(HashMap::new()), shadow: None };
         {
             let mut map = state.cursors.lock().await;
             map.insert(1, CursorEntry { ns: "db.coll".into(), docs: vec![], pos: 0, last_access: Instant::now() - Duration::from_secs(100) });

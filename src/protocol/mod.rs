@@ -155,3 +155,40 @@ pub fn encode_op_reply(docs: &[Document], response_to: i32, request_id: i32) -> 
     out.extend_from_slice(&docs_buf);
     out
 }
+
+/// Decode OP_REPLY body and return the first document if present.
+/// OP_REPLY body layout:
+/// - int32: responseFlags
+/// - int64: cursorID
+/// - int32: startingFrom
+/// - int32: numberReturned
+/// - BSON documents (numberReturned of them)
+pub fn decode_op_reply_first_doc(body: &[u8]) -> Option<Document> {
+    if body.len() < 4 + 8 + 4 + 4 {
+        return None;
+    }
+    let mut i = 0usize;
+    // responseFlags
+    let _flags = u32::from_le_bytes([body[i], body[i + 1], body[i + 2], body[i + 3]]);
+    i += 4;
+    // cursorID
+    let _cursor_id = i64::from_le_bytes([
+        body[i], body[i + 1], body[i + 2], body[i + 3], body[i + 4], body[i + 5], body[i + 6], body[i + 7],
+    ]);
+    i += 8;
+    // startingFrom
+    let _starting_from = i32::from_le_bytes([body[i], body[i + 1], body[i + 2], body[i + 3]]);
+    i += 4;
+    // numberReturned
+    let number_returned = i32::from_le_bytes([body[i], body[i + 1], body[i + 2], body[i + 3]]);
+    i += 4;
+    if number_returned <= 0 {
+        return None;
+    }
+    let doc_bytes = &body[i..];
+    let mut cur = std::io::Cursor::new(doc_bytes);
+    match bson::Document::from_reader(&mut cur) {
+        Ok(doc) => Some(doc),
+        Err(_) => None,
+    }
+}
