@@ -467,6 +467,17 @@ impl PgStore {
         Ok(())
     }
 
+    pub async fn count_docs(&self, db: &str, coll: &str, filter: Option<&bson::Document>) -> Result<i64> {
+        let schema = schema_name(db);
+        let q_schema = q_ident(&schema);
+        let q_table = q_ident(coll);
+        let where_sql = filter.map(build_where_from_filter).unwrap_or_else(|| "TRUE".to_string());
+        let sql = format!("SELECT COUNT(*) FROM {}.{} WHERE {}", q_schema, q_table, where_sql);
+        let row = self.client.query_one(&sql, &[]).await.map_err(err_msg)?;
+        let n: i64 = row.get(0);
+        Ok(n)
+    }
+
     // --- Update/Delete helpers (basic) ---
 
     /// Find one matching document for update, returning (id bytes, document).

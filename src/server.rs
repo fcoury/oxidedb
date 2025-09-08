@@ -605,7 +605,13 @@ async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
         if upsert { return error_doc(20, "upsert not supported"); }
         let set_doc = udoc.get_document("$set").ok().cloned();
         let unset_doc = udoc.get_document("$unset").ok().cloned();
-        if set_doc.is_none() && unset_doc.is_none() { return error_doc(9, "Only $set/$unset supported"); }
+        let inc_doc = udoc.get_document("$inc").ok().cloned();
+        let rename_doc = udoc.get_document("$rename").ok().cloned();
+        let push_doc = udoc.get_document("$push").ok().cloned();
+        let pull_doc = udoc.get_document("$pull").ok().cloned();
+        if set_doc.is_none() && unset_doc.is_none() && inc_doc.is_none() && rename_doc.is_none() && push_doc.is_none() && pull_doc.is_none() {
+            return error_doc(9, "Only $set/$unset/$inc/$rename/$push/$pull supported");
+        }
 
         // Validate array index segments (disallow negative indexes)
         if let Some(ref sets) = set_doc {
@@ -615,6 +621,29 @@ async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
         }
         if let Some(ref unsets) = unset_doc {
             for (k, _v) in unsets.iter() {
+                if path_has_negative_index(k) { return error_doc(2, "Negative array indexes not supported"); }
+            }
+        }
+        if let Some(ref incs) = inc_doc {
+            for (k, v) in incs.iter() {
+                if path_has_negative_index(k) { return error_doc(2, "Negative array indexes not supported"); }
+                if !matches!(v, bson::Bson::Int32(_)|bson::Bson::Int64(_)|bson::Bson::Double(_)) { return error_doc(2, "$inc requires numeric value"); }
+            }
+        }
+        if let Some(ref ren) = rename_doc {
+            for (from, to_b) in ren.iter() {
+                if path_has_negative_index(from) { return error_doc(2, "Negative array indexes not supported"); }
+                let to = match to_b { bson::Bson::String(s) => s, _ => return error_doc(2, "$rename target must be string path") };
+                if path_has_negative_index(to) { return error_doc(2, "Negative array indexes not supported"); }
+            }
+        }
+        if let Some(ref pushes) = push_doc {
+            for (k, _v) in pushes.iter() {
+                if path_has_negative_index(k) { return error_doc(2, "Negative array indexes not supported"); }
+            }
+        }
+        if let Some(ref pulls) = pull_doc {
+            for (k, _v) in pulls.iter() {
                 if path_has_negative_index(k) { return error_doc(2, "Negative array indexes not supported"); }
             }
         }
@@ -628,18 +657,29 @@ async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
             if docs.is_empty() { continue; }
             for mut d in docs {
                 let idb = match d.get("_id").and_then(|b| id_bytes_bson(b)) { Some(v) => v, None => continue };
-                // apply nested $set
+                // remember original
+                let orig = d.clone();
+                // $set
                 if let Some(ref sets) = set_doc {
                     for (k, v) in sets.iter() { set_path_nested(&mut d, k, v.clone()); }
                 }
+                // $unset
                 if let Some(ref unsets) = unset_doc {
                     for (k, _v) in unsets.iter() { unset_path_nested(&mut d, k); }
                 }
+                // $inc
+                if let Some(ref incs) = inc_doc { for (k, v) in incs.iter() { if !apply_inc(&mut d, k, v.clone()) { continue; } } }
+                // $rename
+                if let Some(ref ren) = rename_doc { for (from, to_b) in ren.iter() { if let bson::Bson::String(to) = to_b { apply_rename(&mut d, from, to); } } }
+                // $push
+                if let Some(ref pushes) = push_doc { for (k, v) in pushes.iter() { if !apply_push(&mut d, k, v.clone()) { return error_doc(2, "$push on non-array"); } } }
+                // $pull
+                if let Some(ref pulls) = pull_doc { for (k, v) in pulls.iter() { apply_pull(&mut d, k, v.clone()); } }
                 if let Err(e) = pg.update_doc_by_id(dbname, coll, &idb, &d).await {
                     tracing::warn!("update_doc_by_id failed: {}", e);
                 } else {
                     matched_total += 1;
-                    modified_total += 1;
+                    if d != orig { modified_total += 1; }
                 }
             }
         } else {
@@ -649,12 +689,17 @@ async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
                 Err(e) => return error_doc(59, format!("find failed: {}", e)),
             };
             if let Some((idb, mut doc0)) = found {
+                let orig = doc0.clone();
                 if let Some(ref sets) = set_doc { for (k, v) in sets.iter() { set_path_nested(&mut doc0, k, v.clone()); } }
                 if let Some(ref unsets) = unset_doc { for (k, _v) in unsets.iter() { unset_path_nested(&mut doc0, k); } }
+                if let Some(ref incs) = inc_doc { for (k, v) in incs.iter() { if !apply_inc(&mut doc0, k, v.clone()) { return error_doc(2, "$inc requires numeric field"); } } }
+                if let Some(ref ren) = rename_doc { for (from, to_b) in ren.iter() { if let bson::Bson::String(to) = to_b { apply_rename(&mut doc0, from, to); } } }
+                if let Some(ref pushes) = push_doc { for (k, v) in pushes.iter() { if !apply_push(&mut doc0, k, v.clone()) { return error_doc(2, "$push on non-array"); } } }
+                if let Some(ref pulls) = pull_doc { for (k, v) in pulls.iter() { apply_pull(&mut doc0, k, v.clone()); } }
                 match pg.update_doc_by_id(dbname, coll, &idb, &doc0).await {
                     Ok(n) => {
                         matched_total += 1;
-                        if n > 0 { modified_total += 1; }
+                        if doc0 != orig { modified_total += 1; }
                     }
                     Err(e) => return error_doc(59, format!("update failed: {}", e)),
                 }
@@ -727,6 +772,118 @@ fn path_has_negative_index(path: &str) -> bool {
     false
 }
 
+fn parse_path<'a>(path: &'a str) -> Vec<&'a str> { path.split('.').collect() }
+
+fn get_path_bson_value(doc: &Document, path: &str) -> Option<bson::Bson> {
+    let mut cur = bson::Bson::Document(doc.clone());
+    for seg in parse_path(path) {
+        match (&cur, seg.parse::<usize>().ok()) {
+            (bson::Bson::Document(d), None) => {
+                cur = d.get(seg)?.clone();
+            }
+            (bson::Bson::Array(arr), Some(idx)) => {
+                cur = arr.get(idx)?.clone();
+            }
+            _ => return None,
+        }
+    }
+    Some(cur)
+}
+
+fn apply_rename(doc: &mut Document, from: &str, to: &str) {
+    if let Some(val) = get_path_bson_value(doc, from) {
+        unset_path_nested(doc, from);
+        set_path_nested(doc, to, val);
+    }
+}
+
+fn number_as_f64(b: &bson::Bson) -> Option<f64> {
+    match b { bson::Bson::Int32(n) => Some(*n as f64), bson::Bson::Int64(n) => Some(*n as f64), bson::Bson::Double(n) => Some(*n), _ => None }
+}
+
+fn apply_inc(doc: &mut Document, path: &str, delta: bson::Bson) -> bool {
+    let d = match number_as_f64(&delta) { Some(x) => x, None => return false };
+    let existing = get_path_bson_value(doc, path);
+    if let Some(curv) = existing {
+        if let Some(cur) = number_as_f64(&curv) {
+            let sum = cur + d;
+            set_path_nested(doc, path, bson::Bson::Double(sum));
+            true
+        } else {
+            false
+        }
+    } else {
+        // treat missing as 0
+        set_path_nested(doc, path, delta);
+        true
+    }
+}
+
+fn apply_push(doc: &mut Document, path: &str, val: bson::Bson) -> bool {
+    // Support: { $push: { a: v }} and { $push: { a: { $each: [v1, v2] } } }
+    // Fetch current value
+    let mut root = bson::Bson::Document(doc.clone());
+    let segs: Vec<&str> = path.split('.').collect();
+    // Navigate to parent array
+    let (parent_path, last) = if segs.is_empty() { return false; } else { ( &segs[..segs.len()-1], segs[segs.len()-1]) };
+    // Get parent
+    let mut parent = &mut root;
+    for seg in parent_path {
+        set_path_bson(parent, &[seg], bson::Bson::Document(Document::new()));
+        if let bson::Bson::Document(d) = parent { parent = d.get_mut(*seg).unwrap(); } else { return false; }
+    }
+    // Ensure array at last
+    if let bson::Bson::Document(d) = parent {
+        let entry = d.entry(last.to_string()).or_insert_with(|| bson::Bson::Array(Vec::new()));
+        match entry {
+            bson::Bson::Array(arr) => {
+                // Determine value(s)
+                if let bson::Bson::Document(spec) = val {
+                    if let Ok(each) = spec.get_array("$each") {
+                        for item in each { arr.push(item.clone()); }
+                    } else {
+                        return false;
+                    }
+                } else {
+                    arr.push(val);
+                }
+            }
+            _ => return false,
+        }
+    }
+    if let bson::Bson::Document(updated) = root { *doc = updated; true } else { false }
+}
+
+fn apply_pull(doc: &mut Document, path: &str, criterion: bson::Bson) {
+    let mut root = bson::Bson::Document(doc.clone());
+    let segs: Vec<&str> = path.split('.').collect();
+    let (parent_path, last) = if segs.is_empty() { return; } else { ( &segs[..segs.len()-1], segs[segs.len()-1]) };
+    // Navigate to parent
+    let mut parent = &mut root;
+    for seg in parent_path {
+        match parent {
+            bson::Bson::Document(d) => {
+                if !d.contains_key(*seg) { return; }
+                parent = d.get_mut(*seg).unwrap();
+            }
+            _ => return,
+        }
+    }
+    if let bson::Bson::Document(d) = parent {
+        if let Some(bson::Bson::Array(arr)) = d.get_mut(last) {
+            match criterion {
+                bson::Bson::Array(ref vals) => {
+                    arr.retain(|e| !vals.contains(e));
+                }
+                ref v => {
+                    arr.retain(|e| e != v);
+                }
+            }
+        }
+    }
+    if let bson::Bson::Document(updated) = root { *doc = updated; }
+}
+
 fn unset_path_bson(cur: &mut bson::Bson, segs: &[&str]) {
     if segs.is_empty() { return; }
     let seg = segs[0];
@@ -780,25 +937,23 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
     let pipeline = match cmd.get_array("pipeline") { Ok(a) => a, Err(_) => return error_doc(9, "Missing pipeline") };
     let cursor_spec = cmd.get_document("cursor").unwrap_or(&doc!{}).clone();
     let batch_size = cursor_spec.get_i32("batchSize").unwrap_or(101) as i64;
-    // Minimal pipeline support: $match, $sort, $project, $limit in order
+    // Minimal pipeline support: $match, $sort, $project, $limit, $skip, $addFields/$set in order
     let mut filter: Option<bson::Document> = None;
     let mut sort: Option<bson::Document> = None;
     let mut project: Option<bson::Document> = None;
     let mut limit: Option<i64> = None;
+    let mut skip: Option<i64> = None;
+    let mut add_fields: Option<bson::Document> = None;
+    let mut count_field: Option<String> = None;
     for st in pipeline {
         if let bson::Bson::Document(stage) = st {
             if let Ok(m) = stage.get_document("$match") { filter = Some(m.clone()); continue; }
             if let Ok(s) = stage.get_document("$sort") { sort = Some(s.clone()); continue; }
             if let Ok(p) = stage.get_document("$project") { project = Some(p.clone()); continue; }
             if let Some(l) = stage.get_i64("$limit").ok().or(stage.get_i32("$limit").ok().map(|v| v as i64)) { limit = Some(l); continue; }
-            if let Some(sk) = stage.get_i64("$skip").ok().or(stage.get_i32("$skip").ok().map(|v| v as i64)) { /* we'll post-skip */
-                // encode skip in limit behavior by fetching skip+limit and trimming later
-                let cur_lim = limit.unwrap_or(101);
-                limit = Some(sk + cur_lim);
-                // encode skip by stashing in project as a special marker (we'll do trimming below)
-                project = project.map(|mut p| { p.insert("__skip_marker__", sk); p }).or_else(|| Some(doc!{"__skip_marker__": sk}));
-                continue;
-            }
+            if let Some(sk) = stage.get_i64("$skip").ok().or(stage.get_i32("$skip").ok().map(|v| v as i64)) { skip = Some(sk); continue; }
+            if let Ok(af) = stage.get_document("$addFields").or(stage.get_document("$set")) { add_fields = Some(af.clone()); continue; }
+            if let Ok(cf) = stage.get_str("$count") { count_field = Some(cf.to_string()); continue; }
             // Unknown $stage: error
             if stage.keys().any(|k| k.starts_with('$')) {
                 return error_doc(9, format!("Unsupported pipeline stage: {}", stage.keys().next().unwrap()));
@@ -807,14 +962,29 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
     }
     if state.store.is_none() { return error_doc(13, "No storage configured"); }
     let pg = state.store.as_ref().unwrap();
-    let docs = match pg.find_docs(dbname, coll, filter.as_ref(), sort.as_ref(), project.as_ref(), limit.unwrap_or(batch_size * 10)).await {
+    // Handle $count early: compute count from filter and adjust with skip/limit
+    if let Some(field) = count_field {
+        let total = match pg.count_docs(dbname, coll, filter.as_ref()).await { Ok(n) => n, Err(e) => return error_doc(59, format!("aggregate failed: {}", e)) };
+        let mut n = total;
+        if let Some(sk) = skip { n = (n - sk).max(0); }
+        if let Some(l) = limit { n = n.min(l); }
+        let d = doc!{ field: n };
+        return doc!{ "cursor": {"id": 0i64, "ns": format!("{}.{}", dbname, coll), "firstBatch": [d] }, "ok": 1.0 };
+    }
+
+    let fetch_limit = skip.unwrap_or(0) + limit.unwrap_or(batch_size * 10);
+    let mut docs = match pg.find_docs(dbname, coll, filter.as_ref(), sort.as_ref(), project.as_ref(), fetch_limit).await {
         Ok(v) => v,
         Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
     };
     // Apply skip trimming if requested
-    let mut docs = docs;
-    let skip_val = project.as_ref().and_then(|p| p.get_i64("__skip_marker__").ok());
-    if let Some(sk) = skip_val { if sk as usize <= docs.len() { docs.drain(0..(sk as usize)); } else { docs.clear(); } }
+    if let Some(sk) = skip { if sk as usize <= docs.len() { docs.drain(0..(sk as usize)); } else { docs.clear(); } }
+    // Apply addFields/$set
+    if let Some(af) = add_fields.as_ref() {
+        for d in docs.iter_mut() {
+            for (k, v) in af.iter() { set_path_nested(d, k, v.clone()); }
+        }
+    }
     let (first_batch, remainder): (Vec<_>, Vec<_>) = docs.into_iter().enumerate().partition(|(i, _)| (*i as i64) < batch_size);
     let first_docs: Vec<Document> = first_batch.into_iter().map(|(_, d)| d).collect();
     let rest_docs: Vec<Document> = remainder.into_iter().map(|(_, d)| d).collect();
