@@ -120,8 +120,6 @@ numeric_equivalence = false
 
 Quickly start a MongoDB 7.0 for shadow testing on port 27018.
 
-- No‑auth (recommended for current shadow tests):
-
 ```
 docker run -d \
   --name mongo7 \
@@ -130,19 +128,6 @@ docker run -d \
 ```
 
 Then set `export OXIDEDB_TEST_MONGODB_ADDR=127.0.0.1:27018` and run tests or start OxideDB with shadow enabled.
-
-- Auth‑enabled (username/password `admin`/`password`):
-
-```
-docker run -d \
-  --name mongodb \
-  -p 27018:27017 \
-  -e MONGO_INITDB_ROOT_USERNAME=admin \
-  -e MONGO_INITDB_ROOT_PASSWORD=password \
-  mongo:7
-```
-
-Note: In auth mode, OxideDB’s shadow forwarder does not authenticate upstream yet; read‑only commands like `hello`, `ping`, and `buildInfo` typically work, but writes/reads that require privileges may be rejected by MongoDB. Prefer the no‑auth setup for comprehensive shadow tests until upstream auth is supported.
 
 ## Roadmap
 
