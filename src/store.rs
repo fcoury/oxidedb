@@ -466,6 +466,64 @@ impl PgStore {
             .map_err(err_msg)?;
         Ok(())
     }
+
+    // --- Update/Delete helpers (basic) ---
+
+    /// Find one matching document for update, returning (id bytes, document).
+    pub async fn find_one_for_update(&self, db: &str, coll: &str, filter: &bson::Document) -> Result<Option<(Vec<u8>, bson::Document)>> {
+        let schema = schema_name(db);
+        let q_schema = q_ident(&schema);
+        let q_table = q_ident(coll);
+        let where_sql = build_where_from_filter(filter);
+        let sql = format!(
+            "SELECT id, doc_bson, doc FROM {}.{} WHERE {} ORDER BY id ASC LIMIT 1",
+            q_schema, q_table, where_sql
+        );
+        let rows = self.client.query(&sql, &[]).await.map_err(err_msg)?;
+        if rows.is_empty() { return Ok(None); }
+        let r = &rows[0];
+        let id: Vec<u8> = r.get(0);
+        // Prefer bson if present
+        if let Ok(bytes) = r.try_get::<usize, Vec<u8>>(1) {
+            if let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes)) {
+                return Ok(Some((id, doc)));
+            }
+        }
+        let json: serde_json::Value = r.get(2);
+        let b = bson::to_bson(&json).unwrap_or(bson::Bson::Document(bson::Document::new()));
+        let doc = match b { bson::Bson::Document(d) => d, _ => bson::Document::new() };
+        Ok(Some((id, doc)))
+    }
+
+    /// Overwrite the full document by id (updates both doc_bson and doc JSON).
+    pub async fn update_doc_by_id(&self, db: &str, coll: &str, id: &[u8], new_doc: &bson::Document) -> Result<u64> {
+        let schema = schema_name(db);
+        let q_schema = q_ident(&schema);
+        let q_table = q_ident(coll);
+        let sql = format!("UPDATE {}.{} SET doc_bson = $1, doc = $2 WHERE id = $3", q_schema, q_table);
+        let bson_bytes = bson::to_vec(new_doc).map_err(err_msg)?;
+        let json = serde_json::to_value(new_doc).map_err(err_msg)?;
+        let n = self.client.execute(&sql, &[&bson_bytes, &json, &id]).await.map_err(err_msg)?;
+        Ok(n)
+    }
+
+    /// Delete one matching row based on filter; returns number of rows deleted (0 or 1).
+    pub async fn delete_one_by_filter(&self, db: &str, coll: &str, filter: &bson::Document) -> Result<u64> {
+        let schema = schema_name(db);
+        let q_schema = q_ident(&schema);
+        let q_table = q_ident(coll);
+        let where_sql = build_where_from_filter(filter);
+        let select_sql = format!(
+            "SELECT id FROM {}.{} WHERE {} ORDER BY id ASC LIMIT 1",
+            q_schema, q_table, where_sql
+        );
+        let rows = self.client.query(&select_sql, &[]).await.map_err(err_msg)?;
+        if rows.is_empty() { return Ok(0); }
+        let id: Vec<u8> = rows[0].get(0);
+        let del_sql = format!("DELETE FROM {}.{} WHERE id = $1", q_schema, q_table);
+        let n = self.client.execute(&del_sql, &[&id]).await.map_err(err_msg)?;
+        Ok(n)
+    }
 }
 
 fn schema_name(db: &str) -> String {

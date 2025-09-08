@@ -386,6 +386,9 @@ async fn handle_command(state: &AppState, db: Option<&str>, mut cmd: Document) -
         "drop" => drop_collection_reply(state, db, &cmd).await,
         "dropDatabase" => drop_database_reply(state, db).await,
         "insert" => insert_reply(state, db, &mut cmd).await,
+        "update" => update_reply(state, db, &cmd).await,
+        "delete" => delete_reply(state, db, &cmd).await,
+        "aggregate" => aggregate_reply(state, db, &cmd).await,
         "find" => find_reply(state, db, &cmd).await,
         "getMore" => get_more_reply(state, &cmd).await,
         "createIndexes" => create_indexes_reply(state, db, &cmd).await,
@@ -580,6 +583,92 @@ async fn insert_reply(state: &AppState, db: Option<&str>, cmd: &mut Document) ->
     } else {
         error_doc(13, "No storage configured")
     }
+}
+
+async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Document {
+    let dbname = match db { Some(d) => d, None => return error_doc(59, "Missing $db") };
+    let coll = match cmd.get_str("update") { Ok(c) => c, Err(_) => return error_doc(9, "Invalid update") };
+    let updates = match cmd.get_array("updates") { Ok(a) => a, Err(_) => return error_doc(9, "Missing updates") };
+    if updates.is_empty() { return error_doc(9, "Empty updates"); }
+    let first = match &updates[0] { bson::Bson::Document(d) => d, _ => return error_doc(9, "Invalid update spec") };
+    let filter = match first.get_document("q") { Ok(d) => d.clone(), Err(_) => return error_doc(9, "Missing q") };
+    let udoc = match first.get_document("u") { Ok(d) => d.clone(), Err(_) => return error_doc(9, "Missing u") };
+    let multi = first.get_bool("multi").unwrap_or(false);
+    let upsert = first.get_bool("upsert").unwrap_or(false);
+    if multi { return error_doc(9, "multi updates not supported"); }
+    if upsert { return error_doc(9, "upsert not supported"); }
+    if state.store.is_none() { return error_doc(13, "No storage configured"); }
+    let pg = state.store.as_ref().unwrap();
+    // Only support $set updates for now
+    let set_doc = if let Ok(sd) = udoc.get_document("$set") { sd.clone() } else { return error_doc(9, "Only $set supported"); };
+    // Find a matching doc
+    let found = match pg.find_one_for_update(dbname, coll, &filter).await {
+        Ok(v) => v,
+        Err(e) => return error_doc(59, format!("find failed: {}", e)),
+    };
+    if let Some((idb, mut doc0)) = found {
+        // Apply top-level $set
+        for (k, v) in set_doc.iter() {
+            doc0.insert(k.clone(), v.clone());
+        }
+        // Preserve _id
+        if let Some(idv) = filter.get("_id").cloned() { doc0.insert("_id", idv); }
+        match pg.update_doc_by_id(dbname, coll, &idb, &doc0).await {
+            Ok(n) => {
+                let modified = if n > 0 { 1 } else { 0 };
+                doc!{"n": 1i32, "nModified": modified as i32, "ok": 1.0}
+            }
+            Err(e) => error_doc(59, format!("update failed: {}", e)),
+        }
+    } else {
+        doc!{"n": 0i32, "nModified": 0i32, "ok": 1.0}
+    }
+}
+
+async fn delete_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Document {
+    let dbname = match db { Some(d) => d, None => return error_doc(59, "Missing $db") };
+    let coll = match cmd.get_str("delete") { Ok(c) => c, Err(_) => return error_doc(9, "Invalid delete") };
+    let deletes = match cmd.get_array("deletes") { Ok(a) => a, Err(_) => return error_doc(9, "Missing deletes") };
+    if deletes.is_empty() { return error_doc(9, "Empty deletes"); }
+    let first = match &deletes[0] { bson::Bson::Document(d) => d, _ => return error_doc(9, "Invalid delete spec") };
+    let filter = match first.get_document("q") { Ok(d) => d.clone(), Err(_) => return error_doc(9, "Missing q") };
+    let limit = first.get_i32("limit").unwrap_or(1);
+    if limit != 1 { return error_doc(9, "Only limit=1 supported"); }
+    if state.store.is_none() { return error_doc(13, "No storage configured"); }
+    let pg = state.store.as_ref().unwrap();
+    match pg.delete_one_by_filter(dbname, coll, &filter).await {
+        Ok(n) => doc!{"n": (n as i32), "ok": 1.0},
+        Err(e) => error_doc(59, format!("delete failed: {}", e)),
+    }
+}
+
+async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Document {
+    let dbname = match db { Some(d) => d, None => return error_doc(59, "Missing $db") };
+    let coll = match cmd.get_str("aggregate") { Ok(c) => c, Err(_) => return error_doc(9, "Invalid aggregate") };
+    let pipeline = match cmd.get_array("pipeline") { Ok(a) => a, Err(_) => return error_doc(9, "Missing pipeline") };
+    let cursor_spec = cmd.get_document("cursor").unwrap_or(&doc!{}).clone();
+    let batch_size = cursor_spec.get_i32("batchSize").unwrap_or(101) as i64;
+    // Minimal support: $match only (first stage)
+    let mut filter: Option<bson::Document> = None;
+    if !pipeline.is_empty() {
+        if let bson::Bson::Document(stage) = &pipeline[0] {
+            if let Ok(m) = stage.get_document("$match") { filter = Some(m.clone()); }
+        }
+    }
+    if state.store.is_none() { return error_doc(13, "No storage configured"); }
+    let pg = state.store.as_ref().unwrap();
+    let docs = match pg.find_docs(dbname, coll, filter.as_ref(), None, None, batch_size * 10).await {
+        Ok(v) => v,
+        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
+    };
+    let (first_batch, remainder): (Vec<_>, Vec<_>) = docs.into_iter().enumerate().partition(|(i, _)| (*i as i64) < batch_size);
+    let first_docs: Vec<Document> = first_batch.into_iter().map(|(_, d)| d).collect();
+    let rest_docs: Vec<Document> = remainder.into_iter().map(|(_, d)| d).collect();
+    let ns = format!("{}.{}", dbname, coll);
+    let mut cursor_doc = doc!{ "ns": ns.clone(), "firstBatch": first_docs };
+    let cursor_id = if rest_docs.is_empty() { 0i64 } else { new_cursor(state, ns, rest_docs).await };
+    cursor_doc.insert("id", cursor_id);
+    doc! { "cursor": cursor_doc, "ok": 1.0 }
 }
 
 async fn find_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Document {
