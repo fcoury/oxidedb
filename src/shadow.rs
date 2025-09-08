@@ -154,35 +154,42 @@ pub struct DiffResult {
 }
 
 pub fn compare_docs(ours: &Document, theirs: &Document, opts: &ShadowCompareOptions) -> DiffResult {
-    // Apply ignores (top-level only for initial pass)
+    // Clone and apply path-based ignores
     let mut ours_n = ours.clone();
     let mut theirs_n = theirs.clone();
-    for k in &opts.ignore_fields {
-        ours_n.remove(k);
-        theirs_n.remove(k);
+    let patterns: Vec<Vec<PatternSeg>> = opts
+        .ignore_fields
+        .iter()
+        .map(|p| parse_pattern(p))
+        .collect();
+    for pat in &patterns {
+        apply_ignore_pattern_doc_inplace(&mut ours_n, pat, 0);
+        apply_ignore_pattern_doc_inplace(&mut theirs_n, pat, 0);
     }
 
+    // Collect diffs with path context
     let mut diffs: Vec<String> = Vec::new();
-    // compare keys union
-    let mut keys: Vec<String> = ours_n.keys().map(|s| s.to_string()).collect();
-    for k in theirs_n.keys() { if !keys.iter().any(|x| x == k) { keys.push(k.to_string()); } }
-    keys.sort(); keys.dedup();
-    for k in keys {
-        let a = ours_n.get(&k);
-        let b = theirs_n.get(&k);
-        match (a, b) {
-            (None, Some(_)) => diffs.push(format!("missing key in ours: {}", k)),
-            (Some(_), None) => diffs.push(format!("extra key in ours: {}", k)),
-            (Some(av), Some(bv)) => {
-                if !bson_equal(av, bv, opts) {
-                    diffs.push(format!("{}. ours={:?} theirs={:?}", k, av, bv));
-                }
-            }
-            _ => {}
-        }
-    }
+    diff_bson(
+        &Bson::Document(ours_n),
+        &Bson::Document(theirs_n),
+        &mut Vec::new(),
+        &mut diffs,
+        opts,
+        0,
+    );
+
     let matched = diffs.is_empty();
-    let summary = if matched { "match".to_string() } else { format!("{} diffs", diffs.len()) };
+    let summary = if matched {
+        "match".to_string()
+    } else {
+        format!("{} diffs", diffs.len())
+    };
+    // Limit details to avoid log blow-ups
+    let max_lines = 12usize;
+    if diffs.len() > max_lines {
+        diffs.truncate(max_lines);
+        diffs.push("... (truncated)".to_string());
+    }
     let details = if matched { None } else { Some(diffs.join("; ")) };
     DiffResult { matched, summary, details }
 }
@@ -191,13 +198,146 @@ fn bson_equal(a: &Bson, b: &Bson, opts: &ShadowCompareOptions) -> bool {
     match (a, b) {
         (Bson::Document(da), Bson::Document(db)) => compare_docs(da, db, opts).matched,
         (Bson::Array(aa), Bson::Array(ab)) => {
-            if aa.len() != ab.len() { return false; }
+            if aa.len() != ab.len() {
+                return false;
+            }
             for (ea, eb) in aa.iter().zip(ab.iter()) {
-                if !bson_equal(ea, eb, opts) { return false; }
+                if !bson_equal(ea, eb, opts) {
+                    return false;
+                }
             }
             true
         }
-        // Numeric equivalence disabled by default per requirements.
+        // Optional numeric equivalence
+        (Bson::Int32(x), Bson::Int64(y)) => opts.numeric_equivalence && (*x as i64) == *y,
+        (Bson::Int64(x), Bson::Int32(y)) => opts.numeric_equivalence && *x == (*y as i64),
+        (Bson::Int32(x), Bson::Double(y)) => opts.numeric_equivalence && (*x as f64) == *y,
+        (Bson::Int64(x), Bson::Double(y)) => opts.numeric_equivalence && (*x as f64) == *y,
+        (Bson::Double(x), Bson::Int32(y)) => opts.numeric_equivalence && *x == (*y as f64),
+        (Bson::Double(x), Bson::Int64(y)) => opts.numeric_equivalence && *x == (*y as f64),
         _ => a == b,
+    }
+}
+
+// -------- Path-based ignore implementation --------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PatternSeg {
+    Exact(String),
+    Wildcard,
+}
+
+fn parse_pattern(p: &str) -> Vec<PatternSeg> {
+    p.split('.')
+        .map(|seg| if seg == "*" { PatternSeg::Wildcard } else { PatternSeg::Exact(seg.to_string()) })
+        .collect()
+}
+
+fn apply_ignore_pattern_doc_inplace(doc: &mut Document, pat: &Vec<PatternSeg>, idx: usize) {
+    if idx >= pat.len() { return; }
+    match &pat[idx] {
+        PatternSeg::Exact(k) => {
+            if idx == pat.len() - 1 {
+                doc.remove(k);
+            } else if let Some(Bson::Document(sub)) = doc.get_mut(k) {
+                apply_ignore_pattern_doc_inplace(sub, pat, idx + 1);
+            } else if let Some(Bson::Array(arr)) = doc.get_mut(k) {
+                for v in arr.iter_mut() {
+                    if let Bson::Document(d) = v { apply_ignore_pattern_doc_inplace(d, pat, idx + 1); }
+                }
+            }
+        }
+        PatternSeg::Wildcard => {
+            if idx == pat.len() - 1 {
+                let keys: Vec<String> = doc.keys().map(|s| s.to_string()).collect();
+                for k in keys { doc.remove(&k); }
+            } else {
+                for (_k, v) in doc.iter_mut() {
+                    match v {
+                        Bson::Document(sub) => apply_ignore_pattern_doc_inplace(sub, pat, idx + 1),
+                        Bson::Array(arr) => {
+                            for vv in arr.iter_mut() {
+                                if let Bson::Document(d) = vv { apply_ignore_pattern_doc_inplace(d, pat, idx + 1); }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+// -------- Diff implementation --------
+
+fn diff_bson(a: &Bson, b: &Bson, path: &mut Vec<String>, out: &mut Vec<String>, opts: &ShadowCompareOptions, depth: usize) {
+    match (a, b) {
+        (Bson::Document(da), Bson::Document(db)) => {
+            // compare keys union
+            let mut keys: Vec<String> = da.keys().map(|s| s.to_string()).collect();
+            for k in db.keys() { if !keys.iter().any(|x| x == k) { keys.push(k.to_string()); } }
+            keys.sort(); keys.dedup();
+            for k in keys {
+                let av = da.get(&k);
+                let bv = db.get(&k);
+                path.push(k.clone());
+                match (av, bv) {
+                    (None, Some(_)) => out.push(format!("{} missing in ours", path_str(path))),
+                    (Some(_), None) => out.push(format!("{} extra in ours", path_str(path))),
+                    (Some(x), Some(y)) => diff_bson(x, y, path, out, opts, depth + 1),
+                    _ => {}
+                }
+                path.pop();
+            }
+        }
+        (Bson::Array(aa), Bson::Array(ab)) => {
+            if aa.len() != ab.len() {
+                out.push(format!("{} array length {} != {}", path_str(path), aa.len(), ab.len()));
+                return;
+            }
+            for (i, (ea, eb)) in aa.iter().zip(ab.iter()).enumerate() {
+                path.push(i.to_string());
+                diff_bson(ea, eb, path, out, opts, depth + 1);
+                path.pop();
+            }
+        }
+        _ => {
+            if !bson_equal(a, b, opts) {
+                out.push(format!(
+                    "{} ours={} theirs={}",
+                    path_str(path),
+                    redact_and_summarize(a, path),
+                    redact_and_summarize(b, path)
+                ));
+            }
+        }
+    }
+}
+
+fn path_str(path: &Vec<String>) -> String {
+    if path.is_empty() { "/".to_string() } else { format!("/{}", path.join("/")) }
+}
+
+fn redact_and_summarize(v: &Bson, path: &Vec<String>) -> String {
+    if is_sensitive_path(path) { return "<redacted>".to_string(); }
+    let s = format_bson_one_line(v);
+    if s.len() > 200 { format!("{}...", &s[..200]) } else { s }
+}
+
+fn is_sensitive_path(path: &Vec<String>) -> bool {
+    // Basic heuristic: redact fields containing these substrings
+    let lower: Vec<String> = path.iter().map(|s| s.to_lowercase()).collect();
+    for seg in &lower {
+        if seg.contains("password") || seg.contains("credential") || seg.contains("secret") || seg.contains("token") || seg.contains("sasl") {
+            return true;
+        }
+    }
+    false
+}
+
+fn format_bson_one_line(v: &Bson) -> String {
+    match v {
+        Bson::String(s) => format!("\"{}\"", s),
+        _ => format!("{:?}", v),
     }
 }

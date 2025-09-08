@@ -8,7 +8,7 @@ use tokio::net::{TcpListener, TcpStream};
 use bson::{doc, Document};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
-use rand::Rng;
+// use rand::Rng; // not used directly
 
 static REQ_ID: AtomicI32 = AtomicI32::new(1);
 
