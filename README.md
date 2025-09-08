@@ -105,6 +105,8 @@ numeric_equivalence = false
 - Sampling: shadow every request by default (`sample_rate=1.0`); set to a fraction (e.g., `0.1`) to reduce load.
 - Safety: shadow errors/timeouts are logged and never affect client responses in compare-only mode.
 
+More details: see `docs/shadow.md` for the full plan, configuration, wire behavior, comparer, metrics, and current progress.
+
 ## Tests
 
 - Run all tests (some may skip if env vars are unset):
