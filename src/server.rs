@@ -28,6 +28,11 @@ pub struct AppState {
     pub started_at: Instant,
     pub cursors: Mutex<HashMap<i64, CursorEntry>>,
     pub shadow: Option<std::sync::Arc<ShadowConfig>>,
+    // Shadow metrics
+    pub shadow_attempts: std::sync::atomic::AtomicU64,
+    pub shadow_matches: std::sync::atomic::AtomicU64,
+    pub shadow_mismatches: std::sync::atomic::AtomicU64,
+    pub shadow_timeouts: std::sync::atomic::AtomicU64,
 }
 
 
@@ -41,19 +46,46 @@ pub async fn run(cfg: Config) -> Result<()> {
                 if let Err(e) = pg.bootstrap().await {
                     tracing::error!(error = %format!("{e:?}"), "failed to bootstrap metadata");
                 }
-                AppState { store: Some(pg), started_at: Instant::now(), cursors: Mutex::new(HashMap::new()), shadow: cfg.shadow.as_ref().map(|s| std::sync::Arc::new(s.clone())) }
+                AppState {
+                    store: Some(pg),
+                    started_at: Instant::now(),
+                    cursors: Mutex::new(HashMap::new()),
+                    shadow: cfg.shadow.as_ref().map(|s| std::sync::Arc::new(s.clone())),
+                    shadow_attempts: std::sync::atomic::AtomicU64::new(0),
+                    shadow_matches: std::sync::atomic::AtomicU64::new(0),
+                    shadow_mismatches: std::sync::atomic::AtomicU64::new(0),
+                    shadow_timeouts: std::sync::atomic::AtomicU64::new(0),
+                }
             }
             Err(e) => {
                 tracing::error!(error = %format!("{e:?}"), "failed to connect to postgres; continuing without store");
-                AppState { store: None, started_at: Instant::now(), cursors: Mutex::new(HashMap::new()), shadow: cfg.shadow.as_ref().map(|s| std::sync::Arc::new(s.clone())) }
+                AppState {
+                    store: None,
+                    started_at: Instant::now(),
+                    cursors: Mutex::new(HashMap::new()),
+                    shadow: cfg.shadow.as_ref().map(|s| std::sync::Arc::new(s.clone())),
+                    shadow_attempts: std::sync::atomic::AtomicU64::new(0),
+                    shadow_matches: std::sync::atomic::AtomicU64::new(0),
+                    shadow_mismatches: std::sync::atomic::AtomicU64::new(0),
+                    shadow_timeouts: std::sync::atomic::AtomicU64::new(0),
+                }
             }
         }
     } else {
-        AppState { store: None, started_at: Instant::now(), cursors: Mutex::new(HashMap::new()), shadow: cfg.shadow.as_ref().map(|s| std::sync::Arc::new(s.clone())) }
+        AppState {
+            store: None,
+            started_at: Instant::now(),
+            cursors: Mutex::new(HashMap::new()),
+            shadow: cfg.shadow.as_ref().map(|s| std::sync::Arc::new(s.clone())),
+            shadow_attempts: std::sync::atomic::AtomicU64::new(0),
+            shadow_matches: std::sync::atomic::AtomicU64::new(0),
+            shadow_mismatches: std::sync::atomic::AtomicU64::new(0),
+            shadow_timeouts: std::sync::atomic::AtomicU64::new(0),
+        }
     };
     let state = Arc::new(state);
 
-    // Spawn cursor sweeper
+    // Spawn cursor sweeper (no shutdown in run())
     let ttl = Duration::from_secs(cfg.cursor_timeout_secs.unwrap_or(300));
     let sweep_interval = Duration::from_secs(cfg.cursor_sweep_interval_secs.unwrap_or(30));
     let sweeper_state = state.clone();
@@ -74,6 +106,115 @@ pub async fn run(cfg: Config) -> Result<()> {
             }
         });
     }
+}
+
+/// Spawn the server on the provided listen address and run until `shutdown` is signaled.
+/// Returns the shared `AppState`, the bound local address, a shutdown sender, and the task handle.
+pub async fn spawn_with_shutdown(mut cfg: Config) -> Result<(
+    std::sync::Arc<AppState>,
+    std::net::SocketAddr,
+    tokio::sync::watch::Sender<bool>,
+    tokio::task::JoinHandle<Result<()>>,
+)> {
+    use tokio::sync::watch;
+
+    // Allow ephemeral port usage in tests (e.g., 127.0.0.1:0)
+    let listener = TcpListener::bind(&cfg.listen_addr).await?;
+    let local_addr = listener.local_addr()?;
+
+    // Build state (mirrors run())
+    let state = if let Some(url) = cfg.postgres_url.clone() {
+        match PgStore::connect(&url).await {
+            Ok(pg) => {
+                if let Err(e) = pg.bootstrap().await {
+                    tracing::error!(error = %format!("{e:?}"), "failed to bootstrap metadata");
+                }
+                AppState {
+                    store: Some(pg),
+                    started_at: Instant::now(),
+                    cursors: Mutex::new(HashMap::new()),
+                    shadow: cfg.shadow.as_ref().map(|s| std::sync::Arc::new(s.clone())),
+                    shadow_attempts: std::sync::atomic::AtomicU64::new(0),
+                    shadow_matches: std::sync::atomic::AtomicU64::new(0),
+                    shadow_mismatches: std::sync::atomic::AtomicU64::new(0),
+                    shadow_timeouts: std::sync::atomic::AtomicU64::new(0),
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %format!("{e:?}"), "failed to connect to postgres; continuing without store");
+                AppState {
+                    store: None,
+                    started_at: Instant::now(),
+                    cursors: Mutex::new(HashMap::new()),
+                    shadow: cfg.shadow.as_ref().map(|s| std::sync::Arc::new(s.clone())),
+                    shadow_attempts: std::sync::atomic::AtomicU64::new(0),
+                    shadow_matches: std::sync::atomic::AtomicU64::new(0),
+                    shadow_mismatches: std::sync::atomic::AtomicU64::new(0),
+                    shadow_timeouts: std::sync::atomic::AtomicU64::new(0),
+                }
+            }
+        }
+    } else {
+        AppState {
+            store: None,
+            started_at: Instant::now(),
+            cursors: Mutex::new(HashMap::new()),
+            shadow: cfg.shadow.as_ref().map(|s| std::sync::Arc::new(s.clone())),
+            shadow_attempts: std::sync::atomic::AtomicU64::new(0),
+            shadow_matches: std::sync::atomic::AtomicU64::new(0),
+            shadow_mismatches: std::sync::atomic::AtomicU64::new(0),
+            shadow_timeouts: std::sync::atomic::AtomicU64::new(0),
+        }
+    };
+    let state = std::sync::Arc::new(state);
+
+    // Sweeper with shutdown
+    let ttl = Duration::from_secs(cfg.cursor_timeout_secs.unwrap_or(300));
+    let sweep_interval = Duration::from_secs(cfg.cursor_sweep_interval_secs.unwrap_or(30));
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let sweeper_state = state.clone();
+    let mut sweeper_shutdown = shutdown_rx.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(sweep_interval) => {
+                    prune_cursors_once(&sweeper_state, ttl).await;
+                }
+                _ = sweeper_shutdown.changed() => {
+                    if *sweeper_shutdown.borrow() { break; }
+                }
+            }
+        }
+    });
+
+    // Accept loop with shutdown
+    let state_accept = state.clone();
+    let handle = tokio::spawn(async move {
+        let listener = listener;
+        loop {
+            tokio::select! {
+                res = listener.accept() => {
+                    let (socket, addr) = match res {
+                        Ok(v) => v,
+                        Err(e) => { return Err(e.into()); }
+                    };
+                    tracing::debug!(%addr, "accepted connection");
+                    let state = state_accept.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_connection(state, socket).await {
+                            tracing::debug!(error = %format!("{e:?}"), "connection closed with error");
+                        }
+                    });
+                }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() { break; }
+                }
+            }
+        }
+        Ok(())
+    });
+
+    Ok((state, local_addr, shutdown_tx, handle))
 }
 
 async fn handle_connection(state: Arc<AppState>, mut socket: TcpStream) -> Result<()> {
@@ -133,11 +274,13 @@ async fn handle_connection(state: Arc<AppState>, mut socket: TcpStream) -> Resul
                     let sample = rand::random::<f64>() < cfg.sample_rate;
                     if sample {
                         let sh = sh.clone();
+                        let state2 = state.clone();
                         tokio::spawn(async move {
                             let start = Instant::now();
                             let res = tokio::time::timeout(Duration::from_millis(cfg.timeout_ms), sh.forward_and_read_doc(&hdr, &header_bytes, &body_bytes)).await;
                             match res {
                                 Err(_) => {
+                                    state2.shadow_timeouts.fetch_add(1, Ordering::Relaxed);
                                     tracing::debug!(command=%cmd_name, elapsed_ms=%start.elapsed().as_millis(), "shadow timeout");
                                 }
                                 Ok(Err(e)) => {
@@ -145,10 +288,13 @@ async fn handle_connection(state: Arc<AppState>, mut socket: TcpStream) -> Resul
                                 }
                                 Ok(Ok(up_doc_opt)) => {
                                     if let Some(up_doc) = up_doc_opt {
+                                        state2.shadow_attempts.fetch_add(1, Ordering::Relaxed);
                                         let diff = compare_docs(&ours, &up_doc, &cfg.compare);
                                         if diff.matched {
+                                            state2.shadow_matches.fetch_add(1, Ordering::Relaxed);
                                             tracing::debug!(command=%cmd_name, elapsed_ms=%start.elapsed().as_millis(), "shadow match");
                                         } else {
+                                            state2.shadow_mismatches.fetch_add(1, Ordering::Relaxed);
                                             tracing::info!(command=%cmd_name, elapsed_ms=%start.elapsed().as_millis(), summary=%diff.summary, details=?diff.details, "shadow mismatch");
                                         }
                                     } else {
@@ -180,11 +326,13 @@ async fn handle_connection(state: Arc<AppState>, mut socket: TcpStream) -> Resul
                             let sample = rand::random::<f64>() < cfg.sample_rate;
                             if sample {
                                 let sh = sh.clone();
+                                let state2 = state.clone();
                                 tokio::spawn(async move {
                                     let start = Instant::now();
                                     let res = tokio::time::timeout(Duration::from_millis(cfg.timeout_ms), sh.forward_and_read_doc(&hdr, &header_bytes, &body_bytes)).await;
                                     match res {
                                         Err(_) => {
+                                            state2.shadow_timeouts.fetch_add(1, Ordering::Relaxed);
                                             tracing::debug!(command=%cmd_name, elapsed_ms=%start.elapsed().as_millis(), "shadow timeout");
                                         }
                                         Ok(Err(e)) => {
@@ -192,10 +340,13 @@ async fn handle_connection(state: Arc<AppState>, mut socket: TcpStream) -> Resul
                                         }
                                         Ok(Ok(up_doc_opt)) => {
                                             if let Some(up_doc) = up_doc_opt {
+                                                state2.shadow_attempts.fetch_add(1, Ordering::Relaxed);
                                                 let diff = compare_docs(&ours, &up_doc, &cfg.compare);
                                                 if diff.matched {
+                                                    state2.shadow_matches.fetch_add(1, Ordering::Relaxed);
                                                     tracing::debug!(command=%cmd_name, elapsed_ms=%start.elapsed().as_millis(), "shadow match");
                                                 } else {
+                                                    state2.shadow_mismatches.fetch_add(1, Ordering::Relaxed);
                                                     tracing::info!(command=%cmd_name, elapsed_ms=%start.elapsed().as_millis(), summary=%diff.summary, details=?diff.details, "shadow mismatch");
                                                 }
                                             } else {
@@ -536,7 +687,16 @@ mod tests {
 
     #[tokio::test]
     async fn prune_removes_idle_cursors() {
-        let state = AppState { store: None, started_at: Instant::now(), cursors: Mutex::new(HashMap::new()), shadow: None };
+        let state = AppState {
+            store: None,
+            started_at: Instant::now(),
+            cursors: Mutex::new(HashMap::new()),
+            shadow: None,
+            shadow_attempts: std::sync::atomic::AtomicU64::new(0),
+            shadow_matches: std::sync::atomic::AtomicU64::new(0),
+            shadow_mismatches: std::sync::atomic::AtomicU64::new(0),
+            shadow_timeouts: std::sync::atomic::AtomicU64::new(0),
+        };
         {
             let mut map = state.cursors.lock().await;
             map.insert(1, CursorEntry { ns: "db.coll".into(), docs: vec![], pos: 0, last_access: Instant::now() - Duration::from_secs(100) });
