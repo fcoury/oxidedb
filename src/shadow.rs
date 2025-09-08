@@ -1,5 +1,5 @@
 use crate::config::{ShadowCompareOptions, ShadowConfig, ShadowMode};
-use crate::protocol::{decode_op_msg_section0, decode_op_query, decode_op_reply_first_doc, encode_op_msg, MessageHeader, OP_MSG, OP_QUERY};
+use crate::protocol::{decode_op_msg_section0, decode_op_query, decode_op_reply_first_doc, encode_op_msg, MessageHeader, OP_MSG, OP_QUERY, OP_COMPRESSED};
 use anyhow::{anyhow, Context, Result};
 use bson::{doc, Bson, Document};
 use std::sync::Arc;
@@ -117,6 +117,7 @@ impl ShadowSession {
         match op {
             OP_MSG => decode_op_msg_section0(&buf).map(|(_f, d)| Some(d)).ok_or_else(|| anyhow!("malformed upstream OP_MSG")),
             crate::protocol::OP_REPLY => Ok(decode_op_reply_first_doc(&buf)),
+            OP_COMPRESSED => Ok(None),
             _ => Ok(None),
         }
     }
