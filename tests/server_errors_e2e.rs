@@ -76,7 +76,8 @@ async fn e2e_error_codes() {
     assert_eq!(doc.get_i32("code").unwrap_or(0), 2);
 
     // aggregate with unsupported stage -> code 9
-    let pipeline = vec![bson::Bson::Document(doc!{"$group": {"_id": "$x"}})];
+    // Use a stage we do not implement (e.g., $sample)
+    let pipeline = vec![bson::Bson::Document(doc!{"$sample": {"size": 1i32}})];
     let agg = doc!{"aggregate": "u", "pipeline": pipeline, "cursor": {}, "$db": &dbname};
     let msg = encode_op_msg(&agg, 0, 6);
     stream.write_all(&msg).await.unwrap();
@@ -87,4 +88,3 @@ async fn e2e_error_codes() {
     let _ = shutdown.send(true);
     let _ = handle.await.unwrap();
 }
-
