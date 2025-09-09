@@ -166,8 +166,7 @@ impl PgStore {
                 }
             }
             let json: serde_json::Value = r.get(1);
-            let b = bson::to_bson(&json).unwrap_or(bson::Bson::Document(bson::Document::new()));
-            let doc = match b { bson::Bson::Document(d) => d, _ => bson::Document::new() };
+            let doc = to_doc_from_json(json);
             out.push(doc);
         }
         Ok(out)
@@ -189,15 +188,14 @@ impl PgStore {
                 }
             }
             let json: serde_json::Value = r.get(1);
-            let b = bson::to_bson(&json).unwrap_or(bson::Bson::Document(bson::Document::new()));
-            let doc = match b { bson::Bson::Document(d) => d, _ => bson::Document::new() };
+            let doc = to_doc_from_json(json);
             out.push(doc);
         }
         Ok(out)
     }
 
-    /// Limited top-level filter support: equality, $gt, $gte, $lt, $lte, $in, $exists (true/false)
-    /// Comparisons operate on strings or double precision numbers based on value type.
+    /// Limited filter support: equality, $gt, $gte, $lt, $lte, $in, $exists (true/false), $elemMatch
+    /// Supports dotted field paths and array membership for equality and comparisons.
     pub async fn find_with_top_level_filter(
         &self,
         db: &str,
@@ -210,86 +208,74 @@ impl PgStore {
         let q_table = q_ident(coll);
 
         let mut where_clauses: Vec<String> = Vec::new();
-        let mut eq_obj = serde_json::Map::new();
 
         for (k, v) in filter.iter() {
             // skip _id here; server handles id fast path
             if k == "_id" { continue; }
+            let path = jsonpath_path(k);
             match v {
                 bson::Bson::Document(d) => {
-                    // operators
                     for (op, val) in d.iter() {
                         match op.as_str() {
+                            "$elemMatch" => {
+                                if let bson::Bson::Document(em) = val {
+                                    if let Some(pred) = build_elem_match_pred(&path, em) {
+                                        let jsonpath = format!("{}[*] ? ({})", path, pred);
+                                        where_clauses.push(format!("jsonb_path_exists(doc, '{}')", escape_single(&jsonpath)));
+                                    }
+                                }
+                            }
                             "$exists" => {
                                 let exists = matches!(val, bson::Bson::Boolean(true));
                                 let clause = if exists {
-                                    format!("doc ? '{}'", escape_single(k))
+                                    format!("jsonb_path_exists(doc, '{}')", escape_single(&path))
                                 } else {
-                                    format!("NOT (doc ? '{}')", escape_single(k))
+                                    format!("NOT jsonb_path_exists(doc, '{}')", escape_single(&path))
                                 };
                                 where_clauses.push(clause);
                             }
                             "$in" => {
                                 if let bson::Bson::Array(arr) = val {
-                                    if arr.is_empty() { where_clauses.push("FALSE".to_string()); continue; }
-                                    if all_numeric(arr) {
-                                        let list = join_numeric_array(arr);
-                                        where_clauses.push(format!(
-                                            "((doc->>'{}')::double precision) = ANY(ARRAY[{}]::double precision[])",
-                                            escape_single(k), list
-                                        ));
-                                    } else if all_strings(arr) {
-                                        let list = join_string_array(arr);
-                                        where_clauses.push(format!(
-                                            "(doc->>'{}') = ANY(ARRAY[{}]::text[])",
-                                            escape_single(k), list
-                                        ));
+                                    let mut preds: Vec<String> = Vec::new();
+                                    for item in arr {
+                                        if let Some(lit) = json_literal_from_bson(item) { preds.push(format!("@ == {}", lit)); }
+                                    }
+                                    if preds.is_empty() { where_clauses.push("FALSE".to_string()); }
+                                    else {
+                                        let predicate = preds.join(" || ");
+                                        let p1 = format!("jsonb_path_exists(doc, '{} ? ({} )')", escape_single(&path), predicate);
+                                        let p2 = format!("jsonb_path_exists(doc, '{}[*] ? ({} )')", escape_single(&path), predicate);
+                                        where_clauses.push(format!("({} OR {})", p1, p2));
                                     }
                                 }
                             }
                             "$gt" | "$gte" | "$lt" | "$lte" => {
-                                let (op_sql, _is_inclusive) = match op.as_str() {
-                                    "$gt" => (">", false),
-                                    "$gte" => (">=", true),
-                                    "$lt" => ("<", false),
-                                    "$lte" => ("<=", true),
-                                    _ => unreachable!(),
-                                };
-                                if let Some(num) = as_f64(val) {
-                                    where_clauses.push(format!(
-                                        "((doc->>'{}')::double precision) {} {}",
-                                        escape_single(k), op_sql, num
-                                    ));
-                                } else if let Some(s) = val.as_str() {
-                                    let val_sql = format!("'{}'", escape_single(s));
-                                    where_clauses.push(format!(
-                                        "(doc->>'{}') {} {}",
-                                        escape_single(k), op_sql, val_sql
-                                    ));
+                                let op_sql = match op.as_str() { "$gt" => ">", "$gte" => ">=", "$lt" => "<", "$lte" => "<=", _ => unreachable!() };
+                                if let Some(lit) = json_literal_from_bson(val) {
+                                    let p1 = format!("jsonb_path_exists(doc, '{} ? (@ {} {} )')", escape_single(&path), op_sql, lit);
+                                    let p2 = format!("jsonb_path_exists(doc, '{}[*] ? (@ {} {} )')", escape_single(&path), op_sql, lit);
+                                    where_clauses.push(format!("({} OR {})", p1, p2));
                                 }
                             }
                             "$eq" => {
-                                if let Some(json_val) = bson_to_json_value(val) {
-                                    eq_obj.insert(k.clone(), json_val);
+                                if let Some(lit) = json_literal_from_bson(val) {
+                                    let p1 = format!("jsonb_path_exists(doc, '{} ? (@ == {} )')", escape_single(&path), lit);
+                                    let p2 = format!("jsonb_path_exists(doc, '{}[*] ? (@ == {} )')", escape_single(&path), lit);
+                                    where_clauses.push(format!("({} OR {})", p1, p2));
                                 }
                             }
                             _ => {}
                         }
                     }
                 }
-                // equality on scalar
                 _ => {
-                    if let Some(json_val) = bson_to_json_value(v) {
-                        eq_obj.insert(k.clone(), json_val);
+                    if let Some(lit) = json_literal_from_bson(v) {
+                        let p1 = format!("jsonb_path_exists(doc, '{} ? (@ == {} )')", escape_single(&path), lit);
+                        let p2 = format!("jsonb_path_exists(doc, '{}[*] ? (@ == {} )')", escape_single(&path), lit);
+                        where_clauses.push(format!("({} OR {})", p1, p2));
                     }
                 }
             }
-        }
-
-        if !eq_obj.is_empty() {
-            let json = serde_json::Value::Object(eq_obj);
-            let json_str = json.to_string();
-            where_clauses.push(format!("doc @> '{}'::jsonb", escape_single(&json_str)));
         }
 
         let where_sql = if where_clauses.is_empty() {
@@ -313,8 +299,7 @@ impl PgStore {
                 }
             }
             let json: serde_json::Value = r.get(1);
-            let b = bson::to_bson(&json).unwrap_or(bson::Bson::Document(bson::Document::new()));
-            let doc = match b { bson::Bson::Document(d) => d, _ => bson::Document::new() };
+            let doc = to_doc_from_json(json);
             out.push(doc);
         }
         Ok(out)
@@ -557,10 +542,6 @@ fn q_ident(ident: &str) -> String {
     format!("\"{}\"", escaped)
 }
 
-fn q_string(s: &str) -> String {
-    s.to_string()
-}
-
 fn err_msg<E: std::fmt::Display>(e: E) -> Error {
     Error::Msg(e.to_string())
 }
@@ -569,45 +550,7 @@ fn escape_single(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "''")
 }
 
-fn all_numeric(arr: &Vec<bson::Bson>) -> bool { arr.iter().all(|v| as_f64(v).is_some()) }
-fn all_strings(arr: &Vec<bson::Bson>) -> bool { arr.iter().all(|v| matches!(v, bson::Bson::String(_))) }
-
-fn join_numeric_array(arr: &Vec<bson::Bson>) -> String {
-    let mut parts: Vec<String> = Vec::with_capacity(arr.len());
-    for v in arr {
-        parts.push(as_f64(v).unwrap().to_string());
-    }
-    parts.join(",")
-}
-
-fn join_string_array(arr: &Vec<bson::Bson>) -> String {
-    let mut parts: Vec<String> = Vec::with_capacity(arr.len());
-    for v in arr {
-        if let bson::Bson::String(s) = v { parts.push(format!("'{}'", escape_single(s))); }
-    }
-    parts.join(",")
-}
-
-fn as_f64(v: &bson::Bson) -> Option<f64> {
-    match v {
-        bson::Bson::Int32(n) => Some(*n as f64),
-        bson::Bson::Int64(n) => Some(*n as f64),
-        bson::Bson::Double(n) => Some(*n),
-        _ => None,
-    }
-}
-
-fn bson_to_json_value(v: &bson::Bson) -> Option<serde_json::Value> {
-    match v {
-        bson::Bson::Null => Some(serde_json::Value::Null),
-        bson::Bson::Boolean(b) => Some(serde_json::Value::Bool(*b)),
-        bson::Bson::Int32(n) => Some(serde_json::Value::Number((*n).into())),
-        bson::Bson::Int64(n) => serde_json::Number::from_f64(*n as f64).map(serde_json::Value::Number),
-        bson::Bson::Double(n) => serde_json::Number::from_f64(*n).map(serde_json::Value::Number),
-        bson::Bson::String(s) => Some(serde_json::Value::String(s.clone())),
-        _ => None,
-    }
-}
+// removed unused helpers
 
 fn build_where_from_filter(filter: &bson::Document) -> String {
     let mut where_clauses: Vec<String> = Vec::new();
@@ -622,7 +565,7 @@ fn build_where_from_filter(filter: &bson::Document) -> String {
                             if let bson::Bson::Document(em) = val {
                                 if let Some(pred) = build_elem_match_pred(&path, em) {
                                     where_clauses.push(format!(
-                                        "jsonb_path_exists(doc, '{}[*] ? ({}))'",
+                                        "jsonb_path_exists(doc, '{}[*] ? ({} )')",
                                         escape_single(&path), pred
                                     ));
                                 }
@@ -645,19 +588,25 @@ fn build_where_from_filter(filter: &bson::Document) -> String {
                                 if preds.is_empty() { where_clauses.push("FALSE".to_string()); }
                                 else {
                                     let predicate = preds.join(" || ");
-                                    where_clauses.push(format!("jsonb_path_exists(doc, '{} ? ({}))'", escape_single(&path), predicate));
+                                    let p1 = format!("jsonb_path_exists(doc, '{} ? ({} )')", escape_single(&path), predicate);
+                                    let p2 = format!("jsonb_path_exists(doc, '{}[*] ? ({} )')", escape_single(&path), predicate);
+                                    where_clauses.push(format!("({} OR {})", p1, p2));
                                 }
                             }
                         }
                         "$gt" | "$gte" | "$lt" | "$lte" => {
                             let op_sql = match op.as_str() { "$gt" => ">", "$gte" => ">=", "$lt" => "<", "$lte" => "<=", _ => unreachable!() };
                             if let Some(lit) = json_literal_from_bson(val) {
-                                where_clauses.push(format!("jsonb_path_exists(doc, '{} ? (@ {} {}))'", escape_single(&path), op_sql, lit));
+                                let p1 = format!("jsonb_path_exists(doc, '{} ? (@ {} {} )')", escape_single(&path), op_sql, lit);
+                                let p2 = format!("jsonb_path_exists(doc, '{}[*] ? (@ {} {} )')", escape_single(&path), op_sql, lit);
+                                where_clauses.push(format!("({} OR {})", p1, p2));
                             }
                         }
                         "$eq" => {
                             if let Some(lit) = json_literal_from_bson(val) {
-                                where_clauses.push(format!("jsonb_path_exists(doc, '{} ? (@ == {}))'", escape_single(&path), lit));
+                                let p1 = format!("jsonb_path_exists(doc, '{} ? (@ == {} )')", escape_single(&path), lit);
+                                let p2 = format!("jsonb_path_exists(doc, '{}[*] ? (@ == {} )')", escape_single(&path), lit);
+                                where_clauses.push(format!("({} OR {})", p1, p2));
                             }
                         }
                         _ => {}
@@ -666,7 +615,9 @@ fn build_where_from_filter(filter: &bson::Document) -> String {
             }
             _ => {
                 if let Some(lit) = json_literal_from_bson(v) {
-                    where_clauses.push(format!("jsonb_path_exists(doc, '{} ? (@ == {}))'", escape_single(&path), lit));
+                    let p1 = format!("jsonb_path_exists(doc, '{} ? (@ == {} )')", escape_single(&path), lit);
+                    let p2 = format!("jsonb_path_exists(doc, '{}[*] ? (@ == {} )')", escape_single(&path), lit);
+                    where_clauses.push(format!("({} OR {})", p1, p2));
                 }
             }
         }
@@ -711,7 +662,11 @@ fn projection_pushdown_sql(projection: Option<&bson::Document>) -> Option<String
             continue;
         }
         let on = match v { bson::Bson::Int32(n) => *n != 0, bson::Bson::Boolean(b) => *b, _ => false };
-        if on { include_fields.push(k.clone()); } else { return None; }
+        if on {
+            // Only top-level fields qualify for pushdown; dotted paths require server-side projection
+            if k.contains('.') { return None; }
+            include_fields.push(k.clone());
+        } else { return None; }
     }
     if include_fields.is_empty() && include_id { return None; }
     let mut elems: Vec<String> = Vec::new();
@@ -721,9 +676,37 @@ fn projection_pushdown_sql(projection: Option<&bson::Document>) -> Option<String
     Some(format!("jsonb_build_object({})", elems.join(", ")))
 }
 
+fn json_to_bson(v: &serde_json::Value) -> bson::Bson {
+    use serde_json::Value;
+    match v {
+        Value::Null => bson::Bson::Null,
+        Value::Bool(b) => bson::Bson::Boolean(*b),
+        Value::Number(num) => {
+            if let Some(i) = num.as_i64() {
+                if i >= i32::MIN as i64 && i <= i32::MAX as i64 { bson::Bson::Int32(i as i32) }
+                else { bson::Bson::Int64(i) }
+            } else if let Some(u) = num.as_u64() {
+                if u <= i32::MAX as u64 { bson::Bson::Int32(u as i32) }
+                else if u <= i64::MAX as u64 { bson::Bson::Int64(u as i64) }
+                else { bson::Bson::Double(u as f64) }
+            } else if let Some(f) = num.as_f64() {
+                bson::Bson::Double(f)
+            } else {
+                bson::Bson::Double(0.0)
+            }
+        }
+        Value::String(s) => bson::Bson::String(s.clone()),
+        Value::Array(arr) => bson::Bson::Array(arr.iter().map(json_to_bson).collect()),
+        Value::Object(map) => {
+            let mut d = bson::Document::new();
+            for (k, v) in map.iter() { d.insert(k.clone(), json_to_bson(v)); }
+            bson::Bson::Document(d)
+        }
+    }
+}
+
 fn to_doc_from_json(json: serde_json::Value) -> bson::Document {
-    let b = bson::to_bson(&json).unwrap_or(bson::Bson::Document(bson::Document::new()));
-    match b { bson::Bson::Document(d) => d, _ => bson::Document::new() }
+    match json_to_bson(&json) { bson::Bson::Document(d) => d, _ => bson::Document::new() }
 }
 
 fn jsonpath_path(key: &str) -> String {
@@ -751,7 +734,7 @@ fn json_literal_from_bson(v: &bson::Bson) -> Option<String> {
     }
 }
 
-fn build_elem_match_pred(path: &str, em: &bson::Document) -> Option<String> {
+fn build_elem_match_pred(_path: &str, em: &bson::Document) -> Option<String> {
     // Two forms supported:
     // 1) Scalar operators on array of scalars: { $gt: 5 }
     // 2) Equality/ops on subdocument fields: { x: 2, y: { $gt: 3 } }

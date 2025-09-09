@@ -26,7 +26,7 @@ struct CursorEntry {
 pub struct AppState {
     pub store: Option<PgStore>,
     pub started_at: Instant,
-    pub cursors: Mutex<HashMap<i64, CursorEntry>>,
+    cursors: Mutex<HashMap<i64, CursorEntry>>,
     pub shadow: Option<std::sync::Arc<ShadowConfig>>,
     // Shadow metrics
     pub shadow_attempts: std::sync::atomic::AtomicU64,
@@ -110,7 +110,7 @@ pub async fn run(cfg: Config) -> Result<()> {
 
 /// Spawn the server on the provided listen address and run until `shutdown` is signaled.
 /// Returns the shared `AppState`, the bound local address, a shutdown sender, and the task handle.
-pub async fn spawn_with_shutdown(mut cfg: Config) -> Result<(
+pub async fn spawn_with_shutdown(cfg: Config) -> Result<(
     std::sync::Arc<AppState>,
     std::net::SocketAddr,
     tokio::sync::watch::Sender<bool>,
@@ -700,7 +700,7 @@ async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
                 if let Some(ref pushes) = push_doc { for (k, v) in pushes.iter() { if !apply_push(&mut doc0, k, v.clone()) { return error_doc(2, "$push on non-array"); } } }
                 if let Some(ref pulls) = pull_doc { for (k, v) in pulls.iter() { apply_pull(&mut doc0, k, v.clone()); } }
                 match pg.update_doc_by_id(dbname, coll, &idb, &doc0).await {
-                    Ok(n) => {
+                    Ok(_n) => {
                         matched_total += 1;
                         if doc0 != orig { modified_total += 1; }
                     }
@@ -1029,7 +1029,8 @@ fn apply_group(docs: &Vec<Document>, spec: &Document) -> Vec<Document> {
     use std::collections::HashMap;
     #[derive(Clone)]
     enum Acc {
-        Sum(f64),
+        SumF64(f64),
+        SumI64(i64),
         Avg(f64, i64),
         Min(Option<bson::Bson>),
         Max(Option<bson::Bson>),
@@ -1069,7 +1070,11 @@ fn apply_group(docs: &Vec<Document>, spec: &Document) -> Vec<Document> {
             let mut hm = HashMap::new();
             for (name, spec) in acc_specs.iter() {
                 let st = match spec {
-                    AccSpec::Sum(_) => Acc::Sum(0.0),
+                    // If $sum has a constant integer expression, accumulate as integer so small results come back as Int32
+                    AccSpec::Sum(expr) => match expr {
+                        bson::Bson::Int32(_) | bson::Bson::Int64(_) => Acc::SumI64(0),
+                        _ => Acc::SumF64(0.0),
+                    },
                     AccSpec::Avg(_) => Acc::Avg(0.0, 0),
                     AccSpec::Min(_) => Acc::Min(None),
                     AccSpec::Max(_) => Acc::Max(None),
@@ -1084,10 +1089,20 @@ fn apply_group(docs: &Vec<Document>, spec: &Document) -> Vec<Document> {
         for (name, spec) in acc_specs.iter() {
             let st = entry.1.get_mut(name).unwrap();
             match (st, spec) {
-                (Acc::Sum(s), AccSpec::Sum(expr)) => {
+                (Acc::SumF64(s), AccSpec::Sum(expr)) => {
                     let v = eval_expr(d, expr).unwrap_or(bson::Bson::Null);
                     let n = number_as_f64(&v).unwrap_or(0.0);
                     *s += n;
+                }
+                (Acc::SumI64(total), AccSpec::Sum(expr)) => {
+                    let v = eval_expr(d, expr).unwrap_or(bson::Bson::Null);
+                    match v {
+                        bson::Bson::Int32(n) => { *total += n as i64; }
+                        bson::Bson::Int64(n) => { *total += n; }
+                        // If expression unexpectedly resolves to non-integer, add its floor value
+                        bson::Bson::Double(f) => { *total += f.trunc() as i64; }
+                        _ => {}
+                    }
                 }
                 (Acc::Avg(s, c), AccSpec::Avg(expr)) => {
                     let v = eval_expr(d, expr).unwrap_or(bson::Bson::Null);
@@ -1127,7 +1142,14 @@ fn apply_group(docs: &Vec<Document>, spec: &Document) -> Vec<Document> {
         doc.insert("_id", idv);
         for (name, st) in accs.into_iter() {
             match st {
-                Acc::Sum(s) => { doc.insert(name, bson::Bson::Double(s)); }
+                Acc::SumF64(s) => { doc.insert(name, bson::Bson::Double(s)); }
+                Acc::SumI64(n) => {
+                    if n <= i32::MAX as i64 && n >= i32::MIN as i64 {
+                        doc.insert(name, bson::Bson::Int32(n as i32));
+                    } else {
+                        doc.insert(name, bson::Bson::Int64(n));
+                    }
+                }
                 Acc::Avg(s, c) => { let v = if c > 0 { s / (c as f64) } else { 0.0 }; doc.insert(name, bson::Bson::Double(v)); }
                 Acc::Min(v) => { doc.insert(name, v.unwrap_or(bson::Bson::Null)); }
                 Acc::Max(v) => { doc.insert(name, v.unwrap_or(bson::Bson::Null)); }
@@ -1228,10 +1250,29 @@ fn eval_expr(doc: &Document, v: &bson::Bson) -> Option<bson::Bson> {
                 }
             }
             if let Some(arr) = d.get_array("$add").ok() {
-                let mut sum = 0.0f64;
+                // Evaluate operands first
+                let mut vals: Vec<bson::Bson> = Vec::with_capacity(arr.len());
                 for op in arr {
-                    let ev = eval_expr(doc, op)?;
-                    let n = number_as_f64(&ev)?;
+                    vals.push(eval_expr(doc, op).unwrap_or(bson::Bson::Null));
+                }
+                // If all integer types, return integer with appropriate width
+                if vals.iter().all(|v| matches!(v, bson::Bson::Int32(_) | bson::Bson::Int64(_))) {
+                    let mut acc: i128 = 0;
+                    for v in vals {
+                        match v {
+                            bson::Bson::Int32(n) => acc += n as i128,
+                            bson::Bson::Int64(n) => acc += n as i128,
+                            _ => {}
+                        }
+                    }
+                    if acc >= i32::MIN as i128 && acc <= i32::MAX as i128 { return Some(bson::Bson::Int32(acc as i32)); }
+                    if acc >= i64::MIN as i128 && acc <= i64::MAX as i128 { return Some(bson::Bson::Int64(acc as i64)); }
+                    return Some(bson::Bson::Double(acc as f64));
+                }
+                // Otherwise, compute as double
+                let mut sum = 0.0f64;
+                for v in vals {
+                    let n = number_as_f64(&v)?;
                     sum += n;
                 }
                 Some(bson::Bson::Double(sum))
@@ -1321,41 +1362,42 @@ fn to_bool(b: &bson::Bson) -> bson::Bson {
 }
 
 fn apply_project_with_expr(input: &Document, proj: &Document) -> Document {
-    // If spec contains computed fields or includes, build output accordingly.
-    let mut include_mode = false;
+    use std::collections::HashSet;
+    // Classify fields: includes (==1/true), excludes (==0/false), computed (other values)
     let mut include_id = true;
+    let mut includes: HashSet<&str> = HashSet::new();
+    let mut excludes: HashSet<&str> = HashSet::new();
+    let mut computed: Vec<(&str, &bson::Bson)> = Vec::new();
     for (k, v) in proj.iter() {
         if k == "_id" {
             match v { bson::Bson::Int32(n) if *n == 0 => include_id = false, bson::Bson::Boolean(b) if !*b => include_id = false, _ => {} }
-        } else if matches!(v, bson::Bson::Int32(n) if *n != 0) || matches!(v, bson::Bson::Boolean(true)) {
-            include_mode = true;
+            continue;
         }
-    }
-
-    let mut out = Document::new();
-    if include_mode && include_id {
-        if let Some(idv) = input.get("_id").cloned() { out.insert("_id", idv); }
-    }
-
-    for (k, v) in proj.iter() {
-        if k == "_id" { continue; }
         match v {
-            bson::Bson::Int32(n) => {
-                if *n != 0 {
-                    if let Some(val) = get_path_bson_value(input, k) { set_path_nested(&mut out, k, val); }
-                }
-            }
-            bson::Bson::Boolean(b) => {
-                if *b { if let Some(val) = get_path_bson_value(input, k) { set_path_nested(&mut out, k, val); } }
-            }
-            other => {
-                // computed expression
-                let val = eval_expr(input, other).unwrap_or(bson::Bson::Null);
-                out.insert(k.to_string(), val);
-            }
+            bson::Bson::Int32(n) => { if *n != 0 { includes.insert(k); } else { excludes.insert(k); } }
+            bson::Bson::Boolean(b) => { if *b { includes.insert(k); } else { excludes.insert(k); } }
+            other => { computed.push((k.as_str(), other)); }
         }
     }
 
+    // Inclusion mode when there are any includes or computed fields.
+    let include_mode = !includes.is_empty() || !computed.is_empty();
+
+    if include_mode {
+        let mut out = Document::new();
+        if include_id { if let Some(idv) = input.get("_id").cloned() { out.insert("_id", idv); } }
+        for k in includes { if let Some(val) = get_path_bson_value(input, k) { set_path_nested(&mut out, k, val); } }
+        for (k, expr) in computed {
+            let val = eval_expr(input, expr).unwrap_or(bson::Bson::Null);
+            out.insert(k.to_string(), val);
+        }
+        return out;
+    }
+
+    // Exclusion mode (only excludes and maybe _id suppression)
+    let mut out = input.clone();
+    for k in excludes { unset_path_nested(&mut out, k); }
+    if !include_id { out.remove("_id"); }
     out
 }
 
@@ -1462,14 +1504,27 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
         let mut n = total;
         if let Some(sk) = skip { n = (n - sk).max(0); }
         if let Some(l) = limit { n = n.min(l); }
-        let d = doc!{ field: n };
+        // Match MongoDB's typical small-int behavior when it fits in 32-bit.
+        let d = if n <= i32::MAX as i64 { doc!{ field: (n as i32) } } else { doc!{ field: n } };
         return doc!{ "cursor": {"id": 0i64, "ns": format!("{}.{}", dbname, coll), "firstBatch": [d] }, "ok": 1.0 };
     }
 
-    let fetch_limit = skip.unwrap_or(0) + limit.unwrap_or(batch_size * 10);
-    // Disable projection pushdown if project has computed fields
-    let pushdown_project = if computed_project { None } else { project.as_ref() };
-    let mut docs = match pg.find_docs(dbname, coll, filter.as_ref(), sort.as_ref(), pushdown_project, fetch_limit).await {
+    // Disable pushdowns when later stages transform shape (addFields/set/unwind/group/lookup)
+    // or when project has computed fields.
+    let has_transform = computed_project
+        || add_fields.is_some()
+        || unwind_path.is_some()
+        || group_spec.is_some()
+        || lookup_spec.is_some();
+    // Determine how many docs to fetch before applying in-memory transforms.
+    // When transforms are present, avoid under-fetching (e.g., sorting on computed fields)
+    // by fetching at least a generous base window.
+    let base_fetch = batch_size * 10;
+    let lim = limit.unwrap_or(base_fetch);
+    let fetch_limit = skip.unwrap_or(0) + if has_transform { std::cmp::max(lim, base_fetch) } else { lim };
+    let pushdown_project = if has_transform { None } else { project.as_ref() };
+    let pushdown_sort = if has_transform { None } else { sort.as_ref() };
+    let mut docs = match pg.find_docs(dbname, coll, filter.as_ref(), pushdown_sort, pushdown_project, fetch_limit).await {
         Ok(v) => v,
         Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
     };
@@ -1483,9 +1538,9 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
         }
     }
 
-    // Apply project expressions if present and disable pushdown was used
+    // Early project only when computed and no later transforms depend on fields
     if let Some(ref proj) = project.as_ref() {
-        if computed_project {
+        if computed_project && !has_transform {
             for d in docs.iter_mut() {
                 let out = apply_project_with_expr(d, proj);
                 *d = out;
@@ -1541,9 +1596,19 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
         }
     }
 
-    // In-memory sort if computed/unwind/group/lookup present and client requested sort
-    if (computed_project || unwind_path.is_some() || group_spec.is_some() || lookup_spec.is_some()) && sort.is_some() {
+    // In-memory sort if transforms present and client requested sort
+    if (has_transform) && sort.is_some() {
         if let Some(ref s) = sort { docs.sort_by(|a, b| cmp_multi(a, b, s)); }
+    }
+
+    // Apply project late when we deferred due to transforms or computed fields
+    if let Some(ref proj) = project.as_ref() {
+        if has_transform {
+            for d in docs.iter_mut() {
+                let out = apply_project_with_expr(d, proj);
+                *d = out;
+            }
+        }
     }
 
     // Apply skip/limit after transformations

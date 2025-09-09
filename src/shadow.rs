@@ -1,12 +1,12 @@
-use crate::config::{ShadowCompareOptions, ShadowConfig, ShadowMode};
-use crate::protocol::{decode_op_msg_section0, decode_op_query, decode_op_reply_first_doc, encode_op_msg, MessageHeader, OP_MSG, OP_QUERY, OP_COMPRESSED};
+use crate::config::{ShadowCompareOptions, ShadowConfig};
+use crate::protocol::{decode_op_msg_section0, decode_op_reply_first_doc, encode_op_msg, MessageHeader, OP_MSG, OP_QUERY, OP_COMPRESSED};
 use anyhow::{anyhow, Context, Result};
-use bson::{doc, Bson, Document};
+use bson::{Bson, Document};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tokio::time::{timeout, Duration, Instant};
+use tokio::time::{timeout, Duration};
 
 #[derive(Clone)]
 pub struct ShadowSession {
@@ -143,7 +143,7 @@ fn rewrite_op_query_db_prefix(body: &[u8], prefix: &str) -> Option<Vec<u8>> {
     out.extend_from_slice(new_fqn.as_bytes());
     out.push(0u8);
     // Copy remainder
-    let mut j = end + 1; // skip null
+    let j = end + 1; // skip null
     out.extend_from_slice(&body[j..]);
     Some(out)
 }

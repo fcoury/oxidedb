@@ -34,31 +34,31 @@ impl TestDb {
 
 impl Drop for TestDb {
     fn drop(&mut self) {
-        // Ensure drop even if test panics
+        // Ensure drop even if test panics. Use a dedicated thread + runtime so
+        // we do not depend on any ambient tokio runtime still being alive.
         let admin_url = self.admin_url.clone();
         let dbname = self.dbname.clone();
-        let fut = async move {
-            if let Ok((client, conn)) = tokio_postgres::connect(&admin_url, NoTls).await {
-                tokio::spawn(async move { let _ = conn.await; });
-                let _ = client
-                    .execute(
-                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
-                        &[&dbname],
-                    )
-                    .await;
-                let qname = q_ident(&dbname);
-                let _ = client
-                    .batch_execute(&format!("DROP DATABASE IF EXISTS {}", qname))
-                    .await;
+        let _ = std::thread::spawn(move || {
+            if let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                rt.block_on(async move {
+                    if let Ok((client, conn)) = tokio_postgres::connect(&admin_url, NoTls).await {
+                        // Drive connection on this small runtime
+                        tokio::spawn(async move { let _ = conn.await; });
+                        let _ = client
+                            .execute(
+                                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
+                                &[&dbname],
+                            )
+                            .await;
+                        let qname = q_ident(&dbname);
+                        let _ = client
+                            .batch_execute(&format!("DROP DATABASE IF EXISTS {}", qname))
+                            .await;
+                    }
+                });
             }
-        };
-        if tokio::runtime::Handle::try_current().is_ok() {
-            // Already inside a runtime; spawn cleanup and return.
-            // This avoids blocking a runtime thread.
-            tokio::spawn(fut);
-        } else if let Ok(rt) = tokio::runtime::Runtime::new() {
-            rt.block_on(fut);
-        }
+        })
+        .join();
     }
 }
 
