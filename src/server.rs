@@ -983,6 +983,187 @@ fn cmp<F: Fn(f64,f64)->bool>(a: &bson::Bson, b: &bson::Bson, f: F) -> bool {
     }
 }
 
+fn cmp_multi(a: &Document, b: &Document, spec: &Document) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for (k, v) in spec.iter() {
+        let dir = match v { bson::Bson::Int32(n) => *n, bson::Bson::Int64(n) => *n as i32, bson::Bson::Double(f) => if *f < 0.0 { -1 } else { 1 }, _ => 1 };
+        let av = get_path_bson_value(a, k);
+        let bv = get_path_bson_value(b, k);
+        let ord = cmp_bson_opt(&av, &bv);
+        if ord != Ordering::Equal {
+            return if dir < 0 { ord.reverse() } else { ord };
+        }
+    }
+    Ordering::Equal
+}
+
+fn cmp_bson_opt(a: &Option<bson::Bson>, b: &Option<bson::Bson>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(av), Some(bv)) => cmp_bson(av, bv),
+    }
+}
+
+fn cmp_bson(a: &bson::Bson, b: &bson::Bson) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    // Numeric compare if both numeric
+    if let (Some(x), Some(y)) = (number_as_f64(a), number_as_f64(b)) {
+        return if x < y { Ordering::Less } else if x > y { Ordering::Greater } else { Ordering::Equal };
+    }
+    match (a, b) {
+        (bson::Bson::String(sa), bson::Bson::String(sb)) => sa.cmp(sb),
+        (bson::Bson::Boolean(ba), bson::Bson::Boolean(bb)) => ba.cmp(bb),
+        (bson::Bson::Null, bson::Bson::Null) => Ordering::Equal,
+        (bson::Bson::Null, _) => Ordering::Less,
+        (_, bson::Bson::Null) => Ordering::Greater,
+        _ => format!("{:?}", a).cmp(&format!("{:?}", b)),
+    }
+}
+
+fn key_repr(v: &bson::Bson) -> String { format!("{:?}", v) }
+
+fn apply_group(docs: &Vec<Document>, spec: &Document) -> Vec<Document> {
+    use std::collections::HashMap;
+    #[derive(Clone)]
+    enum Acc {
+        Sum(f64),
+        Avg(f64, i64),
+        Min(Option<bson::Bson>),
+        Max(Option<bson::Bson>),
+        First(Option<bson::Bson>),
+        Last(Option<bson::Bson>),
+        Push(Vec<bson::Bson>),
+    }
+    #[derive(Clone)]
+    enum AccSpec {
+        Sum(bson::Bson),
+        Avg(bson::Bson),
+        Min(bson::Bson),
+        Max(bson::Bson),
+        First(bson::Bson),
+        Last(bson::Bson),
+        Push(bson::Bson),
+    }
+    let id_expr = spec.get("_id").cloned().unwrap_or(bson::Bson::Null);
+    let mut acc_specs: Vec<(String, AccSpec)> = Vec::new();
+    for (k, v) in spec.iter() {
+        if k == "_id" { continue; }
+        if let bson::Bson::Document(d) = v {
+            if let Some(x) = d.get("$sum") { acc_specs.push((k.clone(), AccSpec::Sum(x.clone()))); continue; }
+            if let Some(x) = d.get("$avg") { acc_specs.push((k.clone(), AccSpec::Avg(x.clone()))); continue; }
+            if let Some(x) = d.get("$min") { acc_specs.push((k.clone(), AccSpec::Min(x.clone()))); continue; }
+            if let Some(x) = d.get("$max") { acc_specs.push((k.clone(), AccSpec::Max(x.clone()))); continue; }
+            if let Some(x) = d.get("$first") { acc_specs.push((k.clone(), AccSpec::First(x.clone()))); continue; }
+            if let Some(x) = d.get("$last") { acc_specs.push((k.clone(), AccSpec::Last(x.clone()))); continue; }
+            if let Some(x) = d.get("$push") { acc_specs.push((k.clone(), AccSpec::Push(x.clone()))); continue; }
+        }
+    }
+    let mut map: HashMap<String, (bson::Bson, HashMap<String, Acc>)> = HashMap::new();
+    for d in docs.iter() {
+        let key_val = eval_expr(d, &id_expr).unwrap_or(bson::Bson::Null);
+        let key = key_repr(&key_val);
+        let entry = map.entry(key).or_insert_with(|| {
+            let mut hm = HashMap::new();
+            for (name, spec) in acc_specs.iter() {
+                let st = match spec {
+                    AccSpec::Sum(_) => Acc::Sum(0.0),
+                    AccSpec::Avg(_) => Acc::Avg(0.0, 0),
+                    AccSpec::Min(_) => Acc::Min(None),
+                    AccSpec::Max(_) => Acc::Max(None),
+                    AccSpec::First(_) => Acc::First(None),
+                    AccSpec::Last(_) => Acc::Last(None),
+                    AccSpec::Push(_) => Acc::Push(Vec::new()),
+                };
+                hm.insert(name.clone(), st);
+            }
+            (key_val.clone(), hm)
+        });
+        for (name, spec) in acc_specs.iter() {
+            let st = entry.1.get_mut(name).unwrap();
+            match (st, spec) {
+                (Acc::Sum(s), AccSpec::Sum(expr)) => {
+                    let v = eval_expr(d, expr).unwrap_or(bson::Bson::Null);
+                    let n = number_as_f64(&v).unwrap_or(0.0);
+                    *s += n;
+                }
+                (Acc::Avg(s, c), AccSpec::Avg(expr)) => {
+                    let v = eval_expr(d, expr).unwrap_or(bson::Bson::Null);
+                    if let Some(n) = number_as_f64(&v) { *s += n; *c += 1; }
+                }
+                (Acc::Min(cur), AccSpec::Min(expr)) => {
+                    let v = eval_expr(d, expr).unwrap_or(bson::Bson::Null);
+                    *cur = match cur.take() {
+                        None => Some(v),
+                        Some(old) => Some(if cmp_bson(&v, &old) == std::cmp::Ordering::Less { v } else { old }),
+                    };
+                }
+                (Acc::Max(cur), AccSpec::Max(expr)) => {
+                    let v = eval_expr(d, expr).unwrap_or(bson::Bson::Null);
+                    *cur = match cur.take() {
+                        None => Some(v),
+                        Some(old) => Some(if cmp_bson(&v, &old) == std::cmp::Ordering::Greater { v } else { old }),
+                    };
+                }
+                (Acc::First(cur), AccSpec::First(expr)) => {
+                    if cur.is_none() { *cur = Some(eval_expr(d, expr).unwrap_or(bson::Bson::Null)); }
+                }
+                (Acc::Last(cur), AccSpec::Last(expr)) => {
+                    *cur = Some(eval_expr(d, expr).unwrap_or(bson::Bson::Null));
+                }
+                (Acc::Push(arr), AccSpec::Push(expr)) => {
+                    arr.push(eval_expr(d, expr).unwrap_or(bson::Bson::Null));
+                }
+                _ => {}
+            }
+        }
+    }
+    // build result docs
+    let mut out: Vec<Document> = Vec::with_capacity(map.len());
+    for (_k, (idv, accs)) in map.into_iter() {
+        let mut doc = Document::new();
+        doc.insert("_id", idv);
+        for (name, st) in accs.into_iter() {
+            match st {
+                Acc::Sum(s) => { doc.insert(name, bson::Bson::Double(s)); }
+                Acc::Avg(s, c) => { let v = if c > 0 { s / (c as f64) } else { 0.0 }; doc.insert(name, bson::Bson::Double(v)); }
+                Acc::Min(v) => { doc.insert(name, v.unwrap_or(bson::Bson::Null)); }
+                Acc::Max(v) => { doc.insert(name, v.unwrap_or(bson::Bson::Null)); }
+                Acc::First(v) => { doc.insert(name, v.unwrap_or(bson::Bson::Null)); }
+                Acc::Last(v) => { doc.insert(name, v.unwrap_or(bson::Bson::Null)); }
+                Acc::Push(arr) => { doc.insert(name, bson::Bson::Array(arr)); }
+            }
+        }
+        out.push(doc);
+    }
+    out
+}
+
+use crate::error::Error;
+async fn apply_lookup(db: &str, pg: &crate::store::PgStore, mut docs: Vec<Document>, spec: &Document) -> crate::error::Result<Vec<Document>> {
+    use std::collections::HashMap;
+    let from = spec.get_str("from").map_err(|_| Error::Msg("lookup.from missing".into()))?;
+    let local_field = spec.get_str("localField").map_err(|_| Error::Msg("lookup.localField missing".into()))?;
+    let foreign_field = spec.get_str("foreignField").map_err(|_| Error::Msg("lookup.foreignField missing".into()))?;
+    let as_field = spec.get_str("as").map_err(|_| Error::Msg("lookup.as missing".into()))?;
+    // fetch foreign docs (naively up to a large number)
+    let foreign = pg.find_docs(db, from, None, None, None, 100_000).await.map_err(|e| crate::error::Error::Msg(e.to_string()))?;
+    let mut map: HashMap<String, Vec<Document>> = HashMap::new();
+    for fd in foreign.into_iter() {
+        if let Some(val) = get_path_bson_value(&fd, foreign_field) {
+            map.entry(key_repr(&val)).or_default().push(fd);
+        }
+    }
+    for d in docs.iter_mut() {
+        let key = get_path_bson_value(d, local_field).map(|v| key_repr(&v));
+        let arr = key.and_then(|k| map.get(&k)).cloned().unwrap_or_else(|| Vec::new());
+        set_path_nested(d, as_field, bson::Bson::Array(arr.into_iter().map(|m| bson::Bson::Document(m)).collect()));
+    }
+    Ok(docs)
+}
+
 fn eval_expr(doc: &Document, v: &bson::Bson) -> Option<bson::Bson> {
     match v {
         bson::Bson::String(s) if s.starts_with('$') => {
@@ -990,6 +1171,21 @@ fn eval_expr(doc: &Document, v: &bson::Bson) -> Option<bson::Bson> {
             get_path_bson_value(doc, path)
         }
         bson::Bson::Document(d) => {
+            // Object literal: keys that do not start with '$' are treated as nested fields
+            if d.keys().any(|k| !k.starts_with('$')) {
+                let mut out = Document::new();
+                for (k, vv) in d.iter() {
+                    if k.starts_with('$') {
+                        // If any operator key appears alone, it will be handled below; otherwise skip unknown here
+                        continue;
+                    }
+                    let ev = eval_expr(doc, vv).unwrap_or(bson::Bson::Null);
+                    set_path_nested(&mut out, k, ev);
+                }
+                if !out.is_empty() {
+                    return Some(bson::Bson::Document(out));
+                }
+            }
             if let Some(arrs) = d.get_array("$concatArrays").ok() {
                 let mut out: Vec<bson::Bson> = Vec::new();
                 for op in arrs {
@@ -1014,6 +1210,10 @@ fn eval_expr(doc: &Document, v: &bson::Bson) -> Option<bson::Bson> {
             if let Some(arg) = d.get("$toDouble") {
                 let val = eval_expr(doc, arg).unwrap_or(bson::Bson::Null);
                 return to_double(&val);
+            }
+            if let Some(arg) = d.get("$toBool") {
+                let val = eval_expr(doc, arg).unwrap_or(bson::Bson::Null);
+                return Some(to_bool(&val));
             }
             if let Some(arr) = d.get_array("$ifNull").ok() {
                 if arr.len() == 2 {
@@ -1103,6 +1303,21 @@ fn to_double(b: &bson::Bson) -> Option<bson::Bson> {
         bson::Bson::Boolean(b) => Some(bson::Bson::Double(if *b { 1.0 } else { 0.0 })),
         _ => None,
     }
+}
+
+fn to_bool(b: &bson::Bson) -> bson::Bson {
+    let truthy = match b {
+        bson::Bson::Boolean(v) => *v,
+        bson::Bson::Null => false,
+        bson::Bson::String(s) => !s.is_empty(),
+        bson::Bson::Int32(n) => *n != 0,
+        bson::Bson::Int64(n) => *n != 0,
+        bson::Bson::Double(f) => *f != 0.0,
+        bson::Bson::Array(a) => !a.is_empty(),
+        bson::Bson::Document(d) => !d.is_empty(),
+        _ => true,
+    };
+    bson::Bson::Boolean(truthy)
 }
 
 fn apply_project_with_expr(input: &Document, proj: &Document) -> Document {
@@ -1197,7 +1412,7 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
     let pipeline = match cmd.get_array("pipeline") { Ok(a) => a, Err(_) => return error_doc(9, "Missing pipeline") };
     let cursor_spec = cmd.get_document("cursor").unwrap_or(&doc!{}).clone();
     let batch_size = cursor_spec.get_i32("batchSize").unwrap_or(101) as i64;
-    // Minimal pipeline support: $match, $sort, $project, $limit, $skip, $addFields/$set in order
+    // Minimal pipeline support: $match, $sort, $project, $limit, $skip, $addFields/$set, $unwind, $group, $lookup
     let mut filter: Option<bson::Document> = None;
     let mut sort: Option<bson::Document> = None;
     let mut project: Option<bson::Document> = None;
@@ -1206,6 +1421,9 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
     let mut add_fields: Option<bson::Document> = None;
     let mut count_field: Option<String> = None;
     let mut computed_project = false;
+    let mut unwind_path: Option<(String, bool, Option<String>)> = None; // (path, preserveNullAndEmptyArrays, includeArrayIndex)
+    let mut group_spec: Option<Document> = None;
+    let mut lookup_spec: Option<Document> = None;
     for st in pipeline {
         if let bson::Bson::Document(stage) = st {
             if let Ok(m) = stage.get_document("$match") { filter = Some(m.clone()); continue; }
@@ -1219,6 +1437,17 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
             if let Some(sk) = stage.get_i64("$skip").ok().or(stage.get_i32("$skip").ok().map(|v| v as i64)) { skip = Some(sk); continue; }
             if let Ok(af) = stage.get_document("$addFields").or(stage.get_document("$set")) { add_fields = Some(af.clone()); continue; }
             if let Ok(cf) = stage.get_str("$count") { count_field = Some(cf.to_string()); continue; }
+            if let Ok(u) = stage.get_str("$unwind") { unwind_path = Some((u.trim_start_matches('$').to_string(), false, None)); continue; }
+            if let Ok(ud) = stage.get_document("$unwind") {
+                if let Ok(pth) = ud.get_str("path") {
+                    let preserve = ud.get_bool("preserveNullAndEmptyArrays").unwrap_or(false);
+                    let include = ud.get_str("includeArrayIndex").ok().map(|s| s.to_string());
+                    unwind_path = Some((pth.trim_start_matches('$').to_string(), preserve, include));
+                    continue;
+                }
+            }
+            if let Ok(g) = stage.get_document("$group") { group_spec = Some(g.clone()); continue; }
+            if let Ok(lu) = stage.get_document("$lookup") { lookup_spec = Some(lu.clone()); continue; }
             // Unknown $stage: error
             if stage.keys().any(|k| k.starts_with('$')) {
                 return error_doc(9, format!("Unsupported pipeline stage: {}", stage.keys().next().unwrap()));
@@ -1244,8 +1473,6 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
         Ok(v) => v,
         Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
     };
-    // Apply skip trimming if requested
-    if let Some(sk) = skip { if sk as usize <= docs.len() { docs.drain(0..(sk as usize)); } else { docs.clear(); } }
     // Apply addFields/$set
     if let Some(af) = add_fields.as_ref() {
         for d in docs.iter_mut() {
@@ -1265,6 +1492,63 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
             }
         }
     }
+
+    // Apply unwind (drop docs with missing/non-array path)
+    if let Some((ref upath, preserve, ref include_idx)) = unwind_path {
+        let mut out: Vec<Document> = Vec::new();
+        for d in docs.into_iter() {
+            match get_path_bson_value(&d, upath) {
+                Some(bson::Bson::Array(arr)) => {
+                    if arr.is_empty() {
+                        if preserve {
+                            let mut nd = d.clone();
+                            set_path_nested(&mut nd, upath, bson::Bson::Null);
+                            if let Some(fpath) = include_idx { set_path_nested(&mut nd, fpath, bson::Bson::Null); }
+                            out.push(nd);
+                        }
+                        continue;
+                    }
+                    for (i, item) in arr.into_iter().enumerate() {
+                        let mut nd = d.clone();
+                        set_path_nested(&mut nd, upath, item);
+                        if let Some(fpath) = include_idx { set_path_nested(&mut nd, fpath, bson::Bson::Int32(i as i32)); }
+                        out.push(nd);
+                    }
+                }
+                None | Some(bson::Bson::Null) => {
+                    if preserve {
+                        let mut nd = d.clone();
+                        set_path_nested(&mut nd, upath, bson::Bson::Null);
+                        if let Some(fpath) = include_idx { set_path_nested(&mut nd, fpath, bson::Bson::Null); }
+                        out.push(nd);
+                    }
+                }
+                _ => {}
+            }
+        }
+        docs = out;
+    }
+
+    // Apply $group (in-memory)
+    if let Some(ref gspec) = group_spec {
+        docs = apply_group(&docs, gspec);
+    }
+
+    // Apply $lookup (in-memory)
+    if let Some(ref lspec) = lookup_spec {
+        if let Some(ref pg) = state.store {
+            docs = apply_lookup(dbname, pg, docs, lspec).await.unwrap_or_else(|_| Vec::new());
+        }
+    }
+
+    // In-memory sort if computed/unwind/group/lookup present and client requested sort
+    if (computed_project || unwind_path.is_some() || group_spec.is_some() || lookup_spec.is_some()) && sort.is_some() {
+        if let Some(ref s) = sort { docs.sort_by(|a, b| cmp_multi(a, b, s)); }
+    }
+
+    // Apply skip/limit after transformations
+    if let Some(sk) = skip { if sk as usize <= docs.len() { docs.drain(0..(sk as usize)); } else { docs.clear(); } }
+    if let Some(l) = limit { if (l as usize) < docs.len() { docs.truncate(l as usize); } }
     let (first_batch, remainder): (Vec<_>, Vec<_>) = docs.into_iter().enumerate().partition(|(i, _)| (*i as i64) < batch_size);
     let first_docs: Vec<Document> = first_batch.into_iter().map(|(_, d)| d).collect();
     let rest_docs: Vec<Document> = remainder.into_iter().map(|(_, d)| d).collect();
