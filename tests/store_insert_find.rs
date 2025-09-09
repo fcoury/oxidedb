@@ -14,7 +14,7 @@ async fn insert_and_find_round_trip_bson() {
     store.ensure_collection("test", "users").await.expect("ensure_collection");
 
     let oid = ObjectId::new();
-    let mut doc = doc!{ "_id": oid, "name": "Alice", "age": 30i32, "tags": ["a", "b"] };
+    let doc = doc!{ "_id": oid, "name": "Alice", "age": 30i32, "tags": ["a", "b"] };
     let id_bytes = oid.bytes().to_vec();
     let bson_bytes = bson::to_vec(&doc).unwrap();
     let json = serde_json::to_value(&doc).unwrap();
@@ -32,4 +32,3 @@ async fn insert_and_find_round_trip_bson() {
     let found2 = store.find_by_subdoc("test", "users", &filter, 10).await.expect("find_by_subdoc");
     assert!(found2.iter().any(|d| d == &doc));
 }
-

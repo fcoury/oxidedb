@@ -1,5 +1,5 @@
-use oxidedb::config::{ShadowCompareOptions, ShadowConfig};
-use oxidedb::protocol::{MessageHeader, OP_MSG, OP_QUERY};
+use oxidedb::config::ShadowConfig;
+use oxidedb::protocol::{MessageHeader, OP_QUERY};
 use oxidedb::shadow::ShadowSession;
 use bson::doc;
 use std::sync::Arc;
@@ -84,4 +84,3 @@ async fn shadow_op_query_ismaster_admin_cmd() {
     let up = up.expect("expected doc");
     assert_eq!(up.get_f64("ok").unwrap_or(0.0), 1.0);
 }
-

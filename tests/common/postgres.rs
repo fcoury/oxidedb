@@ -1,6 +1,6 @@
 use rand::{distributions::Alphanumeric, Rng};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio_postgres::{NoTls, Client};
+use tokio_postgres::NoTls;
 
 pub struct TestDb {
     admin_url: String,

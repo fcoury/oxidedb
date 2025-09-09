@@ -1627,8 +1627,8 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
 async fn find_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Document {
     let dbname = match db { Some(d) => d, None => return error_doc(59, "Missing $db") };
     let coll = match cmd.get_str("find") { Ok(c) => c, Err(_) => return error_doc(9, "Invalid find") };
-    let limit = cmd.get_i64("limit").unwrap_or(0);
-    let batch_size = cmd.get_i64("batchSize").unwrap_or(0);
+    let limit = cmd.get_i64("limit").ok().or(cmd.get_i32("limit").ok().map(|v| v as i64)).unwrap_or(0);
+    let batch_size = cmd.get_i64("batchSize").ok().or(cmd.get_i32("batchSize").ok().map(|v| v as i64)).unwrap_or(0);
     let first_batch_limit = if limit > 0 { limit } else if batch_size > 0 { batch_size } else { 101 };
     let filter = cmd.get_document("filter").ok();
 

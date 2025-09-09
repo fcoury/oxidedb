@@ -1,6 +1,5 @@
 use clap::Parser;
 use oxidedb::{config::Config, server};
-use clap::ArgAction;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
