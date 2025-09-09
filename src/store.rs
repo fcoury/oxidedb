@@ -470,6 +470,23 @@ impl PgStore {
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
+        // Fast path: _id equality
+        if let Some(idb) = filter.get("_id").and_then(id_bytes_from_bson) {
+            let sql = format!("SELECT id, doc_bson, doc FROM {}.{} WHERE id = $1 LIMIT 1", q_schema, q_table);
+            let rows = self.client.query(&sql, &[&idb]).await.map_err(err_msg)?;
+            if rows.is_empty() { return Ok(None); }
+            let r = &rows[0];
+            let id: Vec<u8> = r.get(0);
+            if let Ok(bytes) = r.try_get::<usize, Vec<u8>>(1) {
+                if let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes)) {
+                    return Ok(Some((id, doc)));
+                }
+            }
+            let json: serde_json::Value = r.get(2);
+            let b = bson::to_bson(&json).unwrap_or(bson::Bson::Document(bson::Document::new()));
+            let doc = match b { bson::Bson::Document(d) => d, _ => bson::Document::new() };
+            return Ok(Some((id, doc)));
+        }
         let where_sql = build_where_from_filter(filter);
         let sql = format!(
             "SELECT id, doc_bson, doc FROM {}.{} WHERE {} ORDER BY id ASC LIMIT 1",
@@ -508,6 +525,12 @@ impl PgStore {
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
+        // Fast path: _id equality
+        if let Some(idb) = filter.get("_id").and_then(id_bytes_from_bson) {
+            let del_sql = format!("DELETE FROM {}.{} WHERE id = $1", q_schema, q_table);
+            let n = self.client.execute(&del_sql, &[&idb]).await.map_err(err_msg)?;
+            return Ok(n);
+        }
         let where_sql = build_where_from_filter(filter);
         let select_sql = format!(
             "SELECT id FROM {}.{} WHERE {} ORDER BY id ASC LIMIT 1",
@@ -730,6 +753,14 @@ fn json_literal_from_bson(v: &bson::Bson) -> Option<String> {
         bson::Bson::Int64(n) => Some(n.to_string()),
         bson::Bson::Double(n) => Some(n.to_string()),
         bson::Bson::String(s) => Some(format!("{}", serde_json::to_string(s).ok()?)),
+        _ => None,
+    }
+}
+
+fn id_bytes_from_bson(b: &bson::Bson) -> Option<Vec<u8>> {
+    match b {
+        bson::Bson::ObjectId(oid) => Some(oid.bytes().to_vec()),
+        bson::Bson::String(s) => Some(s.as_bytes().to_vec()),
         _ => None,
     }
 }
