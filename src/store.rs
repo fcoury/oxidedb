@@ -622,7 +622,7 @@ fn build_where_from_filter(filter: &bson::Document) -> String {
                             if let bson::Bson::Document(em) = val {
                                 if let Some(pred) = build_elem_match_pred(&path, em) {
                                     where_clauses.push(format!(
-                                        "jsonb_path_exists(doc, '{}[*] ? ({}))",
+                                        "jsonb_path_exists(doc, '{}[*] ? ({}))'",
                                         escape_single(&path), pred
                                     ));
                                 }
@@ -645,19 +645,19 @@ fn build_where_from_filter(filter: &bson::Document) -> String {
                                 if preds.is_empty() { where_clauses.push("FALSE".to_string()); }
                                 else {
                                     let predicate = preds.join(" || ");
-                                    where_clauses.push(format!("jsonb_path_exists(doc, '{} ? ({}))", escape_single(&path), predicate));
+                                    where_clauses.push(format!("jsonb_path_exists(doc, '{} ? ({}))'", escape_single(&path), predicate));
                                 }
                             }
                         }
                         "$gt" | "$gte" | "$lt" | "$lte" => {
                             let op_sql = match op.as_str() { "$gt" => ">", "$gte" => ">=", "$lt" => "<", "$lte" => "<=", _ => unreachable!() };
                             if let Some(lit) = json_literal_from_bson(val) {
-                                where_clauses.push(format!("jsonb_path_exists(doc, '{} ? (@ {} {}))", escape_single(&path), op_sql, lit));
+                                where_clauses.push(format!("jsonb_path_exists(doc, '{} ? (@ {} {}))'", escape_single(&path), op_sql, lit));
                             }
                         }
                         "$eq" => {
                             if let Some(lit) = json_literal_from_bson(val) {
-                                where_clauses.push(format!("jsonb_path_exists(doc, '{} ? (@ == {}))", escape_single(&path), lit));
+                                where_clauses.push(format!("jsonb_path_exists(doc, '{} ? (@ == {}))'", escape_single(&path), lit));
                             }
                         }
                         _ => {}
@@ -666,7 +666,7 @@ fn build_where_from_filter(filter: &bson::Document) -> String {
             }
             _ => {
                 if let Some(lit) = json_literal_from_bson(v) {
-                    where_clauses.push(format!("jsonb_path_exists(doc, '{} ? (@ == {}))", escape_single(&path), lit));
+                    where_clauses.push(format!("jsonb_path_exists(doc, '{} ? (@ == {}))'", escape_single(&path), lit));
                 }
             }
         }
