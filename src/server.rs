@@ -868,7 +868,9 @@ fn apply_inc(doc: &mut Document, path: &str, delta: bson::Bson) -> bool {
 }
 
 fn apply_push(doc: &mut Document, path: &str, val: bson::Bson) -> bool {
-    // Support: { $push: { a: v }} and { $push: { a: { $each: [v1, v2] } } }
+    // Support:
+    // - { $push: { a: v }}
+    // - { $push: { a: { $each: [v1, v2], $position: i?, $slice: n? } } }
     // Fetch current value
     let mut root = bson::Bson::Document(doc.clone());
     let segs: Vec<&str> = path.split('.').collect();
@@ -885,12 +887,27 @@ fn apply_push(doc: &mut Document, path: &str, val: bson::Bson) -> bool {
         let entry = d.entry(last.to_string()).or_insert_with(|| bson::Bson::Array(Vec::new()));
         match entry {
             bson::Bson::Array(arr) => {
-                // Determine value(s)
                 if let bson::Bson::Document(spec) = val {
-                    if let Ok(each) = spec.get_array("$each") {
-                        for item in each { arr.push(item.clone()); }
-                    } else {
-                        return false;
+                    // $each required if using modifiers
+                    let each = match spec.get_array("$each") { Ok(a) => a.clone(), Err(_) => return false };
+                    let pos = spec.get_i32("$position").ok().unwrap_or(i32::MAX);
+                    let slice = spec.get_i32("$slice").ok();
+                    // Insert at position (clamped)
+                    let mut insert_at = if pos < 0 { 0usize } else { pos as usize };
+                    if insert_at > arr.len() { insert_at = arr.len(); }
+                    arr.splice(insert_at..insert_at, each.into_iter());
+                    // Apply slice trimming if provided
+                    if let Some(n) = slice {
+                        if n >= 0 {
+                            let n = n as usize;
+                            if arr.len() > n { arr.truncate(n); }
+                        } else {
+                            let n = (-n) as usize;
+                            if arr.len() > n {
+                                let remove = arr.len() - n;
+                                arr.drain(0..remove);
+                            }
+                        }
                     }
                 } else {
                     arr.push(val);
@@ -923,6 +940,9 @@ fn apply_pull(doc: &mut Document, path: &str, criterion: bson::Bson) {
                 bson::Bson::Array(ref vals) => {
                     arr.retain(|e| !vals.contains(e));
                 }
+                bson::Bson::Document(ref doc_crit) => {
+                    arr.retain(|e| !matches_predicate(e, doc_crit));
+                }
                 ref v => {
                     arr.retain(|e| e != v);
                 }
@@ -932,6 +952,37 @@ fn apply_pull(doc: &mut Document, path: &str, criterion: bson::Bson) {
     if let bson::Bson::Document(updated) = root { *doc = updated; }
 }
 
+fn matches_predicate(elem: &bson::Bson, crit: &Document) -> bool {
+    // Support simple operators: $gt,$gte,$lt,$lte,$eq,$in
+    for (op, val) in crit.iter() {
+        match op.as_str() {
+            "$gt" => if !cmp(elem, val, |a,b| a > b) { return false; },
+            "$gte" => if !cmp(elem, val, |a,b| a >= b) { return false; },
+            "$lt" => if !cmp(elem, val, |a,b| a < b) { return false; },
+            "$lte" => if !cmp(elem, val, |a,b| a <= b) { return false; },
+            "$eq" => if !cmp(elem, val, |a,b| a == b) { return false; },
+            "$in" => {
+                if let bson::Bson::Array(arr) = val {
+                    let mut ok = false;
+                    for v in arr {
+                        if cmp(elem, v, |a,b| a == b) { ok = true; break; }
+                    }
+                    if !ok { return false; }
+                } else { return false; }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+fn cmp<F: Fn(f64,f64)->bool>(a: &bson::Bson, b: &bson::Bson, f: F) -> bool {
+    match (number_as_f64(a), number_as_f64(b)) {
+        (Some(x), Some(y)) => f(x,y),
+        _ => a == b,
+    }
+}
+
 fn eval_expr(doc: &Document, v: &bson::Bson) -> Option<bson::Bson> {
     match v {
         bson::Bson::String(s) if s.starts_with('$') => {
@@ -939,11 +990,30 @@ fn eval_expr(doc: &Document, v: &bson::Bson) -> Option<bson::Bson> {
             get_path_bson_value(doc, path)
         }
         bson::Bson::Document(d) => {
+            if let Some(arrs) = d.get_array("$concatArrays").ok() {
+                let mut out: Vec<bson::Bson> = Vec::new();
+                for op in arrs {
+                    let ev = eval_expr(doc, op)?;
+                    match ev {
+                        bson::Bson::Array(mut a) => { out.append(&mut a); }
+                        _ => return None,
+                    }
+                }
+                return Some(bson::Bson::Array(out));
+            }
             if let Some(arg) = d.get("$toString") {
                 // Support either scalar or single-element array
                 let val = if let bson::Bson::Array(arr) = arg { if arr.len() == 1 { eval_expr(doc, &arr[0]) } else { None } } else { eval_expr(doc, arg) };
                 let val = val.unwrap_or(bson::Bson::Null);
                 return Some(bson::Bson::String(bson_to_string(&val)));
+            }
+            if let Some(arg) = d.get("$toInt") {
+                let val = eval_expr(doc, arg).unwrap_or(bson::Bson::Null);
+                return to_int(&val);
+            }
+            if let Some(arg) = d.get("$toDouble") {
+                let val = eval_expr(doc, arg).unwrap_or(bson::Bson::Null);
+                return to_double(&val);
             }
             if let Some(arr) = d.get_array("$ifNull").ok() {
                 if arr.len() == 2 {
@@ -1006,6 +1076,32 @@ fn bson_to_string(b: &bson::Bson) -> String {
         bson::Bson::Boolean(v) => if *v { "true".into() } else { "false".into() },
         bson::Bson::Null => String::new(),
         other => format!("{:?}", other),
+    }
+}
+
+fn to_int(b: &bson::Bson) -> Option<bson::Bson> {
+    match b {
+        bson::Bson::Int32(n) => Some(bson::Bson::Int32(*n)),
+        bson::Bson::Int64(n) => {
+            if *n >= i32::MIN as i64 && *n <= i32::MAX as i64 { Some(bson::Bson::Int32(*n as i32)) } else { Some(bson::Bson::Int64(*n)) }
+        }
+        bson::Bson::Double(f) => Some(bson::Bson::Int32(*f as i32)),
+        bson::Bson::String(s) => s.parse::<i64>().ok().map(|n| {
+            if n >= i32::MIN as i64 && n <= i32::MAX as i64 { bson::Bson::Int32(n as i32) } else { bson::Bson::Int64(n) }
+        }),
+        bson::Bson::Boolean(b) => Some(bson::Bson::Int32(if *b { 1 } else { 0 })),
+        _ => None,
+    }
+}
+
+fn to_double(b: &bson::Bson) -> Option<bson::Bson> {
+    match b {
+        bson::Bson::Int32(n) => Some(bson::Bson::Double(*n as f64)),
+        bson::Bson::Int64(n) => Some(bson::Bson::Double(*n as f64)),
+        bson::Bson::Double(f) => Some(bson::Bson::Double(*f)),
+        bson::Bson::String(s) => s.parse::<f64>().ok().map(bson::Bson::Double),
+        bson::Bson::Boolean(b) => Some(bson::Bson::Double(if *b { 1.0 } else { 0.0 })),
+        _ => None,
     }
 }
 
