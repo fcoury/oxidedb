@@ -843,7 +843,7 @@ async fn find_and_modify_reply(state: &AppState, db: Option<&str>, cmd: &Documen
     tokio::spawn(async move {
         if let Err(e) = tx_conn.await { tracing::error!(error = %e, "postgres tx connection error"); }
     });
-    let mut tx = match tx_client.transaction().await { Ok(t) => t, Err(e) => return error_doc(59, format!("tx begin failed: {}", e)) };
+    let tx = match tx_client.transaction().await { Ok(t) => t, Err(e) => return error_doc(59, format!("tx begin failed: {}", e)) };
     let found = match pg.find_one_for_update_sorted_tx(&tx, dbname, coll, &filter, sort.as_ref()).await {
         Ok(v) => v,
         Err(e) => { let _ = tx.rollback().await; return error_doc(59, format!("find failed: {}", e)); }
@@ -901,7 +901,7 @@ async fn find_and_modify_reply(state: &AppState, db: Option<&str>, cmd: &Documen
     } else {
         // Not found
         if !upsert {
-            let mut value = bson::Bson::Null;
+            let value = bson::Bson::Null;
             if new_return { /* still null */ }
             return doc!{ "lastErrorObject": { "n": 0i32, "updatedExisting": false }, "value": value, "ok": 1.0 };
         }
@@ -947,7 +947,7 @@ async fn find_and_modify_reply(state: &AppState, db: Option<&str>, cmd: &Documen
         tokio::spawn(async move {
             if let Err(e) = tx2_conn.await { tracing::error!(error = %e, "postgres tx connection error"); }
         });
-        let mut tx2 = match tx2_client.transaction().await { Ok(t) => t, Err(e) => return error_doc(59, format!("tx begin failed: {}", e)) };
+        let tx2 = match tx2_client.transaction().await { Ok(t) => t, Err(e) => return error_doc(59, format!("tx begin failed: {}", e)) };
         match pg.insert_one_tx(&tx2, dbname, coll, &idb, &bson_bytes, &json).await {
             Ok(n) => {
                 if let Err(e) = tx2.commit().await { return error_doc(59, format!("tx commit failed: {}", e)); }
