@@ -94,9 +94,8 @@ pub fn decode_op_msg(body: &[u8]) -> Option<(u32, Document, HashMap<String, Vec<
             1u8 => {
                 if i + 4 > body.len() { return None; }
                 let size = i32::from_le_bytes([body[i], body[i+1], body[i+2], body[i+3]]) as usize;
-                let section_start = i - 4; // points to size field start
-                let section_end = section_start.saturating_add(size);
-                i += 4;
+                let section_end = i + size; // size counts from the size field itself
+                i += 4; // advance past size field
                 if section_end > body.len() { return None; }
                 // parse cstring identifier
                 let mut j = i;
@@ -250,5 +249,81 @@ pub fn decode_op_reply_first_doc(body: &[u8]) -> Option<Document> {
     match bson::Document::from_reader(&mut cur) {
         Ok(doc) => Some(doc),
         Err(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bson::{doc, Bson, Document as BsonDocument};
+
+    // Build an OP_MSG body with:
+    // - flags = 0
+    // - section 0: a command document
+    // - section 1: a document sequence identified by `ident` containing `docs`
+    fn build_op_msg_body_with_sequence(mut cmd: BsonDocument, ident: &str, docs: Vec<BsonDocument>) -> Vec<u8> {
+        // Ensure placeholder (e.g., documents: []) exists in section 0 to mimic real drivers
+        if !cmd.contains_key(ident) {
+            cmd.insert(ident, Bson::Array(Vec::new()));
+        }
+        let mut body = Vec::new();
+        let flags: u32 = 0;
+        body.extend_from_slice(&flags.to_le_bytes());
+        // section 0
+        body.push(0u8);
+        let cmd_bytes = bson::to_vec(&cmd).unwrap();
+        body.extend_from_slice(&cmd_bytes);
+        // section 1
+        body.push(1u8);
+        // compute section size (includes the 4 size bytes themselves)
+        let ident_cstr = {
+            let mut v = ident.as_bytes().to_vec();
+            v.push(0u8);
+            v
+        };
+        let mut seq_docs_flat: Vec<u8> = Vec::new();
+        for d in docs {
+            let b = bson::to_vec(&d).unwrap();
+            seq_docs_flat.extend_from_slice(&b);
+        }
+        let section_size = 4 + ident_cstr.len() + seq_docs_flat.len();
+        body.extend_from_slice(&(section_size as i32).to_le_bytes());
+        body.extend_from_slice(&ident_cstr);
+        body.extend_from_slice(&seq_docs_flat);
+        body
+    }
+
+    #[test]
+    fn decodes_op_msg_document_sequence_and_leaves_section0_intact() {
+        let cmd = doc!{"insert": "tenants", "ordered": true, "$db": "methodiq", "documents": Bson::Array(Vec::new())};
+        let d1 = doc!{"name": "hepquant", "domains": ["hepquant.dev.dxflow.io"]};
+        let body = build_op_msg_body_with_sequence(cmd.clone(), "documents", vec![d1.clone()]);
+        let (_flags, decoded_cmd, seqs) = decode_op_msg(&body).expect("decode");
+        // Section 0 command should be equal to original (still has empty array)
+        assert_eq!(decoded_cmd.get_array("documents").unwrap().len(), 0);
+        // Sequence should carry the real docs
+        let seq_docs = seqs.get("documents").expect("seq present");
+        assert_eq!(seq_docs.len(), 1);
+        assert_eq!(seq_docs[0].get_str("name").unwrap(), "hepquant");
+    }
+
+    #[test]
+    fn merge_logic_appends_sequence_into_existing_array() {
+        // Simulate server-side merge: append sequence docs into an existing array field
+        let mut cmd = doc!{"insert": "tenants", "$db": "methodiq", "documents": Bson::Array(Vec::new())};
+        let d1 = doc!{"name": "hepquant"};
+        let body = build_op_msg_body_with_sequence(cmd.clone(), "documents", vec![d1.clone()]);
+        let (_flags, mut decoded_cmd, seqs) = decode_op_msg(&body).expect("decode");
+        // Merge (same as server): if array exists, extend; else insert
+        if let Some(list) = seqs.get("documents") {
+            let to_append: Vec<Bson> = list.iter().cloned().map(Bson::Document).collect();
+            match decoded_cmd.get_mut("documents") {
+                Some(Bson::Array(a)) => a.extend(to_append),
+                _ => { decoded_cmd.insert("documents", Bson::Array(to_append)); }
+            }
+        }
+        let arr = decoded_cmd.get_array("documents").unwrap();
+        assert_eq!(arr.len(), 1);
+        match &arr[0] { Bson::Document(d) => assert_eq!(d.get_str("name").unwrap(), "hepquant"), _ => panic!("expected doc") }
     }
 }
