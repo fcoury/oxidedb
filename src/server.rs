@@ -426,14 +426,27 @@ fn hello_reply() -> Document {
         "isWritablePrimary": true,
         "helloOk": true,
         "minWireVersion": 0i32,
-        // Advertise a minimally compatible wire version for modern drivers
-        // (MongoDB 4.0+ expects >= 7)
-        "maxWireVersion": 7i32,
+        // Advertise compatibility for MongoDB 4.2+ clients
+        // Node.js driver v6 requires >= 8
+        "maxWireVersion": 8i32,
         "maxBsonObjectSize": 16_777_216i32, // 16MB
         "maxMessageSizeBytes": 48_000_000i32,
         "maxWriteBatchSize": 100_000i32,
         "logicalSessionTimeoutMinutes": 30i32,
         "ok": 1.0
+    }
+}
+
+#[cfg(test)]
+mod hello_tests {
+    use super::hello_reply;
+
+    #[test]
+    fn advertises_wire_version_8() {
+        let d = hello_reply();
+        assert_eq!(d.get_i32("maxWireVersion").unwrap(), 8);
+        assert!(d.get_bool("helloOk").unwrap_or(false));
+        assert!(d.get_bool("isWritablePrimary").unwrap_or(false));
     }
 }
 
@@ -624,13 +637,13 @@ async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
     let mut matched_total = 0i32;
     let mut modified_total = 0i32;
 
-    for upd_b in updates {
+    let mut upserted_entries: Vec<Document> = Vec::new();
+    for (spec_index, upd_b) in updates.iter().enumerate() {
         let spec = match upd_b { bson::Bson::Document(d) => d, _ => return error_doc(9, "Invalid update spec") };
         let filter = match spec.get_document("q") { Ok(d) => d.clone(), Err(_) => return error_doc(9, "Missing q") };
         let udoc = match spec.get_document("u") { Ok(d) => d.clone(), Err(_) => return error_doc(9, "Missing u") };
         let multi = spec.get_bool("multi").unwrap_or(false);
         let upsert = spec.get_bool("upsert").unwrap_or(false);
-        if upsert { return error_doc(20, "upsert not supported"); }
         let set_doc = udoc.get_document("$set").ok().cloned();
         let unset_doc = udoc.get_document("$unset").ok().cloned();
         let inc_doc = udoc.get_document("$inc").ok().cloned();
@@ -685,7 +698,39 @@ async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
                 Ok(v) => v,
                 Err(e) => return error_doc(59, format!("find failed: {}", e)),
             };
-            if docs.is_empty() { continue; }
+            if docs.is_empty() {
+                if upsert {
+                    // Upsert: insert one synthesized document
+                    if let Err(e) = pg.ensure_collection(dbname, coll).await { return error_doc(59, format!("ensure_collection failed: {}", e)); }
+                    let mut new_doc = bson::Document::new();
+                    for (k, v) in filter.iter() {
+                        match v {
+                            bson::Bson::Document(d) => { if let Some(eqv) = d.get("$eq") { new_doc.insert(k.clone(), eqv.clone()); } }
+                            other => { new_doc.insert(k.clone(), other.clone()); }
+                        }
+                    }
+                    if let Some(ref sets) = set_doc { for (k, v) in sets.iter() { set_path_nested(&mut new_doc, k, v.clone()); } }
+                    if let Some(ref unsets) = unset_doc { for (k, _v) in unsets.iter() { unset_path_nested(&mut new_doc, k); } }
+                    if let Some(ref incs) = inc_doc { for (k, v) in incs.iter() { if !apply_inc(&mut new_doc, k, v.clone()) { return error_doc(2, "$inc requires numeric field"); } } }
+                    if let Some(ref ren) = rename_doc { for (from, to_b) in ren.iter() { if let bson::Bson::String(to) = to_b { apply_rename(&mut new_doc, from, to); } } }
+                    if let Some(ref pushes) = push_doc { for (k, v) in pushes.iter() { if !apply_push(&mut new_doc, k, v.clone()) { return error_doc(2, "$push on non-array"); } } }
+                    if let Some(ref pulls) = pull_doc { for (k, v) in pulls.iter() { apply_pull(&mut new_doc, k, v.clone()); } }
+                    ensure_id(&mut new_doc);
+                    let idb = match new_doc.get("_id").and_then(|b| id_bytes_bson(b)) { Some(v) => v, None => return error_doc(2, "unsupported _id type") };
+                    let json = match serde_json::to_value(&new_doc) { Ok(v) => v, Err(e) => return error_doc(2, e.to_string()) };
+                    let bson_bytes = match bson::to_vec(&new_doc) { Ok(v) => v, Err(e) => return error_doc(2, e.to_string()) };
+                    match pg.insert_one(dbname, coll, &idb, &bson_bytes, &json).await {
+                        Ok(n) => {
+                            if n == 1 {
+                                matched_total += 1;
+                                upserted_entries.push(doc!{"index": (spec_index as i32), "_id": new_doc.get("_id").cloned().unwrap_or(bson::Bson::Null)});
+                            }
+                        }
+                        Err(e) => return error_doc(59, format!("insert failed: {}", e)),
+                    }
+                }
+                continue;
+            }
             for mut d in docs {
                 let idb = match d.get("_id").and_then(|b| id_bytes_bson(b)) { Some(v) => v, None => continue };
                 // remember original
@@ -734,11 +779,40 @@ async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
                     }
                     Err(e) => return error_doc(59, format!("update failed: {}", e)),
                 }
+            } else if upsert {
+                if let Err(e) = pg.ensure_collection(dbname, coll).await { return error_doc(59, format!("ensure_collection failed: {}", e)); }
+                let mut new_doc = bson::Document::new();
+                for (k, v) in filter.iter() {
+                    match v {
+                        bson::Bson::Document(d) => { if let Some(eqv) = d.get("$eq") { new_doc.insert(k.clone(), eqv.clone()); } }
+                        other => { new_doc.insert(k.clone(), other.clone()); }
+                    }
+                }
+                if let Some(ref sets) = set_doc { for (k, v) in sets.iter() { set_path_nested(&mut new_doc, k, v.clone()); } }
+                if let Some(ref unsets) = unset_doc { for (k, _v) in unsets.iter() { unset_path_nested(&mut new_doc, k); } }
+                if let Some(ref incs) = inc_doc { for (k, v) in incs.iter() { if !apply_inc(&mut new_doc, k, v.clone()) { return error_doc(2, "$inc requires numeric field"); } } }
+                if let Some(ref ren) = rename_doc { for (from, to_b) in ren.iter() { if let bson::Bson::String(to) = to_b { apply_rename(&mut new_doc, from, to); } } }
+                if let Some(ref pushes) = push_doc { for (k, v) in pushes.iter() { if !apply_push(&mut new_doc, k, v.clone()) { return error_doc(2, "$push on non-array"); } } }
+                if let Some(ref pulls) = pull_doc { for (k, v) in pulls.iter() { apply_pull(&mut new_doc, k, v.clone()); } }
+                ensure_id(&mut new_doc);
+                let idb = match new_doc.get("_id").and_then(|b| id_bytes_bson(b)) { Some(v) => v, None => return error_doc(2, "unsupported _id type") };
+                let json = match serde_json::to_value(&new_doc) { Ok(v) => v, Err(e) => return error_doc(2, e.to_string()) };
+                let bson_bytes = match bson::to_vec(&new_doc) { Ok(v) => v, Err(e) => return error_doc(2, e.to_string()) };
+                match pg.insert_one(dbname, coll, &idb, &bson_bytes, &json).await {
+                    Ok(n) => {
+                        if n == 1 {
+                            matched_total += 1; // emulate n=1 for upsert
+                            upserted_entries.push(doc!{"index": (spec_index as i32), "_id": new_doc.get("_id").cloned().unwrap_or(bson::Bson::Null)});
+                        }
+                    }
+                    Err(e) => return error_doc(59, format!("insert failed: {}", e)),
+                }
             }
         }
     }
-
-    doc!{"n": matched_total, "nModified": modified_total, "ok": 1.0}
+    let mut reply = doc!{"n": matched_total, "nModified": modified_total, "ok": 1.0};
+    if !upserted_entries.is_empty() { reply.insert("upserted", upserted_entries); }
+    reply
 }
 
 async fn find_and_modify_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Document {
