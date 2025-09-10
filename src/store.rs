@@ -1,11 +1,13 @@
 use crate::error::{Error, Result};
-use tokio_postgres::{Client, NoTls, Transaction};
+use tokio_postgres::{NoTls, Transaction};
 use std::collections::HashSet;
 use std::time::Instant;
 use tokio::sync::RwLock;
+use deadpool_postgres::{Pool, Manager, ManagerConfig, RecyclingMethod};
+use std::str::FromStr;
 
 pub struct PgStore {
-    client: Client,
+    pool: Pool,
     dsn: String,
     databases_cache: RwLock<HashSet<String>>,              // known databases
     collections_cache: RwLock<HashSet<(String, String)>>,  // known (db, coll)
@@ -13,15 +15,11 @@ pub struct PgStore {
 
 impl PgStore {
     pub async fn connect(url: &str) -> Result<Self> {
-        let (client, connection) = tokio_postgres::connect(url, NoTls).await.map_err(|e| Error::Msg(e.to_string()))?;
-        // Spawn the connection driver task
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                tracing::error!(error = %e, "postgres connection error");
-            }
-        });
+        let pgcfg = tokio_postgres::Config::from_str(url).map_err(err_msg)?;
+        let mgr = Manager::from_config(pgcfg, NoTls, ManagerConfig { recycling_method: RecyclingMethod::Fast });
+        let pool = Pool::builder(mgr).max_size(16).build().map_err(err_msg)?;
         Ok(Self {
-            client,
+            pool,
             dsn: url.to_string(),
             databases_cache: RwLock::new(HashSet::new()),
             collections_cache: RwLock::new(HashSet::new()),
@@ -30,7 +28,8 @@ impl PgStore {
 
     pub async fn bootstrap(&self) -> Result<()> {
         // Create metadata schema and tables
-        self.client
+        let client = self.pool.get().await.map_err(err_msg)?;
+        client
             .batch_execute(
                 r#"
                 CREATE SCHEMA IF NOT EXISTS mdb_meta;
@@ -58,8 +57,8 @@ impl PgStore {
     }
 
     pub async fn list_databases(&self) -> Result<Vec<String>> {
-        let rows = self
-            .client
+        let client = self.pool.get().await.map_err(err_msg)?;
+        let rows = client
             .query("SELECT db FROM mdb_meta.databases ORDER BY db", &[])
             .await
             .map_err(|e| Error::Msg(e.to_string()))?;
@@ -67,8 +66,8 @@ impl PgStore {
     }
 
     pub async fn list_collections(&self, db: &str) -> Result<Vec<String>> {
-        let rows = self
-            .client
+        let client = self.pool.get().await.map_err(err_msg)?;
+        let rows = client
             .query("SELECT coll FROM mdb_meta.collections WHERE db = $1 ORDER BY coll", &[&db])
             .await
             .map_err(|e| Error::Msg(e.to_string()))?;
@@ -82,8 +81,9 @@ impl PgStore {
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let ddl = format!("CREATE SCHEMA IF NOT EXISTS {}", q_schema);
-        self.client.batch_execute(&ddl).await.map_err(err_msg)?;
-        self.client
+        let client = self.pool.get().await.map_err(err_msg)?;
+        client.batch_execute(&ddl).await.map_err(err_msg)?;
+        client
             .execute(
                 "INSERT INTO mdb_meta.databases(db) VALUES($1) ON CONFLICT (db) DO NOTHING",
                 &[&db],
@@ -109,8 +109,9 @@ impl PgStore {
             "CREATE TABLE IF NOT EXISTS {}.{} (id bytea PRIMARY KEY, doc jsonb NOT NULL, doc_bson bytea NOT NULL);\nCREATE INDEX IF NOT EXISTS {} ON {}.{} USING GIN (doc jsonb_path_ops)",
             q_schema, q_table, q_idx_name, q_schema, q_table
         );
-        self.client.batch_execute(&ddl).await.map_err(err_msg)?;
-        self.client
+        let client = self.pool.get().await.map_err(err_msg)?;
+        client.batch_execute(&ddl).await.map_err(err_msg)?;
+        client
             .execute(
                 "INSERT INTO mdb_meta.collections(db, coll) VALUES($1,$2) ON CONFLICT (db, coll) DO NOTHING",
                 &[&db, &coll],
@@ -127,8 +128,9 @@ impl PgStore {
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
         let ddl = format!("DROP TABLE IF EXISTS {}.{}", q_schema, q_table);
-        self.client.batch_execute(&ddl).await.map_err(err_msg)?;
-        self.client
+        let client = self.pool.get().await.map_err(err_msg)?;
+        client.batch_execute(&ddl).await.map_err(err_msg)?;
+        client
             .execute(
                 "DELETE FROM mdb_meta.collections WHERE db = $1 AND coll = $2",
                 &[&db, &coll],
@@ -142,15 +144,10 @@ impl PgStore {
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let ddl = format!("DROP SCHEMA IF EXISTS {} CASCADE", q_schema);
-        self.client.batch_execute(&ddl).await.map_err(err_msg)?;
-        self.client
-            .execute("DELETE FROM mdb_meta.collections WHERE db = $1", &[&db])
-            .await
-            .map_err(err_msg)?;
-        self.client
-            .execute("DELETE FROM mdb_meta.databases WHERE db = $1", &[&db])
-            .await
-            .map_err(err_msg)?;
+        let client = self.pool.get().await.map_err(err_msg)?;
+        client.batch_execute(&ddl).await.map_err(err_msg)?;
+        client.execute("DELETE FROM mdb_meta.collections WHERE db = $1", &[&db]).await.map_err(err_msg)?;
+        client.execute("DELETE FROM mdb_meta.databases WHERE db = $1", &[&db]).await.map_err(err_msg)?;
         Ok(())
     }
 
@@ -164,8 +161,8 @@ impl PgStore {
             q_schema, q_table
         );
         let t = Instant::now();
-        let n = self
-            .client
+        let client = self.pool.get().await.map_err(err_msg)?;
+        let n = client
             .execute(&sql, &[&id, &bson_bytes, &json])
             .await
             .map_err(err_msg)?;
@@ -179,7 +176,8 @@ impl PgStore {
         let q_table = q_ident(coll);
         let sql = format!("SELECT doc_bson, doc FROM {}.{} ORDER BY id ASC LIMIT $1", q_schema, q_table);
         let t = Instant::now();
-        let rows = match self.client.query(&sql, &[&limit]).await {
+        let client = self.pool.get().await.map_err(err_msg)?;
+        let rows = match client.query(&sql, &[&limit]).await {
             Ok(r) => r,
             Err(e) => {
                 let msg = e.to_string();
@@ -210,7 +208,8 @@ impl PgStore {
         let q_table = q_ident(coll);
         let sql = format!("SELECT doc_bson, doc FROM {}.{} WHERE id = $1 LIMIT $2", q_schema, q_table);
         let t = Instant::now();
-        let rows = match self.client.query(&sql, &[&id, &limit]).await {
+        let client = self.pool.get().await.map_err(err_msg)?;
+        let rows = match client.query(&sql, &[&id, &limit]).await {
             Ok(r) => r,
             Err(e) => {
                 let msg = e.to_string();
@@ -319,18 +318,25 @@ impl PgStore {
             }
         }
 
-        let where_sql = if where_clauses.is_empty() {
-            String::from("TRUE")
-        } else {
-            where_clauses.join(" AND ")
-        };
-
-        let sql = format!(
-            "SELECT doc_bson, doc FROM {}.{} WHERE {} ORDER BY id ASC LIMIT {}",
-            q_schema, q_table, where_sql, limit
-        );
         let t = Instant::now();
-        let rows = self.client.query(&sql, &[]).await.map_err(err_msg)?;
+        let client = self.pool.get().await.map_err(err_msg)?;
+        // Prefer JSONB containment when filter is simple equality-only
+        let rows = match build_where_spec(filter) {
+            WhereSpec::Containment(val) => {
+                let sql = format!(
+                    "SELECT doc_bson, doc FROM {}.{} WHERE doc @> $1::jsonb ORDER BY id ASC LIMIT $2",
+                    q_schema, q_table
+                );
+                client.query(&sql, &[&val, &limit]).await.map_err(err_msg)?
+            }
+            WhereSpec::Raw(where_sql) => {
+                let sql = format!(
+                    "SELECT doc_bson, doc FROM {}.{} WHERE {} ORDER BY id ASC LIMIT {}",
+                    q_schema, q_table, where_sql, limit
+                );
+                client.query(&sql, &[]).await.map_err(err_msg)?
+            }
+        };
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
             let bson_bytes: Option<Vec<u8>> = r.try_get(0).ok();
@@ -361,16 +367,36 @@ impl PgStore {
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
-        let where_sql = filter.map(build_where_from_filter).unwrap_or_else(|| "TRUE".to_string());
+        let where_spec = filter.map(build_where_spec);
         let order_sql = build_order_by(sort);
 
         if let Some(proj_sql) = projection_pushdown_sql(projection) {
-            let sql = format!(
-                "SELECT {} AS doc FROM {}.{} WHERE {} {} LIMIT {}",
-                proj_sql, q_schema, q_table, where_sql, order_sql, limit
-            );
             let t = Instant::now();
-            let rows = match self.client.query(&sql, &[]).await {
+            let client = self.pool.get().await.map_err(err_msg)?;
+            let res = match &where_spec {
+                Some(WhereSpec::Containment(val)) => {
+                    let sql = format!(
+                        "SELECT {} AS doc FROM {}.{} WHERE doc @> $1::jsonb {} LIMIT $2",
+                        proj_sql, q_schema, q_table, order_sql
+                    );
+                    client.query(&sql, &[val, &limit]).await
+                }
+                Some(WhereSpec::Raw(where_sql)) => {
+                    let sql = format!(
+                        "SELECT {} AS doc FROM {}.{} WHERE {} {} LIMIT {}",
+                        proj_sql, q_schema, q_table, where_sql, order_sql, limit
+                    );
+                    client.query(&sql, &[]).await
+                }
+                None => {
+                    let sql = format!(
+                        "SELECT {} AS doc FROM {}.{} WHERE TRUE {} LIMIT {}",
+                        proj_sql, q_schema, q_table, order_sql, limit
+                    );
+                    client.query(&sql, &[]).await
+                }
+            };
+            let rows = match res {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = e.to_string();
@@ -387,12 +413,32 @@ impl PgStore {
             tracing::debug!(op="find_docs_pushdown", db=%db, coll=%coll, elapsed_ms=?t.elapsed().as_millis());
             Ok(out)
         } else {
-            let sql = format!(
-                "SELECT doc_bson, doc FROM {}.{} WHERE {} {} LIMIT {}",
-                q_schema, q_table, where_sql, order_sql, limit
-            );
             let t = Instant::now();
-            let rows = match self.client.query(&sql, &[]).await {
+            let client = self.pool.get().await.map_err(err_msg)?;
+            let res = match &where_spec {
+                Some(WhereSpec::Containment(val)) => {
+                    let sql = format!(
+                        "SELECT doc_bson, doc FROM {}.{} WHERE doc @> $1::jsonb {} LIMIT $2",
+                        q_schema, q_table, order_sql
+                    );
+                    client.query(&sql, &[val, &limit]).await
+                }
+                Some(WhereSpec::Raw(where_sql)) => {
+                    let sql = format!(
+                        "SELECT doc_bson, doc FROM {}.{} WHERE {} {} LIMIT {}",
+                        q_schema, q_table, where_sql, order_sql, limit
+                    );
+                    client.query(&sql, &[]).await
+                }
+                None => {
+                    let sql = format!(
+                        "SELECT doc_bson, doc FROM {}.{} WHERE TRUE {} LIMIT {}",
+                        q_schema, q_table, order_sql, limit
+                    );
+                    client.query(&sql, &[]).await
+                }
+            };
+            let rows = match res {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = e.to_string();
@@ -426,7 +472,8 @@ impl PgStore {
             q_schema, q_table
         );
         let t = Instant::now();
-        let rows = self.client.query(&sql, &[&subdoc, &limit]).await.map_err(err_msg)?;
+        let client = self.pool.get().await.map_err(err_msg)?;
+        let rows = client.query(&sql, &[&subdoc, &limit]).await.map_err(err_msg)?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
             let bson_bytes: Option<Vec<u8>> = r.try_get(0).ok();
@@ -459,9 +506,10 @@ impl PgStore {
         let expr = format!("((doc->>'{}'))", field_escaped);
         let t = Instant::now();
         let ddl = format!("CREATE INDEX IF NOT EXISTS {} ON {}.{} USING btree {}", q_idx, q_schema, q_table, expr);
-        self.client.batch_execute(&ddl).await.map_err(err_msg)?;
+        let client = self.pool.get().await.map_err(err_msg)?;
+        client.batch_execute(&ddl).await.map_err(err_msg)?;
         // Persist metadata
-        self.client
+        client
             .execute(
                 "INSERT INTO mdb_meta.indexes(db, coll, name, spec, sql) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (db, coll, name) DO UPDATE SET spec = EXCLUDED.spec, sql = EXCLUDED.sql",
                 &[&db, &coll, &name, &spec, &ddl],
@@ -477,9 +525,9 @@ impl PgStore {
         let q_schema = q_ident(&schema);
         let q_idx = q_ident(name);
         let ddl = format!("DROP INDEX IF EXISTS {}.{}", q_schema, q_idx);
-        self.client.batch_execute(&ddl).await.map_err(err_msg)?;
-        let n = self
-            .client
+        let client = self.pool.get().await.map_err(err_msg)?;
+        client.batch_execute(&ddl).await.map_err(err_msg)?;
+        let n = client
             .execute("DELETE FROM mdb_meta.indexes WHERE db=$1 AND coll=$2 AND name=$3", &[&db, &coll, &name])
             .await
             .map_err(err_msg)?;
@@ -487,8 +535,8 @@ impl PgStore {
     }
 
     pub async fn list_index_names(&self, db: &str, coll: &str) -> Result<Vec<String>> {
-        let rows = self
-            .client
+        let client = self.pool.get().await.map_err(err_msg)?;
+        let rows = client
             .query("SELECT name FROM mdb_meta.indexes WHERE db=$1 AND coll=$2", &[&db, &coll])
             .await
             .map_err(err_msg)?;
@@ -512,8 +560,9 @@ impl PgStore {
         let elems_joined = elems.join(", ");
         let t = Instant::now();
         let ddl = format!("CREATE INDEX IF NOT EXISTS {} ON {}.{} USING btree ({})", q_idx, q_schema, q_table, elems_joined);
-        self.client.batch_execute(&ddl).await.map_err(err_msg)?;
-        self.client
+        let client = self.pool.get().await.map_err(err_msg)?;
+        client.batch_execute(&ddl).await.map_err(err_msg)?;
+        client
             .execute(
                 "INSERT INTO mdb_meta.indexes(db, coll, name, spec, sql) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (db, coll, name) DO UPDATE SET spec = EXCLUDED.spec, sql = EXCLUDED.sql",
                 &[&db, &coll, &name, &spec, &ddl],
@@ -531,7 +580,8 @@ impl PgStore {
         let where_sql = filter.map(build_where_from_filter).unwrap_or_else(|| "TRUE".to_string());
         let sql = format!("SELECT COUNT(*) FROM {}.{} WHERE {}", q_schema, q_table, where_sql);
         let t = Instant::now();
-        let res = self.client.query_one(&sql, &[]).await;
+        let client = self.pool.get().await.map_err(err_msg)?;
+        let res = client.query_one(&sql, &[]).await;
         match res {
             Ok(row) => {
                 let n: i64 = row.get(0);
@@ -555,7 +605,8 @@ impl PgStore {
         // Fast path: _id equality
         if let Some(idb) = filter.get("_id").and_then(id_bytes_from_bson) {
             let sql = format!("SELECT id, doc_bson, doc FROM {}.{} WHERE id = $1 LIMIT 1", q_schema, q_table);
-            let rows = self.client.query(&sql, &[&idb]).await.map_err(err_msg)?;
+            let client = self.pool.get().await.map_err(err_msg)?;
+            let rows = client.query(&sql, &[&idb]).await.map_err(err_msg)?;
             if rows.is_empty() { return Ok(None); }
             let r = &rows[0];
             let id: Vec<u8> = r.get(0);
@@ -569,13 +620,25 @@ impl PgStore {
             let doc = match b { bson::Bson::Document(d) => d, _ => bson::Document::new() };
             return Ok(Some((id, doc)));
         }
-        let where_sql = build_where_from_filter(filter);
-        let sql = format!(
-            "SELECT id, doc_bson, doc FROM {}.{} WHERE {} ORDER BY id ASC LIMIT 1",
-            q_schema, q_table, where_sql
-        );
+        let where_spec = build_where_spec(filter);
         let t = Instant::now();
-        let rows = self.client.query(&sql, &[]).await.map_err(err_msg)?;
+        let client = self.pool.get().await.map_err(err_msg)?;
+        let rows = match where_spec {
+            WhereSpec::Containment(val) => {
+                let sql = format!(
+                    "SELECT id, doc_bson, doc FROM {}.{} WHERE doc @> $1::jsonb ORDER BY id ASC LIMIT 1",
+                    q_schema, q_table
+                );
+                client.query(&sql, &[&val]).await.map_err(err_msg)?
+            }
+            WhereSpec::Raw(where_sql) => {
+                let sql = format!(
+                    "SELECT id, doc_bson, doc FROM {}.{} WHERE {} ORDER BY id ASC LIMIT 1",
+                    q_schema, q_table, where_sql
+                );
+                client.query(&sql, &[]).await.map_err(err_msg)?
+            }
+        };
         if rows.is_empty() { return Ok(None); }
         let r = &rows[0];
         let id: Vec<u8> = r.get(0);
@@ -601,7 +664,8 @@ impl PgStore {
         let bson_bytes = bson::to_vec(new_doc).map_err(err_msg)?;
         let json = serde_json::to_value(new_doc).map_err(err_msg)?;
         let t = Instant::now();
-        let n = self.client.execute(&sql, &[&bson_bytes, &json, &id]).await.map_err(err_msg)?;
+        let client = self.pool.get().await.map_err(err_msg)?;
+        let n = client.execute(&sql, &[&bson_bytes, &json, &id]).await.map_err(err_msg)?;
         tracing::debug!(op="update_doc_by_id", db=%db, coll=%coll, elapsed_ms=?t.elapsed().as_millis());
         Ok(n)
     }
@@ -614,20 +678,25 @@ impl PgStore {
         // Fast path: _id equality
         if let Some(idb) = filter.get("_id").and_then(id_bytes_from_bson) {
             let del_sql = format!("DELETE FROM {}.{} WHERE id = $1", q_schema, q_table);
-            let n = self.client.execute(&del_sql, &[&idb]).await.map_err(err_msg)?;
+            let client = self.pool.get().await.map_err(err_msg)?;
+            let n = client.execute(&del_sql, &[&idb]).await.map_err(err_msg)?;
             return Ok(n);
         }
-        let where_sql = build_where_from_filter(filter);
+        let where_spec = build_where_spec(filter);
         let select_sql = format!(
             "SELECT id FROM {}.{} WHERE {} ORDER BY id ASC LIMIT 1",
-            q_schema, q_table, where_sql
+            q_schema, q_table, match &where_spec { WhereSpec::Raw(s) => s.as_str(), _ => "doc @> $1::jsonb" }
         );
         let t = Instant::now();
-        let rows = self.client.query(&select_sql, &[]).await.map_err(err_msg)?;
+        let client = self.pool.get().await.map_err(err_msg)?;
+        let rows = match &where_spec {
+            WhereSpec::Containment(val) => client.query(&select_sql, &[val]).await.map_err(err_msg)?,
+            WhereSpec::Raw(_) => client.query(&select_sql, &[]).await.map_err(err_msg)?,
+        };
         if rows.is_empty() { return Ok(0); }
         let id: Vec<u8> = rows[0].get(0);
         let del_sql = format!("DELETE FROM {}.{} WHERE id = $1", q_schema, q_table);
-        let n = self.client.execute(&del_sql, &[&id]).await.map_err(err_msg)?;
+        let n = client.execute(&del_sql, &[&id]).await.map_err(err_msg)?;
         tracing::debug!(op="delete_one_by_filter", db=%db, coll=%coll, elapsed_ms=?t.elapsed().as_millis());
         Ok(n)
     }
@@ -637,10 +706,19 @@ impl PgStore {
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
-        let where_sql = build_where_from_filter(filter);
-        let sql = format!("DELETE FROM {}.{} WHERE {}", q_schema, q_table, where_sql);
+        let where_spec = build_where_spec(filter);
         let t = Instant::now();
-        let n = self.client.execute(&sql, &[]).await.map_err(err_msg)?;
+        let client = self.pool.get().await.map_err(err_msg)?;
+        let n = match where_spec {
+            WhereSpec::Containment(val) => {
+                let sql = format!("DELETE FROM {}.{} WHERE doc @> $1::jsonb", q_schema, q_table);
+                client.execute(&sql, &[&val]).await.map_err(err_msg)?
+            }
+            WhereSpec::Raw(where_sql) => {
+                let sql = format!("DELETE FROM {}.{} WHERE {}", q_schema, q_table, where_sql);
+                client.execute(&sql, &[]).await.map_err(err_msg)?
+            }
+        };
         tracing::debug!(op="delete_many_by_filter", db=%db, coll=%coll, elapsed_ms=?t.elapsed().as_millis());
         Ok(n)
     }
@@ -736,6 +814,53 @@ fn build_where_from_filter(filter: &bson::Document) -> String {
         }
     }
     if where_clauses.is_empty() { String::from("TRUE") } else { where_clauses.join(" AND ") }
+}
+
+enum WhereSpec {
+    Raw(String),
+    Containment(serde_json::Value),
+}
+
+fn json_value_from_bson(v: &bson::Bson) -> Option<serde_json::Value> {
+    match v {
+        bson::Bson::Null => Some(serde_json::Value::Null),
+        bson::Bson::Boolean(b) => Some(serde_json::Value::Bool(*b)),
+        bson::Bson::Int32(n) => Some(serde_json::Value::Number((*n).into())),
+        bson::Bson::Int64(n) => Some(serde_json::Value::Number((*n).into())),
+        bson::Bson::Double(f) => serde_json::Number::from_f64(*f).map(serde_json::Value::Number),
+        bson::Bson::String(s) => Some(serde_json::Value::String(s.clone())),
+        _ => None,
+    }
+}
+
+fn build_where_spec(filter: &bson::Document) -> WhereSpec {
+    // Try simple equality-only pushdown using JSONB containment
+    use serde_json::{Map, Value};
+    let mut m = Map::new();
+    for (k, v) in filter.iter() {
+        if k == "_id" { continue; } // server has fast path; avoid ambiguity
+        if k.contains('.') { return WhereSpec::Raw(build_where_from_filter(filter)); }
+        match v {
+            bson::Bson::Document(d) => {
+                if d.len() == 1 {
+                    if let Some(eqv) = d.get("$eq") {
+                        if let Some(jv) = json_value_from_bson(eqv) { m.insert(k.clone(), jv); continue; }
+                        else { return WhereSpec::Raw(build_where_from_filter(filter)); }
+                    } else {
+                        return WhereSpec::Raw(build_where_from_filter(filter));
+                    }
+                } else {
+                    return WhereSpec::Raw(build_where_from_filter(filter));
+                }
+            }
+            other => {
+                if let Some(jv) = json_value_from_bson(other) { m.insert(k.clone(), jv); }
+                else { return WhereSpec::Raw(build_where_from_filter(filter)); }
+            }
+        }
+    }
+    if m.is_empty() { WhereSpec::Raw(build_where_from_filter(filter)) }
+    else { WhereSpec::Containment(Value::Object(m)) }
 }
 
 fn build_order_by(sort: Option<&bson::Document>) -> String {
@@ -998,6 +1123,9 @@ fn remove_path(doc: &mut bson::Document, path: &str) {
 
 impl PgStore {
     pub fn dsn(&self) -> &str { &self.dsn }
+    pub async fn get_client(&self) -> Result<deadpool_postgres::Object> {
+        self.pool.get().await.map_err(err_msg)
+    }
 
     /// Transactional: find first matching row with optional sort, locking it FOR UPDATE
     pub async fn find_one_for_update_sorted_tx(

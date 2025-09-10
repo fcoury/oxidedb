@@ -294,7 +294,7 @@ async fn handle_connection(state: Arc<AppState>, mut socket: TcpStream) -> Resul
                         let state2 = state.clone();
                         tokio::spawn(async move {
                             let start = Instant::now();
-                            let res = tokio::time::timeout(Duration::from_millis(cfg.timeout_ms), sh.forward_and_read_doc(&hdr, &header_bytes, &body_bytes)).await;
+    let res = tokio::time::timeout(Duration::from_millis(cfg.timeout_ms), sh.forward_and_read_doc(&hdr, &header_bytes, &body_bytes)).await;
                             match res {
                                 Err(_) => {
                                     state2.shadow_timeouts.fetch_add(1, Ordering::Relaxed);
@@ -835,15 +835,9 @@ async fn find_and_modify_reply(state: &AppState, db: Option<&str>, cmd: &Documen
     // Ensure collection exists if we may insert (upsert)
     if upsert { if let Err(e) = pg.ensure_collection(dbname, coll).await { return error_doc(59, format!("ensure_collection failed: {}", e)); } }
 
-    // Transactional path using a dedicated connection
-    let (mut tx_client, tx_conn) = match tokio_postgres::connect(pg.dsn(), NoTls).await {
-        Ok(v) => v,
-        Err(e) => return error_doc(59, format!("tx connect failed: {}", e)),
-    };
-    tokio::spawn(async move {
-        if let Err(e) = tx_conn.await { tracing::error!(error = %e, "postgres tx connection error"); }
-    });
-    let tx = match tx_client.transaction().await { Ok(t) => t, Err(e) => return error_doc(59, format!("tx begin failed: {}", e)) };
+    // Transactional path using pooled connection
+    let mut client = match pg.get_client().await { Ok(c) => c, Err(e) => return error_doc(59, format!("tx client failed: {}", e)) };
+    let tx = match client.transaction().await { Ok(t) => t, Err(e) => return error_doc(59, format!("tx begin failed: {}", e)) };
     let found = match pg.find_one_for_update_sorted_tx(&tx, dbname, coll, &filter, sort.as_ref()).await {
         Ok(v) => v,
         Err(e) => { let _ = tx.rollback().await; return error_doc(59, format!("find failed: {}", e)); }
@@ -940,14 +934,8 @@ async fn find_and_modify_reply(state: &AppState, db: Option<&str>, cmd: &Documen
         let bson_bytes = match bson::to_vec(&new_doc) { Ok(v) => v, Err(e) => return error_doc(2, e.to_string()) };
         let json = match serde_json::to_value(&new_doc) { Ok(v) => v, Err(e) => return error_doc(2, e.to_string()) };
         // Insert in its own transaction
-        let (mut tx2_client, tx2_conn) = match tokio_postgres::connect(pg.dsn(), NoTls).await {
-            Ok(v) => v,
-            Err(e) => return error_doc(59, format!("tx connect failed: {}", e)),
-        };
-        tokio::spawn(async move {
-            if let Err(e) = tx2_conn.await { tracing::error!(error = %e, "postgres tx connection error"); }
-        });
-        let tx2 = match tx2_client.transaction().await { Ok(t) => t, Err(e) => return error_doc(59, format!("tx begin failed: {}", e)) };
+        let mut client2 = match pg.get_client().await { Ok(c) => c, Err(e) => return error_doc(59, format!("tx client failed: {}", e)) };
+        let tx2 = match client2.transaction().await { Ok(t) => t, Err(e) => return error_doc(59, format!("tx begin failed: {}", e)) };
         match pg.insert_one_tx(&tx2, dbname, coll, &idb, &bson_bytes, &json).await {
             Ok(n) => {
                 if let Err(e) = tx2.commit().await { return error_doc(59, format!("tx commit failed: {}", e)); }
