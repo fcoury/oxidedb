@@ -477,7 +477,6 @@ impl PgStore {
         let q_schema = q_ident(&schema);
         let q_idx = q_ident(name);
         let ddl = format!("DROP INDEX IF EXISTS {}.{}", q_schema, q_idx);
-        let t = Instant::now();
         self.client.batch_execute(&ddl).await.map_err(err_msg)?;
         let n = self
             .client
@@ -511,6 +510,7 @@ impl PgStore {
             elems.push(format!("((doc->>'{}')) {}", field_escaped, ord));
         }
         let elems_joined = elems.join(", ");
+        let t = Instant::now();
         let ddl = format!("CREATE INDEX IF NOT EXISTS {} ON {}.{} USING btree ({})", q_idx, q_schema, q_table, elems_joined);
         self.client.batch_execute(&ddl).await.map_err(err_msg)?;
         self.client
@@ -1069,5 +1069,25 @@ impl PgStore {
         let sql = format!("DELETE FROM {}.{} WHERE id = $1", q_schema, q_table);
         let n = tx.execute(&sql, &[&id]).await.map_err(err_msg)?;
         Ok(n)
+    }
+}
+
+// --- Internal cache helpers ---
+impl PgStore {
+    async fn is_known_db(&self, db: &str) -> bool {
+        let g = self.databases_cache.read().await;
+        g.contains(db)
+    }
+    async fn mark_db_known(&self, db: &str) {
+        let mut g = self.databases_cache.write().await;
+        g.insert(db.to_string());
+    }
+    async fn is_known_collection(&self, db: &str, coll: &str) -> bool {
+        let g = self.collections_cache.read().await;
+        g.contains(&(db.to_string(), coll.to_string()))
+    }
+    async fn mark_collection_known(&self, db: &str, coll: &str) {
+        let mut g = self.collections_cache.write().await;
+        g.insert((db.to_string(), coll.to_string()));
     }
 }
