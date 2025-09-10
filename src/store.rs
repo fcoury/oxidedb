@@ -1,8 +1,9 @@
 use crate::error::{Error, Result};
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::{Client, NoTls, Transaction};
 
 pub struct PgStore {
     client: Client,
+    dsn: String,
 }
 
 impl PgStore {
@@ -14,7 +15,7 @@ impl PgStore {
                 tracing::error!(error = %e, "postgres connection error");
             }
         });
-        Ok(Self { client })
+        Ok(Self { client, dsn: url.to_string() })
     }
 
     pub async fn bootstrap(&self) -> Result<()> {
@@ -155,7 +156,14 @@ impl PgStore {
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
         let sql = format!("SELECT doc_bson, doc FROM {}.{} ORDER BY id ASC LIMIT $1", q_schema, q_table);
-        let rows = self.client.query(&sql, &[&limit]).await.map_err(err_msg)?;
+        let rows = match self.client.query(&sql, &[&limit]).await {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("does not exist") { return Ok(Vec::new()); }
+                return Err(err_msg(e));
+            }
+        };
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
             let bson_bytes: Option<Vec<u8>> = r.try_get(0).ok();
@@ -177,7 +185,14 @@ impl PgStore {
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
         let sql = format!("SELECT doc_bson, doc FROM {}.{} WHERE id = $1 LIMIT $2", q_schema, q_table);
-        let rows = self.client.query(&sql, &[&id, &limit]).await.map_err(err_msg)?;
+        let rows = match self.client.query(&sql, &[&id, &limit]).await {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("does not exist") { return Ok(Vec::new()); }
+                return Err(err_msg(e));
+            }
+        };
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
             let bson_bytes: Option<Vec<u8>> = r.try_get(0).ok();
@@ -326,7 +341,15 @@ impl PgStore {
                 "SELECT {} AS doc FROM {}.{} WHERE {} {} LIMIT {}",
                 proj_sql, q_schema, q_table, where_sql, order_sql, limit
             );
-            let rows = self.client.query(&sql, &[]).await.map_err(err_msg)?;
+            let rows = match self.client.query(&sql, &[]).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = e.to_string();
+                    // If the schema or table doesn't exist, emulate Mongo and return empty
+                    if msg.contains("does not exist") { return Ok(Vec::new()); }
+                    return Err(err_msg(e));
+                }
+            };
             let mut out = Vec::with_capacity(rows.len());
             for r in rows {
                 let json: serde_json::Value = r.get(0);
@@ -338,7 +361,14 @@ impl PgStore {
                 "SELECT doc_bson, doc FROM {}.{} WHERE {} {} LIMIT {}",
                 q_schema, q_table, where_sql, order_sql, limit
             );
-            let rows = self.client.query(&sql, &[]).await.map_err(err_msg)?;
+            let rows = match self.client.query(&sql, &[]).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("does not exist") { return Ok(Vec::new()); }
+                    return Err(err_msg(e));
+                }
+            };
             let mut out = Vec::with_capacity(rows.len());
             for r in rows {
                 let bson_bytes: Option<Vec<u8>> = r.try_get(0).ok();
@@ -382,6 +412,8 @@ impl PgStore {
     }
 
     pub async fn create_index_single_field(&self, db: &str, coll: &str, name: &str, field: &str, _order: i32, spec: &serde_json::Value) -> Result<()> {
+        // Ensure collection (schema/table) exists
+        self.ensure_collection(db, coll).await?;
         // Create an expression index on the extracted text value
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
@@ -428,6 +460,8 @@ impl PgStore {
     }
 
     pub async fn create_index_compound(&self, db: &str, coll: &str, name: &str, fields: &[(String, i32)], spec: &serde_json::Value) -> Result<()> {
+        // Ensure collection (schema/table) exists
+        self.ensure_collection(db, coll).await?;
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
@@ -458,9 +492,17 @@ impl PgStore {
         let q_table = q_ident(coll);
         let where_sql = filter.map(build_where_from_filter).unwrap_or_else(|| "TRUE".to_string());
         let sql = format!("SELECT COUNT(*) FROM {}.{} WHERE {}", q_schema, q_table, where_sql);
-        let row = self.client.query_one(&sql, &[]).await.map_err(err_msg)?;
-        let n: i64 = row.get(0);
-        Ok(n)
+        let res = self.client.query_one(&sql, &[]).await;
+        match res {
+            Ok(row) => {
+                let n: i64 = row.get(0);
+                Ok(n)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("does not exist") { Ok(0) } else { Err(err_msg(e)) }
+            }
+        }
     }
 
     // --- Update/Delete helpers (basic) ---
@@ -904,4 +946,80 @@ fn remove_path(doc: &mut bson::Document, path: &str) {
         }
     }
     cur.remove(last);
+}
+
+impl PgStore {
+    pub fn dsn(&self) -> &str { &self.dsn }
+
+    /// Transactional: find first matching row with optional sort, locking it FOR UPDATE
+    pub async fn find_one_for_update_sorted_tx(
+        &self,
+        tx: &Transaction<'_>,
+        db: &str,
+        coll: &str,
+        filter: &bson::Document,
+        sort: Option<&bson::Document>,
+    ) -> Result<Option<(Vec<u8>, bson::Document)>> {
+        let schema = schema_name(db);
+        let q_schema = q_ident(&schema);
+        let q_table = q_ident(coll);
+        let where_sql = build_where_from_filter(filter);
+        let order_sql = build_order_by(sort);
+        let sql = format!(
+            "SELECT id, doc_bson, doc FROM {}.{} WHERE {} {} LIMIT 1 FOR UPDATE",
+            q_schema, q_table, where_sql, order_sql
+        );
+        match tx.query(&sql, &[]).await {
+            Ok(rows) => {
+                if rows.is_empty() { return Ok(None); }
+                let r = &rows[0];
+                let id: Vec<u8> = r.get(0);
+                if let Ok(bytes) = r.try_get::<usize, Vec<u8>>(1) {
+                    if let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes)) {
+                        return Ok(Some((id, doc)));
+                    }
+                }
+                let json: serde_json::Value = r.get(2);
+                let b = bson::to_bson(&json).unwrap_or(bson::Bson::Document(bson::Document::new()));
+                let doc = match b { bson::Bson::Document(d) => d, _ => bson::Document::new() };
+                Ok(Some((id, doc)))
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("does not exist") { Ok(None) } else { Err(err_msg(e)) }
+            }
+        }
+    }
+
+    pub async fn update_doc_by_id_tx(&self, tx: &Transaction<'_>, db: &str, coll: &str, id: &[u8], new_doc: &bson::Document) -> Result<u64> {
+        let schema = schema_name(db);
+        let q_schema = q_ident(&schema);
+        let q_table = q_ident(coll);
+        let sql = format!("UPDATE {}.{} SET doc_bson = $1, doc = $2 WHERE id = $3", q_schema, q_table);
+        let bson_bytes = bson::to_vec(new_doc).map_err(err_msg)?;
+        let json = serde_json::to_value(new_doc).map_err(err_msg)?;
+        let n = tx.execute(&sql, &[&bson_bytes, &json, &id]).await.map_err(err_msg)?;
+        Ok(n)
+    }
+
+    pub async fn insert_one_tx(&self, tx: &Transaction<'_>, db: &str, coll: &str, id: &[u8], bson_bytes: &[u8], json: &serde_json::Value) -> Result<u64> {
+        let schema = schema_name(db);
+        let q_schema = q_ident(&schema);
+        let q_table = q_ident(coll);
+        let sql = format!(
+            "INSERT INTO {}.{} (id, doc_bson, doc) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING",
+            q_schema, q_table
+        );
+        let n = tx.execute(&sql, &[&id, &bson_bytes, &json]).await.map_err(err_msg)?;
+        Ok(n)
+    }
+
+    pub async fn delete_by_id_tx(&self, tx: &Transaction<'_>, db: &str, coll: &str, id: &[u8]) -> Result<u64> {
+        let schema = schema_name(db);
+        let q_schema = q_ident(&schema);
+        let q_table = q_ident(coll);
+        let sql = format!("DELETE FROM {}.{} WHERE id = $1", q_schema, q_table);
+        let n = tx.execute(&sql, &[&id]).await.map_err(err_msg)?;
+        Ok(n)
+    }
 }

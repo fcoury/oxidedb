@@ -1,8 +1,9 @@
 use crate::config::{Config, ShadowConfig};
 use crate::error::Result;
-use crate::protocol::{decode_op_msg_section0, decode_op_query, encode_op_msg, encode_op_reply, MessageHeader, OP_MSG, OP_QUERY};
+use crate::protocol::{decode_op_query, encode_op_msg, encode_op_reply, MessageHeader, OP_MSG, OP_QUERY};
 use crate::shadow::{compare_docs, ShadowSession};
 use crate::store::PgStore;
+use tokio_postgres::NoTls;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use bson::{doc, Document};
@@ -249,9 +250,25 @@ async fn handle_connection(state: Arc<AppState>, mut socket: TcpStream) -> Resul
 
         match hdr.op_code {
             OP_MSG => {
-                let (reply_doc, cmd_opt) = match decode_op_msg_section0(&body) {
-                    Some((_flags, cmd)) => {
+                let (reply_doc, cmd_opt) = match crate::protocol::decode_op_msg(&body) {
+                    Some((_flags, mut cmd, seqs)) => {
+                        // Merge any section-1 sequences into the command doc. If the command
+                        // already has an array placeholder (e.g., documents: []), append to it.
+                        for (name, docs) in seqs.into_iter() {
+                            let seq_arr: Vec<bson::Bson> = docs.into_iter().map(|d| bson::Bson::Document(d)).collect();
+                            match cmd.get_mut(&name) {
+                                Some(existing) => {
+                                    if let bson::Bson::Array(a) = existing { a.extend(seq_arr); }
+                                    else { cmd.insert(name.clone(), bson::Bson::Array(seq_arr)); }
+                                }
+                                None => {
+                                    cmd.insert(name.clone(), bson::Bson::Array(seq_arr));
+                                }
+                            }
+                        }
                         let db = cmd.get_str("$db").ok().map(|s| s.to_string());
+                        let cmd_name = cmd.iter().next().map(|(k, _)| k.clone()).unwrap_or_else(|| "".to_string());
+                        tracing::debug!(command=%cmd_name, db=%db.as_deref().unwrap_or(""), cmd=?cmd, "received OP_MSG");
                         (handle_command(&state, db.as_deref(), cmd.clone()).await, Some(cmd))
                     }
                     None => {
@@ -311,6 +328,7 @@ async fn handle_connection(state: Arc<AppState>, mut socket: TcpStream) -> Resul
                     Some((_flags, fqn, _skip, _nret, cmd)) => {
                         let db = parse_db_from_fqn(&fqn);
                         let cmd_name = cmd.iter().next().map(|(k, _)| k.clone()).unwrap_or_else(|| "".to_string());
+                        tracing::debug!(command=%cmd_name, db=%db.as_deref().unwrap_or(""), cmd=?cmd, "received OP_QUERY");
                         let reply_doc = handle_command(&state, db.as_deref(), cmd).await;
                         let request_id = REQ_ID.fetch_add(1, Ordering::Relaxed);
                         let resp = encode_op_reply(&[reply_doc.clone()], hdr.request_id, request_id);
@@ -388,6 +406,7 @@ async fn handle_command(state: &AppState, db: Option<&str>, mut cmd: Document) -
         "insert" => insert_reply(state, db, &mut cmd).await,
         "update" => update_reply(state, db, &cmd).await,
         "delete" => delete_reply(state, db, &cmd).await,
+        "findAndModify" | "findandmodify" => find_and_modify_reply(state, db, &cmd).await,
         "aggregate" => aggregate_reply(state, db, &cmd).await,
         "find" => find_reply(state, db, &cmd).await,
         "getMore" => get_more_reply(state, &cmd).await,
@@ -550,7 +569,13 @@ async fn drop_database_reply(state: &AppState, db: Option<&str>) -> Document {
 async fn insert_reply(state: &AppState, db: Option<&str>, cmd: &mut Document) -> Document {
     let dbname = match db { Some(d) => d, None => return error_doc(59, "Missing $db") };
     let coll: String = match cmd.get_str("insert") { Ok(c) => c.to_string(), Err(_) => return error_doc(9, "Invalid insert") };
-    let docs_bson: Vec<bson::Bson> = match cmd.get_array("documents") { Ok(a) => a.clone(), Err(_) => return error_doc(9, "Missing documents") };
+    let docs_bson: Vec<bson::Bson> = match cmd.get_array("documents") {
+        Ok(a) => a.clone(),
+        Err(_) => {
+            tracing::warn!(collection=%coll, cmd=?cmd, "insert missing 'documents' array");
+            return error_doc(9, "Missing documents");
+        }
+    };
     if let Some(ref pg) = state.store {
         let mut inserted = 0u32;
         let mut write_errors: Vec<Document> = Vec::new();
@@ -588,7 +613,10 @@ async fn insert_reply(state: &AppState, db: Option<&str>, cmd: &mut Document) ->
 async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Document {
     let dbname = match db { Some(d) => d, None => return error_doc(59, "Missing $db") };
     let coll = match cmd.get_str("update") { Ok(c) => c, Err(_) => return error_doc(9, "Invalid update") };
-    let updates = match cmd.get_array("updates") { Ok(a) => a, Err(_) => return error_doc(9, "Missing updates") };
+    let updates = match cmd.get_array("updates") {
+        Ok(a) => a,
+        Err(_) => { tracing::warn!(collection=%coll, cmd=?cmd, "update missing 'updates' array"); return error_doc(9, "Missing updates") }
+    };
     if updates.is_empty() { return error_doc(9, "Empty updates"); }
     if state.store.is_none() { return error_doc(13, "No storage configured"); }
     let pg = state.store.as_ref().unwrap();
@@ -713,6 +741,152 @@ async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
     doc!{"n": matched_total, "nModified": modified_total, "ok": 1.0}
 }
 
+async fn find_and_modify_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Document {
+    let dbname = match db { Some(d) => d, None => return error_doc(59, "Missing $db") };
+    let coll = match cmd.get_str("findAndModify") { Ok(c) => c, Err(_) => return error_doc(9, "Invalid findAndModify") };
+    if state.store.is_none() { return error_doc(13, "No storage configured"); }
+    let pg = state.store.as_ref().unwrap();
+
+    let filter = cmd.get_document("query").ok().cloned().unwrap_or_else(bson::Document::new);
+    let sort = cmd.get_document("sort").ok().cloned();
+    let new_return = cmd.get_bool("new").unwrap_or(false);
+    let remove = cmd.get_bool("remove").unwrap_or(false);
+    let update_doc = cmd.get_document("update").ok().cloned();
+    let upsert = cmd.get_bool("upsert").unwrap_or(false);
+    let proj = cmd.get_document("fields").ok().cloned().or_else(|| cmd.get_document("projection").ok().cloned());
+
+    if remove && update_doc.is_some() { return error_doc(9, "Cannot specify both remove and update"); }
+    if !remove && update_doc.is_none() { return error_doc(9, "Missing update or remove"); }
+
+    // Ensure collection exists if we may insert (upsert)
+    if upsert { if let Err(e) = pg.ensure_collection(dbname, coll).await { return error_doc(59, format!("ensure_collection failed: {}", e)); } }
+
+    // Transactional path using a dedicated connection
+    let (mut tx_client, tx_conn) = match tokio_postgres::connect(pg.dsn(), NoTls).await {
+        Ok(v) => v,
+        Err(e) => return error_doc(59, format!("tx connect failed: {}", e)),
+    };
+    tokio::spawn(async move {
+        if let Err(e) = tx_conn.await { tracing::error!(error = %e, "postgres tx connection error"); }
+    });
+    let mut tx = match tx_client.transaction().await { Ok(t) => t, Err(e) => return error_doc(59, format!("tx begin failed: {}", e)) };
+    let found = match pg.find_one_for_update_sorted_tx(&tx, dbname, coll, &filter, sort.as_ref()).await {
+        Ok(v) => v,
+        Err(e) => { let _ = tx.rollback().await; return error_doc(59, format!("find failed: {}", e)); }
+    };
+    if let Some((idb, mut current)) = found {
+        // Found document; apply remove or update
+        let before = current.clone();
+        if remove {
+            match pg.delete_by_id_tx(&tx, dbname, coll, &idb).await {
+                Ok(n) => {
+                    if let Err(e) = tx.commit().await { return error_doc(59, format!("tx commit failed: {}", e)); }
+                    let mut value = before;
+                    if let Some(ref p) = proj { value = apply_project_with_expr(&value, p); }
+                    return doc!{ "lastErrorObject": { "n": (n as i32), "updatedExisting": false }, "value": value, "ok": 1.0 };
+                }
+                Err(e) => { let _ = tx.rollback().await; return error_doc(59, format!("delete failed: {}", e)); }
+            }
+        } else {
+            // Apply update operators to current
+            let udoc = update_doc.unwrap();
+            let set_doc = udoc.get_document("$set").ok().cloned();
+            let unset_doc = udoc.get_document("$unset").ok().cloned();
+            let inc_doc = udoc.get_document("$inc").ok().cloned();
+            let rename_doc = udoc.get_document("$rename").ok().cloned();
+            let push_doc = udoc.get_document("$push").ok().cloned();
+            let pull_doc = udoc.get_document("$pull").ok().cloned();
+            if set_doc.is_none() && unset_doc.is_none() && inc_doc.is_none() && rename_doc.is_none() && push_doc.is_none() && pull_doc.is_none() {
+                let _ = tx.rollback().await; return error_doc(9, "Only $set/$unset/$inc/$rename/$push/$pull supported");
+            }
+            if let Some(ref sets) = set_doc { for (k, v) in sets.iter() { set_path_nested(&mut current, k, v.clone()); } }
+            if let Some(ref unsets) = unset_doc { for (k, _v) in unsets.iter() { unset_path_nested(&mut current, k); } }
+            if let Some(ref incs) = inc_doc { for (k, v) in incs.iter() { if !apply_inc(&mut current, k, v.clone()) { let _ = tx.rollback().await; return error_doc(2, "$inc requires numeric field"); } } }
+            if let Some(ref ren) = rename_doc {
+                let mut pairs: Vec<(String, String)> = Vec::new();
+                for (from, to_b) in ren.iter() {
+                    let to = match to_b { bson::Bson::String(s) => s.clone(), _ => { let _ = tx.rollback().await; return error_doc(2, "$rename target must be string path"); } };
+                    pairs.push((from.to_string(), to));
+                }
+                if let Some(err) = validate_rename_pairs(&pairs) { let _ = tx.rollback().await; return err; }
+                for (from, to) in pairs { apply_rename(&mut current, &from, &to); }
+            }
+            if let Some(ref pushes) = push_doc { for (k, v) in pushes.iter() { if !apply_push(&mut current, k, v.clone()) { let _ = tx.rollback().await; return error_doc(2, "$push on non-array"); } } }
+            if let Some(ref pulls) = pull_doc { for (k, v) in pulls.iter() { apply_pull(&mut current, k, v.clone()); } }
+
+            match pg.update_doc_by_id_tx(&tx, dbname, coll, &idb, &current).await {
+                Ok(_n) => {
+                    if let Err(e) = tx.commit().await { return error_doc(59, format!("tx commit failed: {}", e)); }
+                    let value = if new_return { current } else { before };
+                    let value = if let Some(ref p) = proj { apply_project_with_expr(&value, p) } else { value };
+                    return doc!{ "lastErrorObject": { "n": 1i32, "updatedExisting": true }, "value": value, "ok": 1.0 };
+                }
+                Err(e) => { let _ = tx.rollback().await; return error_doc(59, format!("update failed: {}", e)); }
+            }
+        }
+    } else {
+        // Not found
+        if !upsert {
+            let mut value = bson::Bson::Null;
+            if new_return { /* still null */ }
+            return doc!{ "lastErrorObject": { "n": 0i32, "updatedExisting": false }, "value": value, "ok": 1.0 };
+        }
+        // Upsert: build new doc from filter equality and apply operators
+        let mut new_doc = bson::Document::new();
+        // Extract simple equality constraints from filter into new_doc
+        for (k, v) in filter.iter() {
+            match v {
+                bson::Bson::Document(d) => {
+                    if let Some(eqv) = d.get("$eq") { new_doc.insert(k.clone(), eqv.clone()); }
+                }
+                other => { new_doc.insert(k.clone(), other.clone()); }
+            }
+        }
+        if let Some(ref udoc) = update_doc {
+            let set_doc = udoc.get_document("$set").ok().cloned();
+            let unset_doc = udoc.get_document("$unset").ok().cloned();
+            let inc_doc = udoc.get_document("$inc").ok().cloned();
+            let rename_doc = udoc.get_document("$rename").ok().cloned();
+            let push_doc = udoc.get_document("$push").ok().cloned();
+            let pull_doc = udoc.get_document("$pull").ok().cloned();
+            if let Some(ref sets) = set_doc { for (k, v) in sets.iter() { set_path_nested(&mut new_doc, k, v.clone()); } }
+            if let Some(ref unsets) = unset_doc { for (k, _v) in unsets.iter() { unset_path_nested(&mut new_doc, k); } }
+            if let Some(ref incs) = inc_doc { for (k, v) in incs.iter() { if !apply_inc(&mut new_doc, k, v.clone()) { return error_doc(2, "$inc requires numeric field"); } } }
+            if let Some(ref ren) = rename_doc {
+                let mut pairs: Vec<(String, String)> = Vec::new();
+                for (from, to_b) in ren.iter() { if let bson::Bson::String(s) = to_b { pairs.push((from.to_string(), s.clone())); } }
+                if let Some(err) = validate_rename_pairs(&pairs) { return err; }
+                for (from, to) in pairs { apply_rename(&mut new_doc, &from, &to); }
+            }
+            if let Some(ref pushes) = push_doc { for (k, v) in pushes.iter() { if !apply_push(&mut new_doc, k, v.clone()) { return error_doc(2, "$push on non-array"); } } }
+            if let Some(ref pulls) = pull_doc { for (k, v) in pulls.iter() { apply_pull(&mut new_doc, k, v.clone()); } }
+        }
+        ensure_id(&mut new_doc);
+        let idb = match new_doc.get("_id").and_then(|b| id_bytes_bson(b)) { Some(v) => v, None => return error_doc(2, "unsupported _id type") };
+        let bson_bytes = match bson::to_vec(&new_doc) { Ok(v) => v, Err(e) => return error_doc(2, e.to_string()) };
+        let json = match serde_json::to_value(&new_doc) { Ok(v) => v, Err(e) => return error_doc(2, e.to_string()) };
+        // Insert in its own transaction
+        let (mut tx2_client, tx2_conn) = match tokio_postgres::connect(pg.dsn(), NoTls).await {
+            Ok(v) => v,
+            Err(e) => return error_doc(59, format!("tx connect failed: {}", e)),
+        };
+        tokio::spawn(async move {
+            if let Err(e) = tx2_conn.await { tracing::error!(error = %e, "postgres tx connection error"); }
+        });
+        let mut tx2 = match tx2_client.transaction().await { Ok(t) => t, Err(e) => return error_doc(59, format!("tx begin failed: {}", e)) };
+        match pg.insert_one_tx(&tx2, dbname, coll, &idb, &bson_bytes, &json).await {
+            Ok(n) => {
+                if let Err(e) = tx2.commit().await { return error_doc(59, format!("tx commit failed: {}", e)); }
+                let value = if new_return { let mut v = new_doc.clone(); if let Some(ref p) = proj { v = apply_project_with_expr(&v, p); } bson::Bson::Document(v) } else { bson::Bson::Null };
+                let mut leo = doc!{ "n": (n as i32), "updatedExisting": false };
+                if n == 1 { if let Some(idv) = new_doc.get("_id").cloned() { leo.insert("upserted", idv); } }
+                return doc!{ "lastErrorObject": leo, "value": value, "ok": 1.0 };
+            }
+            Err(e) => { let _ = tx2.rollback().await; return error_doc(59, format!("insert failed: {}", e)); }
+        }
+    }
+}
+
 fn set_path_nested(doc: &mut Document, path: &str, value: bson::Bson) {
     // Implement via a generic BSON walker that supports arrays and documents
     let mut root = bson::Bson::Document(doc.clone());
@@ -766,6 +940,33 @@ fn unset_path_nested(doc: &mut Document, path: &str) {
     let segments: Vec<&str> = path.split('.').collect();
     unset_path_bson(&mut root, &segments);
     if let bson::Bson::Document(updated) = root { *doc = updated; }
+}
+
+fn unset_path_bson(cur: &mut bson::Bson, segs: &[&str]) {
+    if segs.is_empty() { return; }
+    let seg = segs[0];
+    match seg.parse::<usize>().ok() {
+        Some(idx) => {
+            if let bson::Bson::Array(arr) = cur {
+                if idx < arr.len() {
+                    if segs.len() == 1 {
+                        arr[idx] = bson::Bson::Null;
+                    } else {
+                        unset_path_bson(&mut arr[idx], &segs[1..]);
+                    }
+                }
+            }
+        }
+        None => {
+            if let bson::Bson::Document(d) = cur {
+                if segs.len() == 1 {
+                    d.remove(seg);
+                } else if let Some(child) = d.get_mut(seg) {
+                    unset_path_bson(child, &segs[1..]);
+                }
+            }
+        }
+    }
 }
 
 fn path_has_negative_index(path: &str) -> bool {
@@ -1401,32 +1602,12 @@ fn apply_project_with_expr(input: &Document, proj: &Document) -> Document {
     out
 }
 
-fn unset_path_bson(cur: &mut bson::Bson, segs: &[&str]) {
-    if segs.is_empty() { return; }
-    let seg = segs[0];
-    let is_last = segs.len() == 1;
-    match seg_is_index(seg) {
-        Some(idx) => {
-            if let bson::Bson::Array(arr) = cur {
-                if idx < arr.len() {
-                    if is_last { arr[idx] = bson::Bson::Null; }
-                    else { unset_path_bson(&mut arr[idx], &segs[1..]); }
-                }
-            }
-        }
-        None => {
-            if let bson::Bson::Document(d) = cur {
-                if is_last { d.remove(seg); }
-                else if let Some(child) = d.get_mut(seg) { unset_path_bson(child, &segs[1..]); }
-            }
-        }
-    }
-}
+// (removed duplicate unset_path_bson; single definition lives above)
 
 async fn delete_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Document {
     let dbname = match db { Some(d) => d, None => return error_doc(59, "Missing $db") };
     let coll = match cmd.get_str("delete") { Ok(c) => c, Err(_) => return error_doc(9, "Invalid delete") };
-    let deletes = match cmd.get_array("deletes") { Ok(a) => a, Err(_) => return error_doc(9, "Missing deletes") };
+    let deletes = match cmd.get_array("deletes") { Ok(a) => a, Err(_) => { tracing::warn!(collection=%coll, cmd=?cmd, "delete missing 'deletes' array"); return error_doc(9, "Missing deletes") } };
     if deletes.is_empty() { return error_doc(9, "Empty deletes"); }
     let first = match &deletes[0] { bson::Bson::Document(d) => d, _ => return error_doc(9, "Invalid delete spec") };
     let filter = match first.get_document("q") { Ok(d) => d.clone(), Err(_) => return error_doc(9, "Missing q") };
@@ -1451,7 +1632,7 @@ async fn delete_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
 async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Document {
     let dbname = match db { Some(d) => d, None => return error_doc(59, "Missing $db") };
     let coll = match cmd.get_str("aggregate") { Ok(c) => c, Err(_) => return error_doc(9, "Invalid aggregate") };
-    let pipeline = match cmd.get_array("pipeline") { Ok(a) => a, Err(_) => return error_doc(9, "Missing pipeline") };
+    let pipeline = match cmd.get_array("pipeline") { Ok(a) => a, Err(_) => { tracing::warn!(collection=%coll, cmd=?cmd, "aggregate missing 'pipeline' array"); return error_doc(9, "Missing pipeline") } };
     let cursor_spec = cmd.get_document("cursor").unwrap_or(&doc!{}).clone();
     let batch_size = cursor_spec.get_i32("batchSize").unwrap_or(101) as i64;
     // Minimal pipeline support: $match, $sort, $project, $limit, $skip, $addFields/$set, $unwind, $group, $lookup
@@ -1630,7 +1811,7 @@ async fn find_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Docum
     let limit = cmd.get_i64("limit").ok().or(cmd.get_i32("limit").ok().map(|v| v as i64)).unwrap_or(0);
     let batch_size = cmd.get_i64("batchSize").ok().or(cmd.get_i32("batchSize").ok().map(|v| v as i64)).unwrap_or(0);
     let first_batch_limit = if limit > 0 { limit } else if batch_size > 0 { batch_size } else { 101 };
-    let filter = cmd.get_document("filter").ok();
+    let filter = cmd.get_document("filter").ok().or(cmd.get_document("query").ok());
 
     if let Some(ref pg) = state.store {
         let sort = cmd.get_document("sort").ok();
@@ -1800,6 +1981,10 @@ async fn create_indexes_reply(state: &AppState, db: Option<&str>, cmd: &Document
     let indexes = match cmd.get_array("indexes") { Ok(a) => a, Err(_) => return error_doc(9, "Missing indexes") };
     if state.store.is_none() { return error_doc(13, "No storage configured"); }
     let pg = state.store.as_ref().unwrap();
+    // Ensure collection exists so index DDL succeeds
+    if let Err(e) = pg.ensure_collection(dbname, coll).await {
+        tracing::warn!("ensure_collection before createIndexes failed: {}", e);
+    }
     let mut created = 0i32;
     for spec_b in indexes {
         let spec_doc = match spec_b { bson::Bson::Document(d) => d, _ => continue };

@@ -3,6 +3,7 @@
 //! - OP_MSG encode/decode (section 0 only)
 
 use bson::Document;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MessageHeader {
@@ -65,6 +66,65 @@ pub fn decode_op_msg_section0(body: &[u8]) -> Option<(u32, Document)> {
         Ok(doc) => Some((flags, doc)),
         Err(_) => None,
     }
+}
+
+/// Decode OP_MSG with support for section 0 (command) and section 1 document sequences.
+/// Returns: (flags, command_doc, sequences) where sequences maps the identifier (e.g., "documents")
+/// to the list of BSON documents contained in that sequence.
+pub fn decode_op_msg(body: &[u8]) -> Option<(u32, Document, HashMap<String, Vec<Document>>)> {
+    if body.len() < 5 { return None; }
+    let flags = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+    let mut i = 4usize;
+
+    // section 0 must be first and exactly one
+    if i >= body.len() || body[i] != 0u8 { return None; }
+    i += 1; // skip kind
+    if i + 4 > body.len() { return None; }
+    let dlen = i32::from_le_bytes([body[i], body[i+1], body[i+2], body[i+3]]) as usize;
+    if i + dlen > body.len() || dlen < 5 { return None; }
+    let mut cur = std::io::Cursor::new(&body[i..i+dlen]);
+    let cmd = bson::Document::from_reader(&mut cur).ok()?;
+    i += dlen;
+
+    let mut seqs: HashMap<String, Vec<Document>> = HashMap::new();
+    while i < body.len() {
+        let kind = body[i];
+        i += 1;
+        match kind {
+            1u8 => {
+                if i + 4 > body.len() { return None; }
+                let size = i32::from_le_bytes([body[i], body[i+1], body[i+2], body[i+3]]) as usize;
+                let section_start = i - 4; // points to size field start
+                let section_end = section_start.saturating_add(size);
+                i += 4;
+                if section_end > body.len() { return None; }
+                // parse cstring identifier
+                let mut j = i;
+                while j < section_end && body[j] != 0 { j += 1; }
+                if j >= section_end { return None; }
+                let ident = std::str::from_utf8(&body[i..j]).ok()?.to_string();
+                i = j + 1; // skip null
+                let mut docs: Vec<Document> = Vec::new();
+                while i < section_end {
+                    if i + 4 > section_end { break; }
+                    let dlen = i32::from_le_bytes([body[i], body[i+1], body[i+2], body[i+3]]) as usize;
+                    if dlen < 5 || i + dlen > section_end { break; }
+                    let mut cur = std::io::Cursor::new(&body[i..i+dlen]);
+                    if let Ok(d) = bson::Document::from_reader(&mut cur) { docs.push(d); }
+                    i += dlen;
+                }
+                seqs.insert(ident, docs);
+                // ensure we are exactly at section_end
+                i = section_end;
+            }
+            // Unknown section kinds are not supported
+            _ => {
+                // Stop parsing on unknown kinds to avoid desync
+                break;
+            }
+        }
+    }
+    Some((flags, cmd, seqs))
 }
 
 /// Encode an OP_MSG with section 0 containing a single BSON document.
