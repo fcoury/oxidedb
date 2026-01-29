@@ -10,7 +10,13 @@ pub enum AggregateStage {
     Skip(i64),
     Unwind(String, bool, Option<String>), // path, preserve, include_index
     Group(Document),
-    // Lookup, etc. will be added later
+    ReplaceRoot(Document),
+    Facet(Document),
+    Sample(i64),
+    UnionWith(Document),
+    Out(String), // collection name for $out
+    Merge(Document), // merge specification for $merge
+                 // Lookup, etc. will be added later
 }
 
 impl AggregateStage {
@@ -81,6 +87,87 @@ impl AggregateStage {
                     .as_document()
                     .ok_or_else(|| Error::Msg("$group must be a document".into()))?;
                 Ok(AggregateStage::Group(d.clone()))
+            }
+            "$replaceRoot" | "$replaceWith" => {
+                let d = val
+                    .as_document()
+                    .ok_or_else(|| Error::Msg(format!("{} must be a document", key)))?;
+                if !d.contains_key("newRoot") {
+                    return Err(Error::Msg(format!("{} must have a 'newRoot' field", key)));
+                }
+                Ok(AggregateStage::ReplaceRoot(d.clone()))
+            }
+            "$facet" => {
+                let d = val
+                    .as_document()
+                    .ok_or_else(|| Error::Msg("$facet must be a document".into()))?;
+                Ok(AggregateStage::Facet(d.clone()))
+            }
+            "$sample" => {
+                let n = val
+                    .as_i64()
+                    .or_else(|| val.as_i32().map(|i| i as i64))
+                    .ok_or_else(|| Error::Msg("$sample must be a number".into()))?;
+                if n <= 0 {
+                    return Err(Error::Msg("$sample must be a positive integer".into()));
+                }
+                Ok(AggregateStage::Sample(n))
+            }
+            "$unionWith" => {
+                let d = val
+                    .as_document()
+                    .ok_or_else(|| Error::Msg("$unionWith must be a document".into()))?;
+                if !d.contains_key("coll") {
+                    return Err(Error::Msg("$unionWith must have a 'coll' field".into()));
+                }
+                Ok(AggregateStage::UnionWith(d.clone()))
+            }
+            "$out" => {
+                // $out can be a string (collection name) or a document with "coll" field
+                if let Some(s) = val.as_str() {
+                    Ok(AggregateStage::Out(s.to_string()))
+                } else if let Some(d) = val.as_document() {
+                    let coll = d
+                        .get_str("coll")
+                        .map_err(|_| Error::Msg("$out document must have a 'coll' field".into()))?;
+                    Ok(AggregateStage::Out(coll.to_string()))
+                } else {
+                    Err(Error::Msg("$out must be a string or document".into()))
+                }
+            }
+            "$merge" => {
+                // $merge must be a document with required "into" field
+                let d = val
+                    .as_document()
+                    .ok_or_else(|| Error::Msg("$merge must be a document".into()))?;
+                if !d.contains_key("into") {
+                    return Err(Error::Msg("$merge must have an 'into' field".into()));
+                }
+                // Validate optional fields if present
+                if let Ok(on) = d.get_str("on")
+                    && on.is_empty()
+                {
+                    return Err(Error::Msg("$merge 'on' field cannot be empty".into()));
+                }
+                if let Ok(when_matched) = d.get_str("whenMatched") {
+                    let valid = ["merge", "replace", "keepExisting", "fail"];
+                    if !valid.contains(&when_matched) {
+                        return Err(Error::Msg(format!(
+                            "$merge 'whenMatched' must be one of: {:?}",
+                            valid
+                        )));
+                    }
+                }
+                if let Ok(when_not_matched) = d.get_str("whenNotMatched") {
+                    let valid = ["insert", "discard"];
+                    if !valid.contains(&when_not_matched) {
+                        return Err(Error::Msg(format!(
+                            "$merge 'whenNotMatched' must be one of: {:?}",
+                            valid
+                        )));
+                    }
+                }
+                Ok(AggregateStage::Merge(d.clone()))
             }
             _ => Err(Error::Msg(format!("Unknown or unsupported stage: {}", key))),
         }

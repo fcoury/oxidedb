@@ -262,6 +262,82 @@ impl SqlBuilder {
                     self.state = SelectState::default();
                     self.state.select = "id, doc".to_string();
                 }
+                AggregateStage::ReplaceRoot(doc) => {
+                    if self.state.group_by.is_some()
+                        || self.state.limit.is_some()
+                        || self.state.offset.is_some()
+                    {
+                        self.flush_cte();
+                    }
+
+                    let new_root = doc
+                        .get("newRoot")
+                        .ok_or(Error::Msg("$replaceRoot missing newRoot field".into()))?;
+
+                    let new_root_sql = match new_root {
+                        bson::Bson::String(s) if s.starts_with('$') => {
+                            let path = &s[1..];
+                            let segs: Vec<String> = path.split('.').map(escape_single).collect();
+                            let path_str = segs.join("','");
+                            format!("doc #> '{{\"{}\"}}'", path_str)
+                        }
+                        bson::Bson::Document(d) => {
+                            let mut json_pairs = Vec::new();
+                            for (k, v) in d.iter() {
+                                if let Some(sql_expr) = translate_expr(v) {
+                                    json_pairs.push(format!(
+                                        "'{}', {}",
+                                        escape_single(k),
+                                        sql_expr
+                                    ));
+                                } else {
+                                    return Err(Error::Msg(format!(
+                                        "Unsupported expression in $replaceRoot newRoot: {:?}",
+                                        v
+                                    )));
+                                }
+                            }
+                            format!("jsonb_build_object({})", json_pairs.join(", "))
+                        }
+                        _ => {
+                            return Err(Error::Msg(
+                                "newRoot must be a path string or document".into(),
+                            ));
+                        }
+                    };
+
+                    self.state.select = format!("id, {} AS doc", new_root_sql);
+                }
+                AggregateStage::Facet(_) => {
+                    return Err(Error::Msg(
+                        "$facet requires engine fallback (multiple sub-pipelines)".into(),
+                    ));
+                }
+                AggregateStage::Sample(n) => {
+                    if self.state.limit.is_some()
+                        || self.state.offset.is_some()
+                        || self.state.group_by.is_some()
+                    {
+                        self.flush_cte();
+                    }
+                    self.state.order = Some("ORDER BY random()".to_string());
+                    self.state.limit = Some(n);
+                }
+                AggregateStage::UnionWith(_) => {
+                    return Err(Error::Msg(
+                        "$unionWith requires engine fallback (UNION ALL)".into(),
+                    ));
+                }
+                AggregateStage::Out(_) => {
+                    return Err(Error::Msg(
+                        "$out requires special handling beyond SQL pushdown".into(),
+                    ));
+                }
+                AggregateStage::Merge(_) => {
+                    return Err(Error::Msg(
+                        "$merge requires special handling beyond SQL pushdown".into(),
+                    ));
+                }
             }
         }
 

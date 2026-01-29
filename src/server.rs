@@ -2533,7 +2533,7 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
     };
     let cursor_spec = cmd.get_document("cursor").unwrap_or(&doc! {}).clone();
     let batch_size = cursor_spec.get_i32("batchSize").unwrap_or(101) as i64;
-    // Minimal pipeline support: $match, $sort, $project, $limit, $skip, $addFields/$set, $unwind, $group, $lookup
+    // Minimal pipeline support: $match, $sort, $project, $limit, $skip, $addFields/$set, $unwind, $group, $lookup, $out, $merge
     let mut filter: Option<bson::Document> = None;
     let mut sort: Option<bson::Document> = None;
     let mut project: Option<bson::Document> = None;
@@ -2545,7 +2545,11 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
     let mut unwind_path: Option<(String, bool, Option<String>)> = None; // (path, preserveNullAndEmptyArrays, includeArrayIndex)
     let mut group_spec: Option<Document> = None;
     let mut lookup_spec: Option<Document> = None;
+    let mut out_coll: Option<String> = None;
+    let mut merge_spec: Option<Document> = None;
+    let mut stage_count = 0;
     for st in pipeline {
+        stage_count += 1;
         if let bson::Bson::Document(stage) = st {
             if let Ok(m) = stage.get_document("$match") {
                 filter = Some(m.clone());
@@ -2609,6 +2613,32 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
             }
             if let Ok(lu) = stage.get_document("$lookup") {
                 lookup_spec = Some(lu.clone());
+                continue;
+            }
+            // $out: can be string or document with "coll" field
+            if let Some(out_val) = stage.get("$out") {
+                if stage_count < pipeline.len() {
+                    return error_doc(9, "$out must be the last stage in the pipeline");
+                }
+                if let bson::Bson::String(s) = out_val {
+                    out_coll = Some(s.clone());
+                } else if let bson::Bson::Document(d) = out_val {
+                    if let Ok(coll) = d.get_str("coll") {
+                        out_coll = Some(coll.to_string());
+                    } else {
+                        return error_doc(9, "$out document must have a 'coll' field");
+                    }
+                } else {
+                    return error_doc(9, "$out must be a string or document");
+                }
+                continue;
+            }
+            // $merge: document with required "into" field
+            if let Ok(merge_doc) = stage.get_document("$merge") {
+                if stage_count < pipeline.len() {
+                    return error_doc(9, "$merge must be the last stage in the pipeline");
+                }
+                merge_spec = Some(merge_doc.clone());
                 continue;
             }
             // Unknown $stage: error
@@ -2793,6 +2823,16 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
             docs.truncate(l as usize);
         }
     }
+    // Handle $out: write results to a new collection
+    if let Some(target_coll) = out_coll {
+        return handle_out_stage(state, dbname, &target_coll, docs).await;
+    }
+
+    // Handle $merge: upsert results into existing collection
+    if let Some(merge_doc) = merge_spec {
+        return handle_merge_stage(state, dbname, &merge_doc, docs).await;
+    }
+
     let (first_batch, remainder): (Vec<_>, Vec<_>) = docs
         .into_iter()
         .enumerate()
@@ -2808,6 +2848,259 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
     };
     cursor_doc.insert("id", cursor_id);
     doc! { "cursor": cursor_doc, "ok": 1.0 }
+}
+
+async fn handle_out_stage(
+    state: &AppState,
+    dbname: &str,
+    target_coll: &str,
+    docs: Vec<Document>,
+) -> Document {
+    if state.store.is_none() {
+        return error_doc(13, "No storage configured");
+    }
+    let pg = state.store.as_ref().unwrap();
+
+    // Ensure the target collection exists
+    if let Err(e) = pg.ensure_collection(dbname, target_coll).await {
+        return error_doc(59, format!("Failed to create target collection: {}", e));
+    }
+
+    // Delete all existing documents in the target collection
+    match pg
+        .delete_many_by_filter(dbname, target_coll, &doc! {})
+        .await
+    {
+        Ok(_) => {}
+        Err(e) => {
+            return error_doc(59, format!("Failed to clear target collection: {}", e));
+        }
+    }
+
+    // Insert all documents from the aggregation result
+    let mut inserted_count = 0i32;
+    for doc in docs {
+        let mut d = doc;
+        ensure_id(&mut d);
+        let idb = match d.get("_id").and_then(|b| id_bytes_bson(b)) {
+            Some(v) => v,
+            None => {
+                continue;
+            }
+        };
+        let json = match serde_json::to_value(&d) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let bson_bytes = match bson::to_vec(&d) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        match pg
+            .insert_one(dbname, target_coll, &idb, &bson_bytes, &json)
+            .await
+        {
+            Ok(n) => {
+                if n == 1 {
+                    inserted_count += 1;
+                }
+            }
+            Err(_) => {
+                // Continue on error for individual documents
+            }
+        }
+    }
+
+    doc! { "ok": 1.0, "nInserted": inserted_count }
+}
+
+async fn handle_merge_stage(
+    state: &AppState,
+    dbname: &str,
+    merge_spec: &Document,
+    docs: Vec<Document>,
+) -> Document {
+    if state.store.is_none() {
+        return error_doc(13, "No storage configured");
+    }
+    let pg = state.store.as_ref().unwrap();
+
+    // Get target collection name from "into" field
+    let target_coll = match merge_spec.get("into") {
+        Some(bson::Bson::String(s)) => s.clone(),
+        Some(bson::Bson::Document(d)) => {
+            // Support { into: { coll: "name" } } format
+            match d.get_str("coll") {
+                Ok(s) => s.to_string(),
+                Err(_) => return error_doc(9, "$merge 'into' must specify a collection"),
+            }
+        }
+        _ => return error_doc(9, "$merge 'into' must be a string or document"),
+    };
+
+    // Get merge options with defaults
+    let on_field = merge_spec.get_str("on").unwrap_or("_id");
+    let when_matched = merge_spec.get_str("whenMatched").unwrap_or("merge");
+    let when_not_matched = merge_spec.get_str("whenNotMatched").unwrap_or("insert");
+
+    // Ensure the target collection exists
+    if let Err(e) = pg.ensure_collection(dbname, &target_coll).await {
+        return error_doc(59, format!("Failed to ensure target collection: {}", e));
+    }
+
+    let mut matched_count = 0i32;
+    let mut modified_count = 0i32;
+    let mut inserted_count = 0i32;
+
+    for mut doc in docs {
+        // Ensure the document has an _id
+        ensure_id(&mut doc);
+
+        // Build filter based on the "on" field
+        let filter = if on_field == "_id" {
+            doc.get("_id")
+                .map(|id| doc! { "_id": id.clone() })
+                .unwrap_or_else(|| doc! {})
+        } else {
+            // For other fields, build a filter from the document
+            let mut filter_doc = doc! {};
+            if let Some(val) = get_path_bson_value(&doc, on_field) {
+                filter_doc.insert(on_field, val);
+            }
+            filter_doc
+        };
+
+        // Check if document exists in target
+        let existing = match pg.find_one_for_update(dbname, &target_coll, &filter).await {
+            Ok(v) => v,
+            Err(_) => None,
+        };
+
+        if let Some((idb, mut existing_doc)) = existing {
+            // Document exists - handle whenMatched
+            matched_count += 1;
+
+            match when_matched {
+                "merge" => {
+                    // Merge fields from source into existing document
+                    for (k, v) in doc.iter() {
+                        if k != "_id" {
+                            set_path_nested(&mut existing_doc, k, v.clone());
+                        }
+                    }
+                    if let Err(_) = pg
+                        .update_doc_by_id(dbname, &target_coll, &idb, &existing_doc)
+                        .await
+                    {
+                        // Continue on error
+                    } else {
+                        modified_count += 1;
+                    }
+                }
+                "replace" => {
+                    // Replace entire document but keep _id
+                    let id_val = existing_doc.get("_id").cloned();
+                    doc.insert("_id", id_val.unwrap_or(bson::Bson::Null));
+                    if let Err(_) = pg.update_doc_by_id(dbname, &target_coll, &idb, &doc).await {
+                        // Continue on error
+                    } else {
+                        modified_count += 1;
+                    }
+                }
+                "keepExisting" => {
+                    // Do nothing, keep existing document
+                }
+                "fail" => {
+                    return error_doc(59, "Document already exists in target collection");
+                }
+                _ => {
+                    // Default to merge
+                    for (k, v) in doc.iter() {
+                        if k != "_id" {
+                            set_path_nested(&mut existing_doc, k, v.clone());
+                        }
+                    }
+                    if let Err(_) = pg
+                        .update_doc_by_id(dbname, &target_coll, &idb, &existing_doc)
+                        .await
+                    {
+                        // Continue on error
+                    } else {
+                        modified_count += 1;
+                    }
+                }
+            }
+        } else {
+            // Document doesn't exist - handle whenNotMatched
+            match when_not_matched {
+                "insert" => {
+                    let idb = match doc.get("_id").and_then(|b| id_bytes_bson(b)) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    let json = match serde_json::to_value(&doc) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let bson_bytes = match bson::to_vec(&doc) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    match pg
+                        .insert_one(dbname, &target_coll, &idb, &bson_bytes, &json)
+                        .await
+                    {
+                        Ok(n) => {
+                            if n == 1 {
+                                inserted_count += 1;
+                            }
+                        }
+                        Err(_) => {
+                            // Continue on error
+                        }
+                    }
+                }
+                "discard" => {
+                    // Do nothing, discard the document
+                }
+                _ => {
+                    // Default to insert
+                    let idb = match doc.get("_id").and_then(|b| id_bytes_bson(b)) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    let json = match serde_json::to_value(&doc) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let bson_bytes = match bson::to_vec(&doc) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    match pg
+                        .insert_one(dbname, &target_coll, &idb, &bson_bytes, &json)
+                        .await
+                    {
+                        Ok(n) => {
+                            if n == 1 {
+                                inserted_count += 1;
+                            }
+                        }
+                        Err(_) => {
+                            // Continue on error
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    doc! {
+        "ok": 1.0,
+        "nMatched": matched_count,
+        "nModified": modified_count,
+        "nInserted": inserted_count,
+    }
 }
 
 async fn find_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Document {

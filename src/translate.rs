@@ -6,9 +6,94 @@ pub enum WhereSpec {
 }
 
 pub fn build_where_from_filter(filter: &bson::Document) -> String {
+    build_where_from_filter_internal(filter, false)
+}
+
+pub fn build_where_from_filter_internal(filter: &bson::Document, is_nested: bool) -> String {
     let mut where_clauses: Vec<String> = Vec::new();
+
+    // Handle logical operators at the top level first
+    if let Some(or_val) = filter.get("$or") {
+        if let bson::Bson::Array(arr) = or_val {
+            let mut or_clauses: Vec<String> = Vec::new();
+            for item in arr {
+                if let bson::Bson::Document(d) = item {
+                    let clause = build_where_from_filter_internal(d, true);
+                    if clause != "TRUE" {
+                        or_clauses.push(clause);
+                    }
+                }
+            }
+            if !or_clauses.is_empty() {
+                let joined = or_clauses.join(" OR ");
+                where_clauses.push(if or_clauses.len() > 1 {
+                    format!("({})", joined)
+                } else {
+                    joined
+                });
+            }
+        }
+    }
+
+    if let Some(and_val) = filter.get("$and") {
+        if let bson::Bson::Array(arr) = and_val {
+            let mut and_clauses: Vec<String> = Vec::new();
+            for item in arr {
+                if let bson::Bson::Document(d) = item {
+                    let clause = build_where_from_filter_internal(d, true);
+                    if clause != "TRUE" {
+                        and_clauses.push(clause);
+                    }
+                }
+            }
+            if !and_clauses.is_empty() {
+                let joined = and_clauses.join(" AND ");
+                where_clauses.push(if and_clauses.len() > 1 {
+                    format!("({})", joined)
+                } else {
+                    joined
+                });
+            }
+        }
+    }
+
+    if let Some(not_val) = filter.get("$not") {
+        if let bson::Bson::Document(d) = not_val {
+            let clause = build_where_from_filter_internal(d, true);
+            if clause != "TRUE" {
+                where_clauses.push(format!("NOT ({})", clause));
+            }
+        }
+    }
+
+    if let Some(nor_val) = filter.get("$nor") {
+        if let bson::Bson::Array(arr) = nor_val {
+            let mut nor_clauses: Vec<String> = Vec::new();
+            for item in arr {
+                if let bson::Bson::Document(d) = item {
+                    let clause = build_where_from_filter_internal(d, true);
+                    if clause != "TRUE" {
+                        nor_clauses.push(clause);
+                    }
+                }
+            }
+            if !nor_clauses.is_empty() {
+                let joined = nor_clauses.join(" OR ");
+                where_clauses.push(format!(
+                    "NOT ({})",
+                    if nor_clauses.len() > 1 {
+                        format!("({})", joined)
+                    } else {
+                        joined
+                    }
+                ));
+            }
+        }
+    }
+
+    // Process field-level operators (skip keys starting with $)
     for (k, v) in filter.iter() {
-        if k == "_id" {
+        if k == "_id" || k.starts_with('$') {
             continue;
         }
         let path = jsonpath_path(k);
@@ -20,7 +105,7 @@ pub fn build_where_from_filter(filter: &bson::Document) -> String {
                             if let bson::Bson::Document(em) = val {
                                 if let Some(pred) = build_elem_match_pred(&path, em) {
                                     where_clauses.push(format!(
-                                        "jsonb_path_exists(doc, ‘{}’ ? ({} ))",
+                                        "jsonb_path_exists(doc, '{}') ? ({} ))",
                                         escape_single(&path),
                                         pred
                                     ));
@@ -59,6 +144,93 @@ pub fn build_where_from_filter(filter: &bson::Document) -> String {
                                     );
                                     where_clauses.push(format!("({} OR {})", p1, p2));
                                 }
+                            }
+                        }
+                        "$ne" => {
+                            if let Some(lit) = json_literal_from_bson(val) {
+                                let p1 = format!(
+                                    "jsonb_path_exists(doc, '{} ? (@ != {} )')",
+                                    escape_single(&path),
+                                    lit
+                                );
+                                let p2 = format!(
+                                    "jsonb_path_exists(doc, '{}[*] ? (@ != {} )')",
+                                    escape_single(&path),
+                                    lit
+                                );
+                                where_clauses.push(format!("({} OR {})", p1, p2));
+                            }
+                        }
+                        "$nin" => {
+                            if let bson::Bson::Array(arr) = val {
+                                let mut preds: Vec<String> = Vec::new();
+                                for item in arr {
+                                    if let Some(lit) = json_literal_from_bson(item) {
+                                        preds.push(format!("@ != {}", lit));
+                                    }
+                                }
+                                if preds.is_empty() {
+                                    where_clauses.push("TRUE".to_string());
+                                } else {
+                                    let predicate = preds.join(" && ");
+                                    let p1 = format!(
+                                        "jsonb_path_exists(doc, '{} ? ({} )')",
+                                        escape_single(&path),
+                                        predicate
+                                    );
+                                    let p2 = format!(
+                                        "jsonb_path_exists(doc, '{}[*] ? ({} )')",
+                                        escape_single(&path),
+                                        predicate
+                                    );
+                                    where_clauses.push(format!("({} AND {})", p1, p2));
+                                }
+                            }
+                        }
+                        "$regex" => {
+                            if let bson::Bson::String(pattern) = val {
+                                let flags =
+                                    d.get("$options").and_then(|o| o.as_str()).unwrap_or("");
+                                let regex_clause = build_regex_clause(&path, pattern, flags);
+                                where_clauses.push(regex_clause);
+                            }
+                        }
+                        "$all" => {
+                            if let bson::Bson::Array(arr) = val {
+                                let mut all_clauses: Vec<String> = Vec::new();
+                                for item in arr {
+                                    if let Some(lit) = json_literal_from_bson(item) {
+                                        let p1 = format!(
+                                            "jsonb_path_exists(doc, '{} ? (@ == {} )')",
+                                            escape_single(&path),
+                                            lit
+                                        );
+                                        let p2 = format!(
+                                            "jsonb_path_exists(doc, '{}[*] ? (@ == {} )')",
+                                            escape_single(&path),
+                                            lit
+                                        );
+                                        all_clauses.push(format!("({} OR {})", p1, p2));
+                                    }
+                                }
+                                if !all_clauses.is_empty() {
+                                    where_clauses.push(format!("({})", all_clauses.join(" AND ")));
+                                }
+                            }
+                        }
+                        "$size" => {
+                            let size_val = match val {
+                                bson::Bson::Int32(n) => Some(*n as i64),
+                                bson::Bson::Int64(n) => Some(*n),
+                                _ => None,
+                            };
+                            if let Some(n) = size_val {
+                                let size_clause = format!(
+                                    "jsonb_array_length(doc->'{}') = {}",
+                                    escape_single(k),
+                                    n
+                                );
+                                where_clauses.push(size_clause);
                             }
                         }
                         "$gt" | "$gte" | "$lt" | "$lte" => {
@@ -121,11 +293,44 @@ pub fn build_where_from_filter(filter: &bson::Document) -> String {
             }
         }
     }
+
     if where_clauses.is_empty() {
         String::from("TRUE")
+    } else if where_clauses.len() == 1 {
+        where_clauses[0].clone()
+    } else if is_nested {
+        format!("({})", where_clauses.join(" AND "))
     } else {
         where_clauses.join(" AND ")
     }
+}
+
+fn build_regex_clause(path: &str, pattern: &str, flags: &str) -> String {
+    // Convert MongoDB regex pattern to PostgreSQL regex
+    // Escape single quotes in pattern
+    let escaped_pattern = pattern.replace("'", "''");
+    let escaped_path = escape_single(path.trim_start_matches("$"));
+
+    // Build PostgreSQL regex flags
+    let mut pg_flags = String::new();
+    if flags.contains('i') {
+        pg_flags.push('i');
+    }
+    if flags.contains('m') || flags.contains('s') {
+        pg_flags.push('n');
+    }
+
+    let flag_prefix = if pg_flags.is_empty() {
+        String::new()
+    } else {
+        format!("(?{})", pg_flags)
+    };
+
+    // Use ~ operator for regex matching
+    format!(
+        "(doc->>'{}') ~ '{}{}'",
+        escaped_path, flag_prefix, escaped_pattern
+    )
 }
 
 pub fn build_where_spec(filter: &bson::Document) -> WhereSpec {
@@ -217,7 +422,7 @@ pub fn projection_pushdown_sql(projection: Option<&bson::Document>) -> Option<St
     if proj.is_empty() {
         return None;
     }
-    let mut include_fields: Vec<String> = Vec::new();
+    let mut include_fields: Vec<(String, String)> = Vec::new();
     let mut include_id = true;
     for (k, v) in proj.iter() {
         if k == "_id" {
@@ -228,18 +433,40 @@ pub fn projection_pushdown_sql(projection: Option<&bson::Document>) -> Option<St
             }
             continue;
         }
-        let on = match v {
-            bson::Bson::Int32(n) => *n != 0,
-            bson::Bson::Boolean(b) => *b,
-            _ => false,
-        };
-        if on {
-            if k.contains('.') {
+        match v {
+            bson::Bson::Int32(n) => {
+                if *n != 0 {
+                    if k.contains('.') {
+                        return None;
+                    }
+                    include_fields.push((k.clone(), format!("doc->'{}'", escape_single(k))));
+                } else {
+                    return None;
+                }
+            }
+            bson::Bson::Boolean(b) => {
+                if *b {
+                    if k.contains('.') {
+                        return None;
+                    }
+                    include_fields.push((k.clone(), format!("doc->'{}'", escape_single(k))));
+                } else {
+                    return None;
+                }
+            }
+            bson::Bson::Document(_) => {
+                if k.contains('.') {
+                    return None;
+                }
+                if let Some(sql_expr) = translate_expression(v) {
+                    include_fields.push((k.clone(), sql_expr));
+                } else {
+                    return None;
+                }
+            }
+            _ => {
                 return None;
             }
-            include_fields.push(k.clone());
-        } else {
-            return None;
         }
     }
     if include_fields.is_empty() && include_id {
@@ -249,12 +476,8 @@ pub fn projection_pushdown_sql(projection: Option<&bson::Document>) -> Option<St
     if include_id {
         elems.push("'_id', doc->'_id'".to_string());
     }
-    for f in include_fields {
-        elems.push(format!(
-            "'{}', doc->'{}'",
-            escape_single(&f),
-            escape_single(&f)
-        ));
+    for (field_name, sql_expr) in include_fields {
+        elems.push(format!("'{}', {}", escape_single(&field_name), sql_expr));
     }
     if elems.is_empty() {
         return None;
@@ -357,4 +580,108 @@ pub fn build_elem_match_pred(_path: &str, em: &bson::Document) -> Option<String>
 
 pub fn escape_single(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "''")
+}
+
+pub fn translate_expression(expr: &bson::Bson) -> Option<String> {
+    match expr {
+        bson::Bson::Document(doc) => {
+            if doc.is_empty() {
+                return None;
+            }
+            let (op, val) = doc.iter().next()?;
+            match op.as_str() {
+                "$cond" => translate_cond(val),
+                "$ifNull" => translate_if_null(val),
+                "$toString" => translate_type_cast(val, "text"),
+                "$toInt" => translate_type_cast(val, "integer"),
+                "$toDouble" => translate_type_cast(val, "double precision"),
+                "$toBool" => translate_type_cast(val, "boolean"),
+                "$concat" => translate_concat(val),
+                "$substr" => translate_substr(val),
+                "$substrCP" => translate_substr(val),
+                _ => None,
+            }
+        }
+        bson::Bson::String(s) if s.starts_with('$') => {
+            let path = &s[1..];
+            let segs: Vec<String> = path.split('.').map(escape_single).collect();
+            let path_str = segs.join("','");
+            Some(format!("doc #> '{{\"{}\"}}'", path_str))
+        }
+        bson::Bson::Int32(n) => Some(n.to_string()),
+        bson::Bson::Int64(n) => Some(n.to_string()),
+        bson::Bson::Double(f) => Some(f.to_string()),
+        bson::Bson::Boolean(b) => Some(if *b { "true".into() } else { "false".into() }),
+        bson::Bson::Null => Some("NULL".into()),
+        _ => None,
+    }
+}
+
+fn translate_cond(val: &bson::Bson) -> Option<String> {
+    match val {
+        bson::Bson::Array(arr) if arr.len() == 3 => {
+            let if_expr = translate_expression(&arr[0])?;
+            let then_expr = translate_expression(&arr[1])?;
+            let else_expr = translate_expression(&arr[2])?;
+            Some(format!(
+                "CASE WHEN {} THEN {} ELSE {} END",
+                if_expr, then_expr, else_expr
+            ))
+        }
+        bson::Bson::Document(doc) => {
+            let if_expr = doc.get("if").and_then(translate_expression)?;
+            let then_expr = doc.get("then").and_then(translate_expression)?;
+            let else_expr = doc.get("else").and_then(translate_expression)?;
+            Some(format!(
+                "CASE WHEN {} THEN {} ELSE {} END",
+                if_expr, then_expr, else_expr
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn translate_if_null(val: &bson::Bson) -> Option<String> {
+    match val {
+        bson::Bson::Array(arr) if arr.len() == 2 => {
+            let expr = translate_expression(&arr[0])?;
+            let replacement = translate_expression(&arr[1])?;
+            Some(format!("COALESCE({}, {})", expr, replacement))
+        }
+        _ => None,
+    }
+}
+
+fn translate_type_cast(val: &bson::Bson, target_type: &str) -> Option<String> {
+    let expr = translate_expression(val)?;
+    Some(format!("({})::{}", expr, target_type))
+}
+
+fn translate_concat(val: &bson::Bson) -> Option<String> {
+    match val {
+        bson::Bson::Array(arr) => {
+            let exprs: Vec<String> = arr.iter().filter_map(translate_expression).collect();
+            if exprs.is_empty() {
+                None
+            } else {
+                Some(format!("CONCAT({})", exprs.join(", ")))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn translate_substr(val: &bson::Bson) -> Option<String> {
+    match val {
+        bson::Bson::Array(arr) if arr.len() == 3 => {
+            let string_expr = translate_expression(&arr[0])?;
+            let start = translate_expression(&arr[1])?;
+            let length = translate_expression(&arr[2])?;
+            Some(format!(
+                "SUBSTRING({} FROM ({}::integer + 1) FOR {}::integer)",
+                string_expr, start, length
+            ))
+        }
+        _ => None,
+    }
 }
