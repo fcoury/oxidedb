@@ -51,14 +51,13 @@ async fn e2e_error_codes() {
     stream.write_all(&msg).await.unwrap();
     let _ = read_one_op_msg(&mut stream).await;
 
-    // update with upsert=true -> code 20
+    // update with upsert=true -> now supported, should succeed
     let u_spec = doc! {"q": {}, "u": {"$set": {"x": 1}}, "upsert": true};
     let upd = doc! {"update": "u", "updates": [u_spec], "$db": &dbname};
     let msg = encode_op_msg(&upd, 0, 2);
     stream.write_all(&msg).await.unwrap();
     let doc = read_one_op_msg(&mut stream).await;
-    assert_eq!(doc.get_f64("ok").unwrap_or(1.0), 0.0);
-    assert_eq!(doc.get_i32("code").unwrap_or(0), 20);
+    assert_eq!(doc.get_f64("ok").unwrap_or(0.0), 1.0);
 
     // update with unsupported operator -> code 9
     let u_spec = doc! {"q": {}, "u": {"$foo": {"a": 1}}};
@@ -87,8 +86,7 @@ async fn e2e_error_codes() {
     assert_eq!(doc.get_f64("ok").unwrap_or(1.0), 0.0);
     assert_eq!(doc.get_i32("code").unwrap_or(0), 2);
 
-    // aggregate with unsupported stage -> code 9
-    // Use a stage we do not implement (e.g., $sample)
+    // aggregate with unsupported stage $sample -> code 9
     let pipeline = vec![bson::Bson::Document(doc! {"$sample": {"size": 1i32}})];
     let agg = doc! {"aggregate": "u", "pipeline": pipeline, "cursor": {}, "$db": &dbname};
     let msg = encode_op_msg(&agg, 0, 6);

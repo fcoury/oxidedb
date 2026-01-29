@@ -418,23 +418,12 @@ impl PgStore {
 
         let t = Instant::now();
         let client = self.pool.get().await.map_err(err_msg)?;
-        // Prefer JSONB containment when filter is simple equality-only
-        let rows = match build_where_spec(filter) {
-            WhereSpec::Containment(val) => {
-                let sql = format!(
-                    "SELECT doc_bson, doc FROM {}.{} WHERE doc @> $1::jsonb ORDER BY id ASC LIMIT $2",
-                    q_schema, q_table
-                );
-                client.query(&sql, &[&val, &limit]).await.map_err(err_msg)?
-            }
-            WhereSpec::Raw(where_sql) => {
-                let sql = format!(
-                    "SELECT doc_bson, doc FROM {}.{} WHERE {} ORDER BY id ASC LIMIT {}",
-                    q_schema, q_table, where_sql, limit
-                );
-                client.query(&sql, &[]).await.map_err(err_msg)?
-            }
-        };
+        let where_sql = build_where_from_filter(filter);
+        let sql = format!(
+            "SELECT doc_bson, doc FROM {}.{} WHERE {} ORDER BY id ASC LIMIT {}",
+            q_schema, q_table, where_sql, limit
+        );
+        let rows = client.query(&sql, &[]).await.map_err(err_msg)?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
             let bson_bytes: Option<Vec<u8>> = r.try_get(0).ok();
@@ -465,24 +454,17 @@ impl PgStore {
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
-        let where_spec = filter.map(build_where_spec);
+        let where_sql = filter.map(build_where_from_filter);
         let order_sql = build_order_by(sort);
 
         if let Some(proj_sql) = projection_pushdown_sql(projection) {
             let t = Instant::now();
             let client = self.pool.get().await.map_err(err_msg)?;
-            let res = match &where_spec {
-                Some(WhereSpec::Containment(val)) => {
-                    let sql = format!(
-                        "SELECT {} AS doc FROM {}.{} WHERE doc @> $1::jsonb {} LIMIT $2",
-                        proj_sql, q_schema, q_table, order_sql
-                    );
-                    client.query(&sql, &[val, &limit]).await
-                }
-                Some(WhereSpec::Raw(where_sql)) => {
+            let res = match &where_sql {
+                Some(where_clause) => {
                     let sql = format!(
                         "SELECT {} AS doc FROM {}.{} WHERE {} {} LIMIT {}",
-                        proj_sql, q_schema, q_table, where_sql, order_sql, limit
+                        proj_sql, q_schema, q_table, where_clause, order_sql, limit
                     );
                     client.query(&sql, &[]).await
                 }
@@ -515,18 +497,11 @@ impl PgStore {
         } else {
             let t = Instant::now();
             let client = self.pool.get().await.map_err(err_msg)?;
-            let res = match &where_spec {
-                Some(WhereSpec::Containment(val)) => {
-                    let sql = format!(
-                        "SELECT doc_bson, doc FROM {}.{} WHERE doc @> $1::jsonb {} LIMIT $2",
-                        q_schema, q_table, order_sql
-                    );
-                    client.query(&sql, &[val, &limit]).await
-                }
-                Some(WhereSpec::Raw(where_sql)) => {
+            let res = match &where_sql {
+                Some(where_clause) => {
                     let sql = format!(
                         "SELECT doc_bson, doc FROM {}.{} WHERE {} {} LIMIT {}",
-                        q_schema, q_table, where_sql, order_sql, limit
+                        q_schema, q_table, where_clause, order_sql, limit
                     );
                     client.query(&sql, &[]).await
                 }
@@ -796,25 +771,14 @@ impl PgStore {
             };
             return Ok(Some((id, doc)));
         }
-        let where_spec = build_where_spec(filter);
+        let where_sql = build_where_from_filter(filter);
         let t = Instant::now();
         let client = self.pool.get().await.map_err(err_msg)?;
-        let rows = match where_spec {
-            WhereSpec::Containment(val) => {
-                let sql = format!(
-                    "SELECT id, doc_bson, doc FROM {}.{} WHERE doc @> $1::jsonb ORDER BY id ASC LIMIT 1",
-                    q_schema, q_table
-                );
-                client.query(&sql, &[&val]).await.map_err(err_msg)?
-            }
-            WhereSpec::Raw(where_sql) => {
-                let sql = format!(
-                    "SELECT id, doc_bson, doc FROM {}.{} WHERE {} ORDER BY id ASC LIMIT 1",
-                    q_schema, q_table, where_sql
-                );
-                client.query(&sql, &[]).await.map_err(err_msg)?
-            }
-        };
+        let sql = format!(
+            "SELECT id, doc_bson, doc FROM {}.{} WHERE {} ORDER BY id ASC LIMIT 1",
+            q_schema, q_table, where_sql
+        );
+        let rows = client.query(&sql, &[]).await.map_err(err_msg)?;
         if rows.is_empty() {
             return Ok(None);
         }
@@ -880,24 +844,14 @@ impl PgStore {
             let n = client.execute(&del_sql, &[&idb]).await.map_err(err_msg)?;
             return Ok(n);
         }
-        let where_spec = build_where_spec(filter);
+        let where_sql = build_where_from_filter(filter);
         let select_sql = format!(
             "SELECT id FROM {}.{} WHERE {} ORDER BY id ASC LIMIT 1",
-            q_schema,
-            q_table,
-            match &where_spec {
-                WhereSpec::Raw(s) => s.as_str(),
-                _ => "doc @> $1::jsonb",
-            }
+            q_schema, q_table, where_sql
         );
         let t = Instant::now();
         let client = self.pool.get().await.map_err(err_msg)?;
-        let rows = match &where_spec {
-            WhereSpec::Containment(val) => {
-                client.query(&select_sql, &[val]).await.map_err(err_msg)?
-            }
-            WhereSpec::Raw(_) => client.query(&select_sql, &[]).await.map_err(err_msg)?,
-        };
+        let rows = client.query(&select_sql, &[]).await.map_err(err_msg)?;
         if rows.is_empty() {
             return Ok(0);
         }
@@ -918,22 +872,11 @@ impl PgStore {
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
-        let where_spec = build_where_spec(filter);
+        let where_sql = build_where_from_filter(filter);
         let t = Instant::now();
         let client = self.pool.get().await.map_err(err_msg)?;
-        let n = match where_spec {
-            WhereSpec::Containment(val) => {
-                let sql = format!(
-                    "DELETE FROM {}.{} WHERE doc @> $1::jsonb",
-                    q_schema, q_table
-                );
-                client.execute(&sql, &[&val]).await.map_err(err_msg)?
-            }
-            WhereSpec::Raw(where_sql) => {
-                let sql = format!("DELETE FROM {}.{} WHERE {}", q_schema, q_table, where_sql);
-                client.execute(&sql, &[]).await.map_err(err_msg)?
-            }
-        };
+        let sql = format!("DELETE FROM {}.{} WHERE {}", q_schema, q_table, where_sql);
+        let n = client.execute(&sql, &[]).await.map_err(err_msg)?;
         tracing::debug!(op="delete_many_by_filter", db=%db, coll=%coll, elapsed_ms=?t.elapsed().as_millis());
         Ok(n)
     }
@@ -959,9 +902,94 @@ fn escape_single(s: &str) -> String {
 // removed unused helpers
 
 fn build_where_from_filter(filter: &bson::Document) -> String {
+    build_where_from_filter_internal(filter, false)
+}
+
+fn build_where_from_filter_internal(filter: &bson::Document, is_nested: bool) -> String {
     let mut where_clauses: Vec<String> = Vec::new();
+
+    // Handle logical operators at the top level first
+    if let Some(or_val) = filter.get("$or") {
+        if let bson::Bson::Array(arr) = or_val {
+            let mut or_clauses: Vec<String> = Vec::new();
+            for item in arr {
+                if let bson::Bson::Document(d) = item {
+                    let clause = build_where_from_filter_internal(d, true);
+                    if clause != "TRUE" {
+                        or_clauses.push(clause);
+                    }
+                }
+            }
+            if !or_clauses.is_empty() {
+                let joined = or_clauses.join(" OR ");
+                where_clauses.push(if or_clauses.len() > 1 {
+                    format!("({})", joined)
+                } else {
+                    joined
+                });
+            }
+        }
+    }
+
+    if let Some(and_val) = filter.get("$and") {
+        if let bson::Bson::Array(arr) = and_val {
+            let mut and_clauses: Vec<String> = Vec::new();
+            for item in arr {
+                if let bson::Bson::Document(d) = item {
+                    let clause = build_where_from_filter_internal(d, true);
+                    if clause != "TRUE" {
+                        and_clauses.push(clause);
+                    }
+                }
+            }
+            if !and_clauses.is_empty() {
+                let joined = and_clauses.join(" AND ");
+                where_clauses.push(if and_clauses.len() > 1 {
+                    format!("({})", joined)
+                } else {
+                    joined
+                });
+            }
+        }
+    }
+
+    if let Some(not_val) = filter.get("$not") {
+        if let bson::Bson::Document(d) = not_val {
+            let clause = build_where_from_filter_internal(d, true);
+            if clause != "TRUE" {
+                where_clauses.push(format!("NOT ({})", clause));
+            }
+        }
+    }
+
+    if let Some(nor_val) = filter.get("$nor") {
+        if let bson::Bson::Array(arr) = nor_val {
+            let mut nor_clauses: Vec<String> = Vec::new();
+            for item in arr {
+                if let bson::Bson::Document(d) = item {
+                    let clause = build_where_from_filter_internal(d, true);
+                    if clause != "TRUE" {
+                        nor_clauses.push(clause);
+                    }
+                }
+            }
+            if !nor_clauses.is_empty() {
+                let joined = nor_clauses.join(" OR ");
+                where_clauses.push(format!(
+                    "NOT ({})",
+                    if nor_clauses.len() > 1 {
+                        format!("({})", joined)
+                    } else {
+                        joined
+                    }
+                ));
+            }
+        }
+    }
+
+    // Process field-level operators (skip keys starting with $)
     for (k, v) in filter.iter() {
-        if k == "_id" {
+        if k == "_id" || k.starts_with('$') {
             continue;
         }
         let path = jsonpath_path(k);
@@ -1012,6 +1040,93 @@ fn build_where_from_filter(filter: &bson::Document) -> String {
                                     );
                                     where_clauses.push(format!("({} OR {})", p1, p2));
                                 }
+                            }
+                        }
+                        "$ne" => {
+                            if let Some(lit) = json_literal_from_bson(val) {
+                                let p1 = format!(
+                                    "jsonb_path_exists(doc, '{} ? (@ != {} )')",
+                                    escape_single(&path),
+                                    lit
+                                );
+                                let p2 = format!(
+                                    "jsonb_path_exists(doc, '{}[*] ? (@ != {} )')",
+                                    escape_single(&path),
+                                    lit
+                                );
+                                where_clauses.push(format!("({} OR {})", p1, p2));
+                            }
+                        }
+                        "$nin" => {
+                            if let bson::Bson::Array(arr) = val {
+                                let mut preds: Vec<String> = Vec::new();
+                                for item in arr {
+                                    if let Some(lit) = json_literal_from_bson(item) {
+                                        preds.push(format!("@ != {}", lit));
+                                    }
+                                }
+                                if preds.is_empty() {
+                                    where_clauses.push("TRUE".to_string());
+                                } else {
+                                    let predicate = preds.join(" && ");
+                                    let p1 = format!(
+                                        "jsonb_path_exists(doc, '{} ? ({} )')",
+                                        escape_single(&path),
+                                        predicate
+                                    );
+                                    let p2 = format!(
+                                        "jsonb_path_exists(doc, '{}[*] ? ({} )')",
+                                        escape_single(&path),
+                                        predicate
+                                    );
+                                    where_clauses.push(format!("({} AND {})", p1, p2));
+                                }
+                            }
+                        }
+                        "$regex" => {
+                            if let bson::Bson::String(pattern) = val {
+                                let flags =
+                                    d.get("$options").and_then(|o| o.as_str()).unwrap_or("");
+                                let regex_clause = build_regex_clause(&path, pattern, flags);
+                                where_clauses.push(regex_clause);
+                            }
+                        }
+                        "$all" => {
+                            if let bson::Bson::Array(arr) = val {
+                                let mut all_clauses: Vec<String> = Vec::new();
+                                for item in arr {
+                                    if let Some(lit) = json_literal_from_bson(item) {
+                                        let p1 = format!(
+                                            "jsonb_path_exists(doc, '{} ? (@ == {} )')",
+                                            escape_single(&path),
+                                            lit
+                                        );
+                                        let p2 = format!(
+                                            "jsonb_path_exists(doc, '{}[*] ? (@ == {} )')",
+                                            escape_single(&path),
+                                            lit
+                                        );
+                                        all_clauses.push(format!("({} OR {})", p1, p2));
+                                    }
+                                }
+                                if !all_clauses.is_empty() {
+                                    where_clauses.push(format!("({})", all_clauses.join(" AND ")));
+                                }
+                            }
+                        }
+                        "$size" => {
+                            let size_val = match val {
+                                bson::Bson::Int32(n) => Some(*n as i64),
+                                bson::Bson::Int64(n) => Some(*n),
+                                _ => None,
+                            };
+                            if let Some(n) = size_val {
+                                let size_clause = format!(
+                                    "jsonb_array_length(doc->'{}') = {}",
+                                    escape_single(k),
+                                    n
+                                );
+                                where_clauses.push(size_clause);
                             }
                         }
                         "$gt" | "$gte" | "$lt" | "$lte" => {
@@ -1074,72 +1189,57 @@ fn build_where_from_filter(filter: &bson::Document) -> String {
             }
         }
     }
+
     if where_clauses.is_empty() {
         String::from("TRUE")
+    } else if where_clauses.len() == 1 {
+        where_clauses[0].clone()
+    } else if is_nested {
+        format!("({})", where_clauses.join(" AND "))
     } else {
         where_clauses.join(" AND ")
     }
 }
 
-enum WhereSpec {
-    Raw(String),
-    Containment(serde_json::Value),
-}
+fn build_regex_clause(path: &str, pattern: &str, flags: &str) -> String {
+    // Convert MongoDB regex pattern to PostgreSQL regex
+    // Escape single quotes in pattern
+    let escaped_pattern = pattern.replace("'", "''");
 
-fn json_value_from_bson(v: &bson::Bson) -> Option<serde_json::Value> {
-    match v {
-        bson::Bson::Null => Some(serde_json::Value::Null),
-        bson::Bson::Boolean(b) => Some(serde_json::Value::Bool(*b)),
-        bson::Bson::Int32(n) => Some(serde_json::Value::Number((*n).into())),
-        bson::Bson::Int64(n) => Some(serde_json::Value::Number((*n).into())),
-        bson::Bson::Double(f) => serde_json::Number::from_f64(*f).map(serde_json::Value::Number),
-        bson::Bson::String(s) => Some(serde_json::Value::String(s.clone())),
-        _ => None,
-    }
-}
-
-fn build_where_spec(filter: &bson::Document) -> WhereSpec {
-    // Try simple equality-only pushdown using JSONB containment
-    use serde_json::{Map, Value};
-    let mut m = Map::new();
-    for (k, v) in filter.iter() {
-        if k == "_id" {
-            continue;
-        } // server has fast path; avoid ambiguity
-        if k.contains('.') {
-            return WhereSpec::Raw(build_where_from_filter(filter));
-        }
-        match v {
-            bson::Bson::Document(d) => {
-                if d.len() == 1 {
-                    if let Some(eqv) = d.get("$eq") {
-                        if let Some(jv) = json_value_from_bson(eqv) {
-                            m.insert(k.clone(), jv);
-                            continue;
-                        } else {
-                            return WhereSpec::Raw(build_where_from_filter(filter));
-                        }
-                    } else {
-                        return WhereSpec::Raw(build_where_from_filter(filter));
-                    }
-                } else {
-                    return WhereSpec::Raw(build_where_from_filter(filter));
-                }
-            }
-            other => {
-                if let Some(jv) = json_value_from_bson(other) {
-                    m.insert(k.clone(), jv);
-                } else {
-                    return WhereSpec::Raw(build_where_from_filter(filter));
-                }
-            }
-        }
-    }
-    if m.is_empty() {
-        WhereSpec::Raw(build_where_from_filter(filter))
+    // Extract field name from JSONPath format $.”field” or $."field"
+    // Remove leading '$' and extract quoted segments
+    let field_name = if path.starts_with("$.") {
+        // Extract content between quotes: $."field" -> field
+        path[2..]
+            .split(".")
+            .map(|s| s.trim_matches('"'))
+            .collect::<Vec<_>>()
+            .join(".")
     } else {
-        WhereSpec::Containment(Value::Object(m))
+        path.trim_start_matches('$').to_string()
+    };
+    let escaped_path = escape_single(&field_name);
+
+    // Build PostgreSQL regex flags
+    let mut pg_flags = String::new();
+    if flags.contains('i') {
+        pg_flags.push('i');
     }
+    if flags.contains('m') || flags.contains('s') {
+        pg_flags.push('n');
+    }
+
+    let flag_prefix = if pg_flags.is_empty() {
+        String::new()
+    } else {
+        format!("(?{})", pg_flags)
+    };
+
+    // Use ~ operator for regex matching
+    format!(
+        "(doc->>'{}') ~ '{}{}'",
+        escaped_path, flag_prefix, escaped_pattern
+    )
 }
 
 fn build_order_by(sort: Option<&bson::Document>) -> String {
