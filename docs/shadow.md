@@ -48,11 +48,13 @@ CLI/env overrides:
   - OP_MSG → forward OP_MSG (request header/body), reusing requestId.
   - OP_QUERY → forward OP_QUERY (fullCollectionName/flags preserved).
 - Rewrites (only when `db_prefix` is set):
-  - OP_MSG: update `$db` inside section-0 doc to `<prefix>_<db>`.
+  - OP_MSG: comprehensive namespace rewriting including:
+    - `$db` field → `<prefix>_<db>`
+    - Collection name fields: `find`, `insert`, `update`, `delete`, `aggregate`, `create`, `drop`, `createIndexes`, `dropIndexes`
+    - Namespace fields: `getMore.collection`, `killCursors.collection`
+    - Nested fields: `createIndexes.indexes[].ns` (some drivers include this)
   - OP_QUERY: rewrite `fullCollectionName` C-string from `db.$cmd` or `db.<coll>` to `<prefix>_<db>.$cmd`/`<prefix>_<db>.<coll>`.
-  - TODO: rewrite explicit namespace fields for commands that carry them (e.g., getMore/killCursors/insert/find). Not yet implemented.
-- OP_COMPRESSED:
-  - Currently not supported: replies with `OP_COMPRESSED` are detected and skipped (no comparison). Future: add decompression and compare.
+  - OP_COMPRESSED: decompress, rewrite inner payload, recompress with same compressor (Snappy supported)
 
 ## Comparer
 
@@ -102,29 +104,27 @@ CLI/env overrides:
 ## Milestones and Status
 
 - Config + CLI surfaces [x]
-- ShadowSession forwarder (OP_MSG/OP_QUERY) [x]
+- ShadowSession forwarder (OP_MSG/OP_QUERY/OP_COMPRESSED) [x]
 - OP_REPLY first-doc decoding [x]
 - Comparer (ignores, path-diff, redaction) [x]
 - Server hook (non-blocking compare; sampling + timeout) [x]
 - Metrics counters [x]
-- OP_COMPRESSED detection/skip [x]
+- OP_COMPRESSED detection/skip → full support [x]
 - Forwarder tests (hello/ping/buildInfo; ismaster) [x]
 - E2E tests (hello/ping/buildInfo) [x]
 - E2E CRUD test (create/insert/find) [x]
-- Namespace rewrites for explicit ns fields when `db_prefix` [ ]
+- Comprehensive namespace rewrites for all commands [x]
 - Upstream auth (SCRAM-SHA-256) [ ]
 - Deterministic sampling (hash-based) [ ]
 - Metrics exposure/endpoint [ ]
-- OP_COMPRESSED full support (decompression) [ ]
 - Additional e2e coverage (getMore/killCursors/list*/indexes) [ ]
 
 ## Next Steps
 
-1) Namespace rewriting (db_prefix) for commands with explicit collection/ns fields (getMore, killCursors, insert, find).
-2) Extend e2e coverage to getMore/killCursors and listDatabases/listCollections; align shapes as needed.
-3) Optional: deterministic sampling and a simple metrics dump endpoint or admin command.
-4) Investigate OP_COMPRESSED support for full parity with modern drivers.
-5) Consider upstream auth (SCRAM-SHA-256) to enable shadow against secured clusters.
+1) Extend e2e coverage to getMore/killCursors and listDatabases/listCollections; align shapes as needed.
+2) Optional: deterministic sampling and a simple metrics dump endpoint or admin command.
+3) Consider upstream auth (SCRAM-SHA-256) to enable shadow against secured clusters.
+4) Add zlib/zstd compressor support for OP_COMPRESSED (currently only Snappy is supported).
 
 ---
 

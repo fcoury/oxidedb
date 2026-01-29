@@ -19,6 +19,7 @@ dotenvy = "0.15"
 tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-serde_json-1"] }
 rand = "0.8"
 deadpool-postgres = { version = "0.10", features = ["rt_tokio_1"] }
+snap = "1.1"
 
 [dev-dependencies]
 tokio = { version = "1.39", features = ["full"] }
