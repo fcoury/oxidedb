@@ -1,22 +1,28 @@
 use crate::error::{Error, Result};
-use tokio_postgres::{NoTls, Transaction};
+use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use std::collections::HashSet;
+use std::str::FromStr;
 use std::time::Instant;
 use tokio::sync::RwLock;
-use deadpool_postgres::{Pool, Manager, ManagerConfig, RecyclingMethod};
-use std::str::FromStr;
+use tokio_postgres::{NoTls, Transaction};
 
 pub struct PgStore {
     pool: Pool,
     dsn: String,
-    databases_cache: RwLock<HashSet<String>>,              // known databases
-    collections_cache: RwLock<HashSet<(String, String)>>,  // known (db, coll)
+    databases_cache: RwLock<HashSet<String>>, // known databases
+    collections_cache: RwLock<HashSet<(String, String)>>, // known (db, coll)
 }
 
 impl PgStore {
     pub async fn connect(url: &str) -> Result<Self> {
         let pgcfg = tokio_postgres::Config::from_str(url).map_err(err_msg)?;
-        let mgr = Manager::from_config(pgcfg, NoTls, ManagerConfig { recycling_method: RecyclingMethod::Fast });
+        let mgr = Manager::from_config(
+            pgcfg,
+            NoTls,
+            ManagerConfig {
+                recycling_method: RecyclingMethod::Fast,
+            },
+        );
         let pool = Pool::builder(mgr).max_size(16).build().map_err(err_msg)?;
         Ok(Self {
             pool,
@@ -68,7 +74,10 @@ impl PgStore {
     pub async fn list_collections(&self, db: &str) -> Result<Vec<String>> {
         let client = self.pool.get().await.map_err(err_msg)?;
         let rows = client
-            .query("SELECT coll FROM mdb_meta.collections WHERE db = $1 ORDER BY coll", &[&db])
+            .query(
+                "SELECT coll FROM mdb_meta.collections WHERE db = $1 ORDER BY coll",
+                &[&db],
+            )
             .await
             .map_err(|e| Error::Msg(e.to_string()))?;
         Ok(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
@@ -76,7 +85,9 @@ impl PgStore {
 
     pub async fn ensure_database(&self, db: &str) -> Result<()> {
         // Fast path: cache
-        if self.is_known_db(db).await { return Ok(()); }
+        if self.is_known_db(db).await {
+            return Ok(());
+        }
         let t = Instant::now();
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
@@ -97,7 +108,9 @@ impl PgStore {
 
     pub async fn ensure_collection(&self, db: &str, coll: &str) -> Result<()> {
         // Fast path: cache
-        if self.is_known_collection(db, coll).await { return Ok(()); }
+        if self.is_known_collection(db, coll).await {
+            return Ok(());
+        }
         self.ensure_database(db).await?;
         let t = Instant::now();
         let schema = schema_name(db);
@@ -146,12 +159,25 @@ impl PgStore {
         let ddl = format!("DROP SCHEMA IF EXISTS {} CASCADE", q_schema);
         let client = self.pool.get().await.map_err(err_msg)?;
         client.batch_execute(&ddl).await.map_err(err_msg)?;
-        client.execute("DELETE FROM mdb_meta.collections WHERE db = $1", &[&db]).await.map_err(err_msg)?;
-        client.execute("DELETE FROM mdb_meta.databases WHERE db = $1", &[&db]).await.map_err(err_msg)?;
+        client
+            .execute("DELETE FROM mdb_meta.collections WHERE db = $1", &[&db])
+            .await
+            .map_err(err_msg)?;
+        client
+            .execute("DELETE FROM mdb_meta.databases WHERE db = $1", &[&db])
+            .await
+            .map_err(err_msg)?;
         Ok(())
     }
 
-    pub async fn insert_one(&self, db: &str, coll: &str, id: &[u8], bson_bytes: &[u8], json: &serde_json::Value) -> Result<u64> {
+    pub async fn insert_one(
+        &self,
+        db: &str,
+        coll: &str,
+        id: &[u8],
+        bson_bytes: &[u8],
+        json: &serde_json::Value,
+    ) -> Result<u64> {
         self.ensure_collection(db, coll).await?;
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
@@ -170,18 +196,28 @@ impl PgStore {
         Ok(n)
     }
 
-    pub async fn find_simple_docs(&self, db: &str, coll: &str, limit: i64) -> Result<Vec<bson::Document>> {
+    pub async fn find_simple_docs(
+        &self,
+        db: &str,
+        coll: &str,
+        limit: i64,
+    ) -> Result<Vec<bson::Document>> {
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
-        let sql = format!("SELECT doc_bson, doc FROM {}.{} ORDER BY id ASC LIMIT $1", q_schema, q_table);
+        let sql = format!(
+            "SELECT doc_bson, doc FROM {}.{} ORDER BY id ASC LIMIT $1",
+            q_schema, q_table
+        );
         let t = Instant::now();
         let client = self.pool.get().await.map_err(err_msg)?;
         let rows = match client.query(&sql, &[&limit]).await {
             Ok(r) => r,
             Err(e) => {
                 let msg = e.to_string();
-                if msg.contains("does not exist") { return Ok(Vec::new()); }
+                if msg.contains("does not exist") {
+                    return Ok(Vec::new());
+                }
                 return Err(err_msg(e));
             }
         };
@@ -202,18 +238,29 @@ impl PgStore {
         Ok(out)
     }
 
-    pub async fn find_by_id_docs(&self, db: &str, coll: &str, id: &[u8], limit: i64) -> Result<Vec<bson::Document>> {
+    pub async fn find_by_id_docs(
+        &self,
+        db: &str,
+        coll: &str,
+        id: &[u8],
+        limit: i64,
+    ) -> Result<Vec<bson::Document>> {
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
-        let sql = format!("SELECT doc_bson, doc FROM {}.{} WHERE id = $1 LIMIT $2", q_schema, q_table);
+        let sql = format!(
+            "SELECT doc_bson, doc FROM {}.{} WHERE id = $1 LIMIT $2",
+            q_schema, q_table
+        );
         let t = Instant::now();
         let client = self.pool.get().await.map_err(err_msg)?;
         let rows = match client.query(&sql, &[&id, &limit]).await {
             Ok(r) => r,
             Err(e) => {
                 let msg = e.to_string();
-                if msg.contains("does not exist") { return Ok(Vec::new()); }
+                if msg.contains("does not exist") {
+                    return Ok(Vec::new());
+                }
                 return Err(err_msg(e));
             }
         };
@@ -251,7 +298,9 @@ impl PgStore {
 
         for (k, v) in filter.iter() {
             // skip _id here; server handles id fast path
-            if k == "_id" { continue; }
+            if k == "_id" {
+                continue;
+            }
             let path = jsonpath_path(k);
             match v {
                 bson::Bson::Document(d) => {
@@ -261,7 +310,10 @@ impl PgStore {
                                 if let bson::Bson::Document(em) = val {
                                     if let Some(pred) = build_elem_match_pred(&path, em) {
                                         let jsonpath = format!("{}[*] ? ({})", path, pred);
-                                        where_clauses.push(format!("jsonb_path_exists(doc, '{}')", escape_single(&jsonpath)));
+                                        where_clauses.push(format!(
+                                            "jsonb_path_exists(doc, '{}')",
+                                            escape_single(&jsonpath)
+                                        ));
                                     }
                                 }
                             }
@@ -270,7 +322,10 @@ impl PgStore {
                                 let clause = if exists {
                                     format!("jsonb_path_exists(doc, '{}')", escape_single(&path))
                                 } else {
-                                    format!("NOT jsonb_path_exists(doc, '{}')", escape_single(&path))
+                                    format!(
+                                        "NOT jsonb_path_exists(doc, '{}')",
+                                        escape_single(&path)
+                                    )
                                 };
                                 where_clauses.push(clause);
                             }
@@ -278,29 +333,64 @@ impl PgStore {
                                 if let bson::Bson::Array(arr) = val {
                                     let mut preds: Vec<String> = Vec::new();
                                     for item in arr {
-                                        if let Some(lit) = json_literal_from_bson(item) { preds.push(format!("@ == {}", lit)); }
+                                        if let Some(lit) = json_literal_from_bson(item) {
+                                            preds.push(format!("@ == {}", lit));
+                                        }
                                     }
-                                    if preds.is_empty() { where_clauses.push("FALSE".to_string()); }
-                                    else {
+                                    if preds.is_empty() {
+                                        where_clauses.push("FALSE".to_string());
+                                    } else {
                                         let predicate = preds.join(" || ");
-                                        let p1 = format!("jsonb_path_exists(doc, '{} ? ({} )')", escape_single(&path), predicate);
-                                        let p2 = format!("jsonb_path_exists(doc, '{}[*] ? ({} )')", escape_single(&path), predicate);
+                                        let p1 = format!(
+                                            "jsonb_path_exists(doc, '{} ? ({} )')",
+                                            escape_single(&path),
+                                            predicate
+                                        );
+                                        let p2 = format!(
+                                            "jsonb_path_exists(doc, '{}[*] ? ({} )')",
+                                            escape_single(&path),
+                                            predicate
+                                        );
                                         where_clauses.push(format!("({} OR {})", p1, p2));
                                     }
                                 }
                             }
                             "$gt" | "$gte" | "$lt" | "$lte" => {
-                                let op_sql = match op.as_str() { "$gt" => ">", "$gte" => ">=", "$lt" => "<", "$lte" => "<=", _ => unreachable!() };
+                                let op_sql = match op.as_str() {
+                                    "$gt" => ">",
+                                    "$gte" => ">=",
+                                    "$lt" => "<",
+                                    "$lte" => "<=",
+                                    _ => unreachable!(),
+                                };
                                 if let Some(lit) = json_literal_from_bson(val) {
-                                    let p1 = format!("jsonb_path_exists(doc, '{} ? (@ {} {} )')", escape_single(&path), op_sql, lit);
-                                    let p2 = format!("jsonb_path_exists(doc, '{}[*] ? (@ {} {} )')", escape_single(&path), op_sql, lit);
+                                    let p1 = format!(
+                                        "jsonb_path_exists(doc, '{} ? (@ {} {} )')",
+                                        escape_single(&path),
+                                        op_sql,
+                                        lit
+                                    );
+                                    let p2 = format!(
+                                        "jsonb_path_exists(doc, '{}[*] ? (@ {} {} )')",
+                                        escape_single(&path),
+                                        op_sql,
+                                        lit
+                                    );
                                     where_clauses.push(format!("({} OR {})", p1, p2));
                                 }
                             }
                             "$eq" => {
                                 if let Some(lit) = json_literal_from_bson(val) {
-                                    let p1 = format!("jsonb_path_exists(doc, '{} ? (@ == {} )')", escape_single(&path), lit);
-                                    let p2 = format!("jsonb_path_exists(doc, '{}[*] ? (@ == {} )')", escape_single(&path), lit);
+                                    let p1 = format!(
+                                        "jsonb_path_exists(doc, '{} ? (@ == {} )')",
+                                        escape_single(&path),
+                                        lit
+                                    );
+                                    let p2 = format!(
+                                        "jsonb_path_exists(doc, '{}[*] ? (@ == {} )')",
+                                        escape_single(&path),
+                                        lit
+                                    );
                                     where_clauses.push(format!("({} OR {})", p1, p2));
                                 }
                             }
@@ -310,8 +400,16 @@ impl PgStore {
                 }
                 _ => {
                     if let Some(lit) = json_literal_from_bson(v) {
-                        let p1 = format!("jsonb_path_exists(doc, '{} ? (@ == {} )')", escape_single(&path), lit);
-                        let p2 = format!("jsonb_path_exists(doc, '{}[*] ? (@ == {} )')", escape_single(&path), lit);
+                        let p1 = format!(
+                            "jsonb_path_exists(doc, '{} ? (@ == {} )')",
+                            escape_single(&path),
+                            lit
+                        );
+                        let p2 = format!(
+                            "jsonb_path_exists(doc, '{}[*] ? (@ == {} )')",
+                            escape_single(&path),
+                            lit
+                        );
                         where_clauses.push(format!("({} OR {})", p1, p2));
                     }
                 }
@@ -401,7 +499,9 @@ impl PgStore {
                 Err(e) => {
                     let msg = e.to_string();
                     // If the schema or table doesn't exist, emulate Mongo and return empty
-                    if msg.contains("does not exist") { return Ok(Vec::new()); }
+                    if msg.contains("does not exist") {
+                        return Ok(Vec::new());
+                    }
                     return Err(err_msg(e));
                 }
             };
@@ -442,7 +542,9 @@ impl PgStore {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = e.to_string();
-                    if msg.contains("does not exist") { return Ok(Vec::new()); }
+                    if msg.contains("does not exist") {
+                        return Ok(Vec::new());
+                    }
                     return Err(err_msg(e));
                 }
             };
@@ -451,19 +553,33 @@ impl PgStore {
                 let bson_bytes: Option<Vec<u8>> = r.try_get(0).ok();
                 if let Some(bytes) = bson_bytes {
                     if let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes)) {
-                        out.push(if let Some(p) = projection { project_document(&doc, p) } else { doc });
+                        out.push(if let Some(p) = projection {
+                            project_document(&doc, p)
+                        } else {
+                            doc
+                        });
                         continue;
                     }
                 }
                 let json: serde_json::Value = r.get(1);
                 let d = to_doc_from_json(json);
-                out.push(if let Some(p) = projection { project_document(&d, p) } else { d });
+                out.push(if let Some(p) = projection {
+                    project_document(&d, p)
+                } else {
+                    d
+                });
             }
             tracing::debug!(op="find_docs", db=%db, coll=%coll, elapsed_ms=?t.elapsed().as_millis());
             Ok(out)
         }
     }
-    pub async fn find_by_subdoc(&self, db: &str, coll: &str, subdoc: &serde_json::Value, limit: i64) -> Result<Vec<bson::Document>> {
+    pub async fn find_by_subdoc(
+        &self,
+        db: &str,
+        coll: &str,
+        subdoc: &serde_json::Value,
+        limit: i64,
+    ) -> Result<Vec<bson::Document>> {
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
@@ -473,7 +589,10 @@ impl PgStore {
         );
         let t = Instant::now();
         let client = self.pool.get().await.map_err(err_msg)?;
-        let rows = client.query(&sql, &[&subdoc, &limit]).await.map_err(err_msg)?;
+        let rows = client
+            .query(&sql, &[&subdoc, &limit])
+            .await
+            .map_err(err_msg)?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
             let bson_bytes: Option<Vec<u8>> = r.try_get(0).ok();
@@ -485,14 +604,25 @@ impl PgStore {
             }
             let json: serde_json::Value = r.get(1);
             let b = bson::to_bson(&json).unwrap_or(bson::Bson::Document(bson::Document::new()));
-            let doc = match b { bson::Bson::Document(d) => d, _ => bson::Document::new() };
+            let doc = match b {
+                bson::Bson::Document(d) => d,
+                _ => bson::Document::new(),
+            };
             out.push(doc);
         }
         tracing::debug!(op="find_by_subdoc", db=%db, coll=%coll, elapsed_ms=?t.elapsed().as_millis());
         Ok(out)
     }
 
-    pub async fn create_index_single_field(&self, db: &str, coll: &str, name: &str, field: &str, _order: i32, spec: &serde_json::Value) -> Result<()> {
+    pub async fn create_index_single_field(
+        &self,
+        db: &str,
+        coll: &str,
+        name: &str,
+        field: &str,
+        _order: i32,
+        spec: &serde_json::Value,
+    ) -> Result<()> {
         // Ensure collection (schema/table) exists
         self.ensure_collection(db, coll).await?;
         // Create an expression index on the extracted text value
@@ -505,7 +635,10 @@ impl PgStore {
         // e.g., USING btree ((doc->>'field'))
         let expr = format!("((doc->>'{}'))", field_escaped);
         let t = Instant::now();
-        let ddl = format!("CREATE INDEX IF NOT EXISTS {} ON {}.{} USING btree {}", q_idx, q_schema, q_table, expr);
+        let ddl = format!(
+            "CREATE INDEX IF NOT EXISTS {} ON {}.{} USING btree {}",
+            q_idx, q_schema, q_table, expr
+        );
         let client = self.pool.get().await.map_err(err_msg)?;
         client.batch_execute(&ddl).await.map_err(err_msg)?;
         // Persist metadata
@@ -528,7 +661,10 @@ impl PgStore {
         let client = self.pool.get().await.map_err(err_msg)?;
         client.batch_execute(&ddl).await.map_err(err_msg)?;
         let n = client
-            .execute("DELETE FROM mdb_meta.indexes WHERE db=$1 AND coll=$2 AND name=$3", &[&db, &coll, &name])
+            .execute(
+                "DELETE FROM mdb_meta.indexes WHERE db=$1 AND coll=$2 AND name=$3",
+                &[&db, &coll, &name],
+            )
             .await
             .map_err(err_msg)?;
         Ok(n > 0)
@@ -537,13 +673,23 @@ impl PgStore {
     pub async fn list_index_names(&self, db: &str, coll: &str) -> Result<Vec<String>> {
         let client = self.pool.get().await.map_err(err_msg)?;
         let rows = client
-            .query("SELECT name FROM mdb_meta.indexes WHERE db=$1 AND coll=$2", &[&db, &coll])
+            .query(
+                "SELECT name FROM mdb_meta.indexes WHERE db=$1 AND coll=$2",
+                &[&db, &coll],
+            )
             .await
             .map_err(err_msg)?;
         Ok(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
-    pub async fn create_index_compound(&self, db: &str, coll: &str, name: &str, fields: &[(String, i32)], spec: &serde_json::Value) -> Result<()> {
+    pub async fn create_index_compound(
+        &self,
+        db: &str,
+        coll: &str,
+        name: &str,
+        fields: &[(String, i32)],
+        spec: &serde_json::Value,
+    ) -> Result<()> {
         // Ensure collection (schema/table) exists
         self.ensure_collection(db, coll).await?;
         let schema = schema_name(db);
@@ -559,7 +705,10 @@ impl PgStore {
         }
         let elems_joined = elems.join(", ");
         let t = Instant::now();
-        let ddl = format!("CREATE INDEX IF NOT EXISTS {} ON {}.{} USING btree ({})", q_idx, q_schema, q_table, elems_joined);
+        let ddl = format!(
+            "CREATE INDEX IF NOT EXISTS {} ON {}.{} USING btree ({})",
+            q_idx, q_schema, q_table, elems_joined
+        );
         let client = self.pool.get().await.map_err(err_msg)?;
         client.batch_execute(&ddl).await.map_err(err_msg)?;
         client
@@ -573,12 +722,22 @@ impl PgStore {
         Ok(())
     }
 
-    pub async fn count_docs(&self, db: &str, coll: &str, filter: Option<&bson::Document>) -> Result<i64> {
+    pub async fn count_docs(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: Option<&bson::Document>,
+    ) -> Result<i64> {
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
-        let where_sql = filter.map(build_where_from_filter).unwrap_or_else(|| "TRUE".to_string());
-        let sql = format!("SELECT COUNT(*) FROM {}.{} WHERE {}", q_schema, q_table, where_sql);
+        let where_sql = filter
+            .map(build_where_from_filter)
+            .unwrap_or_else(|| "TRUE".to_string());
+        let sql = format!(
+            "SELECT COUNT(*) FROM {}.{} WHERE {}",
+            q_schema, q_table, where_sql
+        );
         let t = Instant::now();
         let client = self.pool.get().await.map_err(err_msg)?;
         let res = client.query_one(&sql, &[]).await;
@@ -590,7 +749,11 @@ impl PgStore {
             }
             Err(e) => {
                 let msg = e.to_string();
-                if msg.contains("does not exist") { Ok(0) } else { Err(err_msg(e)) }
+                if msg.contains("does not exist") {
+                    Ok(0)
+                } else {
+                    Err(err_msg(e))
+                }
             }
         }
     }
@@ -598,16 +761,26 @@ impl PgStore {
     // --- Update/Delete helpers (basic) ---
 
     /// Find one matching document for update, returning (id bytes, document).
-    pub async fn find_one_for_update(&self, db: &str, coll: &str, filter: &bson::Document) -> Result<Option<(Vec<u8>, bson::Document)>> {
+    pub async fn find_one_for_update(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &bson::Document,
+    ) -> Result<Option<(Vec<u8>, bson::Document)>> {
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
         // Fast path: _id equality
         if let Some(idb) = filter.get("_id").and_then(id_bytes_from_bson) {
-            let sql = format!("SELECT id, doc_bson, doc FROM {}.{} WHERE id = $1 LIMIT 1", q_schema, q_table);
+            let sql = format!(
+                "SELECT id, doc_bson, doc FROM {}.{} WHERE id = $1 LIMIT 1",
+                q_schema, q_table
+            );
             let client = self.pool.get().await.map_err(err_msg)?;
             let rows = client.query(&sql, &[&idb]).await.map_err(err_msg)?;
-            if rows.is_empty() { return Ok(None); }
+            if rows.is_empty() {
+                return Ok(None);
+            }
             let r = &rows[0];
             let id: Vec<u8> = r.get(0);
             if let Ok(bytes) = r.try_get::<usize, Vec<u8>>(1) {
@@ -617,7 +790,10 @@ impl PgStore {
             }
             let json: serde_json::Value = r.get(2);
             let b = bson::to_bson(&json).unwrap_or(bson::Bson::Document(bson::Document::new()));
-            let doc = match b { bson::Bson::Document(d) => d, _ => bson::Document::new() };
+            let doc = match b {
+                bson::Bson::Document(d) => d,
+                _ => bson::Document::new(),
+            };
             return Ok(Some((id, doc)));
         }
         let where_spec = build_where_spec(filter);
@@ -639,7 +815,9 @@ impl PgStore {
                 client.query(&sql, &[]).await.map_err(err_msg)?
             }
         };
-        if rows.is_empty() { return Ok(None); }
+        if rows.is_empty() {
+            return Ok(None);
+        }
         let r = &rows[0];
         let id: Vec<u8> = r.get(0);
         // Prefer bson if present
@@ -650,28 +828,48 @@ impl PgStore {
         }
         let json: serde_json::Value = r.get(2);
         let b = bson::to_bson(&json).unwrap_or(bson::Bson::Document(bson::Document::new()));
-        let doc = match b { bson::Bson::Document(d) => d, _ => bson::Document::new() };
+        let doc = match b {
+            bson::Bson::Document(d) => d,
+            _ => bson::Document::new(),
+        };
         tracing::debug!(op="find_one_for_update", db=%db, coll=%coll, elapsed_ms=?t.elapsed().as_millis());
         Ok(Some((id, doc)))
     }
 
     /// Overwrite the full document by id (updates both doc_bson and doc JSON).
-    pub async fn update_doc_by_id(&self, db: &str, coll: &str, id: &[u8], new_doc: &bson::Document) -> Result<u64> {
+    pub async fn update_doc_by_id(
+        &self,
+        db: &str,
+        coll: &str,
+        id: &[u8],
+        new_doc: &bson::Document,
+    ) -> Result<u64> {
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
-        let sql = format!("UPDATE {}.{} SET doc_bson = $1, doc = $2 WHERE id = $3", q_schema, q_table);
+        let sql = format!(
+            "UPDATE {}.{} SET doc_bson = $1, doc = $2 WHERE id = $3",
+            q_schema, q_table
+        );
         let bson_bytes = bson::to_vec(new_doc).map_err(err_msg)?;
         let json = serde_json::to_value(new_doc).map_err(err_msg)?;
         let t = Instant::now();
         let client = self.pool.get().await.map_err(err_msg)?;
-        let n = client.execute(&sql, &[&bson_bytes, &json, &id]).await.map_err(err_msg)?;
+        let n = client
+            .execute(&sql, &[&bson_bytes, &json, &id])
+            .await
+            .map_err(err_msg)?;
         tracing::debug!(op="update_doc_by_id", db=%db, coll=%coll, elapsed_ms=?t.elapsed().as_millis());
         Ok(n)
     }
 
     /// Delete one matching row based on filter; returns number of rows deleted (0 or 1).
-    pub async fn delete_one_by_filter(&self, db: &str, coll: &str, filter: &bson::Document) -> Result<u64> {
+    pub async fn delete_one_by_filter(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &bson::Document,
+    ) -> Result<u64> {
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
@@ -685,15 +883,24 @@ impl PgStore {
         let where_spec = build_where_spec(filter);
         let select_sql = format!(
             "SELECT id FROM {}.{} WHERE {} ORDER BY id ASC LIMIT 1",
-            q_schema, q_table, match &where_spec { WhereSpec::Raw(s) => s.as_str(), _ => "doc @> $1::jsonb" }
+            q_schema,
+            q_table,
+            match &where_spec {
+                WhereSpec::Raw(s) => s.as_str(),
+                _ => "doc @> $1::jsonb",
+            }
         );
         let t = Instant::now();
         let client = self.pool.get().await.map_err(err_msg)?;
         let rows = match &where_spec {
-            WhereSpec::Containment(val) => client.query(&select_sql, &[val]).await.map_err(err_msg)?,
+            WhereSpec::Containment(val) => {
+                client.query(&select_sql, &[val]).await.map_err(err_msg)?
+            }
             WhereSpec::Raw(_) => client.query(&select_sql, &[]).await.map_err(err_msg)?,
         };
-        if rows.is_empty() { return Ok(0); }
+        if rows.is_empty() {
+            return Ok(0);
+        }
         let id: Vec<u8> = rows[0].get(0);
         let del_sql = format!("DELETE FROM {}.{} WHERE id = $1", q_schema, q_table);
         let n = client.execute(&del_sql, &[&id]).await.map_err(err_msg)?;
@@ -702,7 +909,12 @@ impl PgStore {
     }
 
     /// Delete many rows matching filter; returns number of rows deleted.
-    pub async fn delete_many_by_filter(&self, db: &str, coll: &str, filter: &bson::Document) -> Result<u64> {
+    pub async fn delete_many_by_filter(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &bson::Document,
+    ) -> Result<u64> {
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
@@ -711,7 +923,10 @@ impl PgStore {
         let client = self.pool.get().await.map_err(err_msg)?;
         let n = match where_spec {
             WhereSpec::Containment(val) => {
-                let sql = format!("DELETE FROM {}.{} WHERE doc @> $1::jsonb", q_schema, q_table);
+                let sql = format!(
+                    "DELETE FROM {}.{} WHERE doc @> $1::jsonb",
+                    q_schema, q_table
+                );
                 client.execute(&sql, &[&val]).await.map_err(err_msg)?
             }
             WhereSpec::Raw(where_sql) => {
@@ -746,7 +961,9 @@ fn escape_single(s: &str) -> String {
 fn build_where_from_filter(filter: &bson::Document) -> String {
     let mut where_clauses: Vec<String> = Vec::new();
     for (k, v) in filter.iter() {
-        if k == "_id" { continue; }
+        if k == "_id" {
+            continue;
+        }
         let path = jsonpath_path(k);
         match v {
             bson::Bson::Document(d) => {
@@ -757,7 +974,8 @@ fn build_where_from_filter(filter: &bson::Document) -> String {
                                 if let Some(pred) = build_elem_match_pred(&path, em) {
                                     where_clauses.push(format!(
                                         "jsonb_path_exists(doc, '{}[*] ? ({} )')",
-                                        escape_single(&path), pred
+                                        escape_single(&path),
+                                        pred
                                     ));
                                 }
                             }
@@ -774,29 +992,64 @@ fn build_where_from_filter(filter: &bson::Document) -> String {
                             if let bson::Bson::Array(arr) = val {
                                 let mut preds: Vec<String> = Vec::new();
                                 for item in arr {
-                                    if let Some(lit) = json_literal_from_bson(item) { preds.push(format!("@ == {}", lit)); }
+                                    if let Some(lit) = json_literal_from_bson(item) {
+                                        preds.push(format!("@ == {}", lit));
+                                    }
                                 }
-                                if preds.is_empty() { where_clauses.push("FALSE".to_string()); }
-                                else {
+                                if preds.is_empty() {
+                                    where_clauses.push("FALSE".to_string());
+                                } else {
                                     let predicate = preds.join(" || ");
-                                    let p1 = format!("jsonb_path_exists(doc, '{} ? ({} )')", escape_single(&path), predicate);
-                                    let p2 = format!("jsonb_path_exists(doc, '{}[*] ? ({} )')", escape_single(&path), predicate);
+                                    let p1 = format!(
+                                        "jsonb_path_exists(doc, '{} ? ({} )')",
+                                        escape_single(&path),
+                                        predicate
+                                    );
+                                    let p2 = format!(
+                                        "jsonb_path_exists(doc, '{}[*] ? ({} )')",
+                                        escape_single(&path),
+                                        predicate
+                                    );
                                     where_clauses.push(format!("({} OR {})", p1, p2));
                                 }
                             }
                         }
                         "$gt" | "$gte" | "$lt" | "$lte" => {
-                            let op_sql = match op.as_str() { "$gt" => ">", "$gte" => ">=", "$lt" => "<", "$lte" => "<=", _ => unreachable!() };
+                            let op_sql = match op.as_str() {
+                                "$gt" => ">",
+                                "$gte" => ">=",
+                                "$lt" => "<",
+                                "$lte" => "<=",
+                                _ => unreachable!(),
+                            };
                             if let Some(lit) = json_literal_from_bson(val) {
-                                let p1 = format!("jsonb_path_exists(doc, '{} ? (@ {} {} )')", escape_single(&path), op_sql, lit);
-                                let p2 = format!("jsonb_path_exists(doc, '{}[*] ? (@ {} {} )')", escape_single(&path), op_sql, lit);
+                                let p1 = format!(
+                                    "jsonb_path_exists(doc, '{} ? (@ {} {} )')",
+                                    escape_single(&path),
+                                    op_sql,
+                                    lit
+                                );
+                                let p2 = format!(
+                                    "jsonb_path_exists(doc, '{}[*] ? (@ {} {} )')",
+                                    escape_single(&path),
+                                    op_sql,
+                                    lit
+                                );
                                 where_clauses.push(format!("({} OR {})", p1, p2));
                             }
                         }
                         "$eq" => {
                             if let Some(lit) = json_literal_from_bson(val) {
-                                let p1 = format!("jsonb_path_exists(doc, '{} ? (@ == {} )')", escape_single(&path), lit);
-                                let p2 = format!("jsonb_path_exists(doc, '{}[*] ? (@ == {} )')", escape_single(&path), lit);
+                                let p1 = format!(
+                                    "jsonb_path_exists(doc, '{} ? (@ == {} )')",
+                                    escape_single(&path),
+                                    lit
+                                );
+                                let p2 = format!(
+                                    "jsonb_path_exists(doc, '{}[*] ? (@ == {} )')",
+                                    escape_single(&path),
+                                    lit
+                                );
                                 where_clauses.push(format!("({} OR {})", p1, p2));
                             }
                         }
@@ -806,14 +1059,26 @@ fn build_where_from_filter(filter: &bson::Document) -> String {
             }
             _ => {
                 if let Some(lit) = json_literal_from_bson(v) {
-                    let p1 = format!("jsonb_path_exists(doc, '{} ? (@ == {} )')", escape_single(&path), lit);
-                    let p2 = format!("jsonb_path_exists(doc, '{}[*] ? (@ == {} )')", escape_single(&path), lit);
+                    let p1 = format!(
+                        "jsonb_path_exists(doc, '{} ? (@ == {} )')",
+                        escape_single(&path),
+                        lit
+                    );
+                    let p2 = format!(
+                        "jsonb_path_exists(doc, '{}[*] ? (@ == {} )')",
+                        escape_single(&path),
+                        lit
+                    );
                     where_clauses.push(format!("({} OR {})", p1, p2));
                 }
             }
         }
     }
-    if where_clauses.is_empty() { String::from("TRUE") } else { where_clauses.join(" AND ") }
+    if where_clauses.is_empty() {
+        String::from("TRUE")
+    } else {
+        where_clauses.join(" AND ")
+    }
 }
 
 enum WhereSpec {
@@ -838,14 +1103,22 @@ fn build_where_spec(filter: &bson::Document) -> WhereSpec {
     use serde_json::{Map, Value};
     let mut m = Map::new();
     for (k, v) in filter.iter() {
-        if k == "_id" { continue; } // server has fast path; avoid ambiguity
-        if k.contains('.') { return WhereSpec::Raw(build_where_from_filter(filter)); }
+        if k == "_id" {
+            continue;
+        } // server has fast path; avoid ambiguity
+        if k.contains('.') {
+            return WhereSpec::Raw(build_where_from_filter(filter));
+        }
         match v {
             bson::Bson::Document(d) => {
                 if d.len() == 1 {
                     if let Some(eqv) = d.get("$eq") {
-                        if let Some(jv) = json_value_from_bson(eqv) { m.insert(k.clone(), jv); continue; }
-                        else { return WhereSpec::Raw(build_where_from_filter(filter)); }
+                        if let Some(jv) = json_value_from_bson(eqv) {
+                            m.insert(k.clone(), jv);
+                            continue;
+                        } else {
+                            return WhereSpec::Raw(build_where_from_filter(filter));
+                        }
                     } else {
                         return WhereSpec::Raw(build_where_from_filter(filter));
                     }
@@ -854,13 +1127,19 @@ fn build_where_spec(filter: &bson::Document) -> WhereSpec {
                 }
             }
             other => {
-                if let Some(jv) = json_value_from_bson(other) { m.insert(k.clone(), jv); }
-                else { return WhereSpec::Raw(build_where_from_filter(filter)); }
+                if let Some(jv) = json_value_from_bson(other) {
+                    m.insert(k.clone(), jv);
+                } else {
+                    return WhereSpec::Raw(build_where_from_filter(filter));
+                }
             }
         }
     }
-    if m.is_empty() { WhereSpec::Raw(build_where_from_filter(filter)) }
-    else { WhereSpec::Containment(Value::Object(m)) }
+    if m.is_empty() {
+        WhereSpec::Raw(build_where_from_filter(filter))
+    } else {
+        WhereSpec::Containment(Value::Object(m))
+    }
 }
 
 fn build_order_by(sort: Option<&bson::Document>) -> String {
@@ -868,15 +1147,31 @@ fn build_order_by(sort: Option<&bson::Document>) -> String {
     let mut has_id = false;
     if let Some(spec) = sort {
         for (k, v) in spec.iter() {
-            let dir = match v { bson::Bson::Int32(n) => *n, bson::Bson::Int64(n) => *n as i32, bson::Bson::Double(f) => if *f < 0.0 { -1 } else { 1 }, _ => 1 };
+            let dir = match v {
+                bson::Bson::Int32(n) => *n,
+                bson::Bson::Int64(n) => *n as i32,
+                bson::Bson::Double(f) => {
+                    if *f < 0.0 {
+                        -1
+                    } else {
+                        1
+                    }
+                }
+                _ => 1,
+            };
             let ord = if dir < 0 { "DESC" } else { "ASC" };
-            if k == "_id" { has_id = true; parts.push(format!("id {}", ord)); }
-            else {
+            if k == "_id" {
+                has_id = true;
+                parts.push(format!("id {}", ord));
+            } else {
                 let f = escape_single(k);
                 // Heuristic: numbers before strings, then numeric ASC/DESC, then text ASC/DESC
                 let numeric_re = format!("(doc->>'{}') ~ '^[+-]?[0-9]+(\\.[0-9]+)?$'", f);
                 let num_first = format!("(CASE WHEN {} THEN 0 ELSE 1 END) ASC", numeric_re);
-                let num_val = format!("(CASE WHEN {} THEN (doc->>'{}')::double precision END) {}", numeric_re, f, ord);
+                let num_val = format!(
+                    "(CASE WHEN {} THEN (doc->>'{}')::double precision END) {}",
+                    numeric_re, f, ord
+                );
                 let text_val = format!("(doc->>'{}') {}", f, ord);
                 parts.push(num_first);
                 parts.push(num_val);
@@ -884,33 +1179,61 @@ fn build_order_by(sort: Option<&bson::Document>) -> String {
             }
         }
     }
-    if !has_id { parts.push("id ASC".to_string()); }
+    if !has_id {
+        parts.push("id ASC".to_string());
+    }
     format!("ORDER BY {}", parts.join(", "))
 }
 
 fn projection_pushdown_sql(projection: Option<&bson::Document>) -> Option<String> {
     let proj = projection?;
-    if proj.is_empty() { return None; }
+    if proj.is_empty() {
+        return None;
+    }
     // only allow inclusive projections with possible _id exclusion
     let mut include_fields: Vec<String> = Vec::new();
     let mut include_id = true;
     for (k, v) in proj.iter() {
         if k == "_id" {
-            match v { bson::Bson::Int32(n) if *n == 0 => include_id = false, bson::Bson::Boolean(b) if !*b => include_id = false, _ => {} }
+            match v {
+                bson::Bson::Int32(n) if *n == 0 => include_id = false,
+                bson::Bson::Boolean(b) if !*b => include_id = false,
+                _ => {}
+            }
             continue;
         }
-        let on = match v { bson::Bson::Int32(n) => *n != 0, bson::Bson::Boolean(b) => *b, _ => false };
+        let on = match v {
+            bson::Bson::Int32(n) => *n != 0,
+            bson::Bson::Boolean(b) => *b,
+            _ => false,
+        };
         if on {
             // Only top-level fields qualify for pushdown; dotted paths require server-side projection
-            if k.contains('.') { return None; }
+            if k.contains('.') {
+                return None;
+            }
             include_fields.push(k.clone());
-        } else { return None; }
+        } else {
+            return None;
+        }
     }
-    if include_fields.is_empty() && include_id { return None; }
+    if include_fields.is_empty() && include_id {
+        return None;
+    }
     let mut elems: Vec<String> = Vec::new();
-    if include_id { elems.push("'_id', doc->'_id'".to_string()); }
-    for f in include_fields { elems.push(format!("'{}', doc->'{}'", escape_single(&f), escape_single(&f))); }
-    if elems.is_empty() { return None; }
+    if include_id {
+        elems.push("'_id', doc->'_id'".to_string());
+    }
+    for f in include_fields {
+        elems.push(format!(
+            "'{}', doc->'{}'",
+            escape_single(&f),
+            escape_single(&f)
+        ));
+    }
+    if elems.is_empty() {
+        return None;
+    }
     Some(format!("jsonb_build_object({})", elems.join(", ")))
 }
 
@@ -921,12 +1244,19 @@ fn json_to_bson(v: &serde_json::Value) -> bson::Bson {
         Value::Bool(b) => bson::Bson::Boolean(*b),
         Value::Number(num) => {
             if let Some(i) = num.as_i64() {
-                if i >= i32::MIN as i64 && i <= i32::MAX as i64 { bson::Bson::Int32(i as i32) }
-                else { bson::Bson::Int64(i) }
+                if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
+                    bson::Bson::Int32(i as i32)
+                } else {
+                    bson::Bson::Int64(i)
+                }
             } else if let Some(u) = num.as_u64() {
-                if u <= i32::MAX as u64 { bson::Bson::Int32(u as i32) }
-                else if u <= i64::MAX as u64 { bson::Bson::Int64(u as i64) }
-                else { bson::Bson::Double(u as f64) }
+                if u <= i32::MAX as u64 {
+                    bson::Bson::Int32(u as i32)
+                } else if u <= i64::MAX as u64 {
+                    bson::Bson::Int64(u as i64)
+                } else {
+                    bson::Bson::Double(u as f64)
+                }
             } else if let Some(f) = num.as_f64() {
                 bson::Bson::Double(f)
             } else {
@@ -937,14 +1267,19 @@ fn json_to_bson(v: &serde_json::Value) -> bson::Bson {
         Value::Array(arr) => bson::Bson::Array(arr.iter().map(json_to_bson).collect()),
         Value::Object(map) => {
             let mut d = bson::Document::new();
-            for (k, v) in map.iter() { d.insert(k.clone(), json_to_bson(v)); }
+            for (k, v) in map.iter() {
+                d.insert(k.clone(), json_to_bson(v));
+            }
             bson::Bson::Document(d)
         }
     }
 }
 
 fn to_doc_from_json(json: serde_json::Value) -> bson::Document {
-    match json_to_bson(&json) { bson::Bson::Document(d) => d, _ => bson::Document::new() }
+    match json_to_bson(&json) {
+        bson::Bson::Document(d) => d,
+        _ => bson::Document::new(),
+    }
 }
 
 fn jsonpath_path(key: &str) -> String {
@@ -996,10 +1331,16 @@ fn build_elem_match_pred(_path: &str, em: &bson::Document) -> Option<String> {
                 "$eq" => ("==", json_literal_from_bson(val)),
                 _ => ("", None),
             };
-            if sql_op.is_empty() || lit.is_none() { continue; }
+            if sql_op.is_empty() || lit.is_none() {
+                continue;
+            }
             clauses.push(format!("@ {} {}", sql_op, lit.unwrap()));
         }
-        if clauses.is_empty() { None } else { Some(clauses.join(" && ")) }
+        if clauses.is_empty() {
+            None
+        } else {
+            Some(clauses.join(" && "))
+        }
     } else {
         // subdocument fields
         let mut clauses: Vec<String> = Vec::new();
@@ -1016,7 +1357,9 @@ fn build_elem_match_pred(_path: &str, em: &bson::Document) -> Option<String> {
                             "$eq" => ("==", json_literal_from_bson(val)),
                             _ => ("", None),
                         };
-                        if sql_op.is_empty() || lit.is_none() { continue; }
+                        if sql_op.is_empty() || lit.is_none() {
+                            continue;
+                        }
                         clauses.push(format!("{} {} {}", attr, sql_op, lit.unwrap()));
                     }
                 }
@@ -1027,7 +1370,11 @@ fn build_elem_match_pred(_path: &str, em: &bson::Document) -> Option<String> {
                 }
             }
         }
-        if clauses.is_empty() { None } else { Some(clauses.join(" && ")) }
+        if clauses.is_empty() {
+            None
+        } else {
+            Some(clauses.join(" && "))
+        }
     }
 }
 
@@ -1037,8 +1384,14 @@ fn project_document(doc: &bson::Document, projection: &bson::Document) -> bson::
     let mut include_id = true;
     for (k, v) in projection.iter() {
         if k == "_id" {
-            match v { bson::Bson::Int32(n) if *n == 0 => include_id = false, bson::Bson::Boolean(b) if !*b => include_id = false, _ => {} }
-        } else if matches!(v, bson::Bson::Int32(n) if *n != 0) || matches!(v, bson::Bson::Boolean(true)) {
+            match v {
+                bson::Bson::Int32(n) if *n == 0 => include_id = false,
+                bson::Bson::Boolean(b) if !*b => include_id = false,
+                _ => {}
+            }
+        } else if matches!(v, bson::Bson::Int32(n) if *n != 0)
+            || matches!(v, bson::Bson::Boolean(true))
+        {
             include_mode = true;
         }
     }
@@ -1046,13 +1399,23 @@ fn project_document(doc: &bson::Document, projection: &bson::Document) -> bson::
     if include_mode {
         let mut out = bson::Document::new();
         if include_id {
-            if let Some(idv) = doc.get("_id").cloned() { out.insert("_id", idv); }
+            if let Some(idv) = doc.get("_id").cloned() {
+                out.insert("_id", idv);
+            }
         }
         for (k, v) in projection.iter() {
-            if k == "_id" { continue; }
-            let on = match v { bson::Bson::Int32(n) => *n != 0, bson::Bson::Boolean(b) => *b, _ => false };
+            if k == "_id" {
+                continue;
+            }
+            let on = match v {
+                bson::Bson::Int32(n) => *n != 0,
+                bson::Bson::Boolean(b) => *b,
+                _ => false,
+            };
             if on {
-                if let Some(val) = get_path(doc, k) { set_path(&mut out, k, val); }
+                if let Some(val) = get_path(doc, k) {
+                    set_path(&mut out, k, val);
+                }
             }
         }
         out
@@ -1060,11 +1423,21 @@ fn project_document(doc: &bson::Document, projection: &bson::Document) -> bson::
         // Exclusion mode: start with full doc and remove fields
         let mut out = doc.clone();
         for (k, v) in projection.iter() {
-            if k == "_id" { continue; }
-            let off = match v { bson::Bson::Int32(n) => *n == 0, bson::Bson::Boolean(b) => !*b, _ => false };
-            if off { remove_path(&mut out, k); }
+            if k == "_id" {
+                continue;
+            }
+            let off = match v {
+                bson::Bson::Int32(n) => *n == 0,
+                bson::Bson::Boolean(b) => !*b,
+                _ => false,
+            };
+            if off {
+                remove_path(&mut out, k);
+            }
         }
-        if !include_id { out.remove("_id"); }
+        if !include_id {
+            out.remove("_id");
+        }
         out
     }
 }
@@ -1081,7 +1454,9 @@ fn get_path(doc: &bson::Document, path: &str) -> Option<bson::Bson> {
                     } else {
                         return Some(v.clone());
                     }
-                } else { return None; }
+                } else {
+                    return None;
+                }
             }
             _ => return None,
         }
@@ -1091,7 +1466,9 @@ fn get_path(doc: &bson::Document, path: &str) -> Option<bson::Bson> {
 
 fn set_path(doc: &mut bson::Document, path: &str, value: bson::Bson) {
     let mut segments: Vec<&str> = path.split('.').collect();
-    if segments.is_empty() { return; }
+    if segments.is_empty() {
+        return;
+    }
     let last = segments.pop().unwrap();
     let mut cur = doc;
     for seg in segments {
@@ -1109,12 +1486,16 @@ fn set_path(doc: &mut bson::Document, path: &str, value: bson::Bson) {
 
 fn remove_path(doc: &mut bson::Document, path: &str) {
     let mut segments: Vec<&str> = path.split('.').collect();
-    if segments.is_empty() { return; }
+    if segments.is_empty() {
+        return;
+    }
     let last = segments.pop().unwrap();
     let mut cur = doc;
     for seg in segments {
         match cur.get_mut(seg) {
-            Some(bson::Bson::Document(d)) => { cur = d; }
+            Some(bson::Bson::Document(d)) => {
+                cur = d;
+            }
             _ => return,
         }
     }
@@ -1122,7 +1503,9 @@ fn remove_path(doc: &mut bson::Document, path: &str) {
 }
 
 impl PgStore {
-    pub fn dsn(&self) -> &str { &self.dsn }
+    pub fn dsn(&self) -> &str {
+        &self.dsn
+    }
     pub async fn get_client(&self) -> Result<deadpool_postgres::Object> {
         self.pool.get().await.map_err(err_msg)
     }
@@ -1147,7 +1530,9 @@ impl PgStore {
         );
         match tx.query(&sql, &[]).await {
             Ok(rows) => {
-                if rows.is_empty() { return Ok(None); }
+                if rows.is_empty() {
+                    return Ok(None);
+                }
                 let r = &rows[0];
                 let id: Vec<u8> = r.get(0);
                 if let Ok(bytes) = r.try_get::<usize, Vec<u8>>(1) {
@@ -1157,28 +1542,56 @@ impl PgStore {
                 }
                 let json: serde_json::Value = r.get(2);
                 let b = bson::to_bson(&json).unwrap_or(bson::Bson::Document(bson::Document::new()));
-                let doc = match b { bson::Bson::Document(d) => d, _ => bson::Document::new() };
+                let doc = match b {
+                    bson::Bson::Document(d) => d,
+                    _ => bson::Document::new(),
+                };
                 Ok(Some((id, doc)))
             }
             Err(e) => {
                 let msg = e.to_string();
-                if msg.contains("does not exist") { Ok(None) } else { Err(err_msg(e)) }
+                if msg.contains("does not exist") {
+                    Ok(None)
+                } else {
+                    Err(err_msg(e))
+                }
             }
         }
     }
 
-    pub async fn update_doc_by_id_tx(&self, tx: &Transaction<'_>, db: &str, coll: &str, id: &[u8], new_doc: &bson::Document) -> Result<u64> {
+    pub async fn update_doc_by_id_tx(
+        &self,
+        tx: &Transaction<'_>,
+        db: &str,
+        coll: &str,
+        id: &[u8],
+        new_doc: &bson::Document,
+    ) -> Result<u64> {
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
-        let sql = format!("UPDATE {}.{} SET doc_bson = $1, doc = $2 WHERE id = $3", q_schema, q_table);
+        let sql = format!(
+            "UPDATE {}.{} SET doc_bson = $1, doc = $2 WHERE id = $3",
+            q_schema, q_table
+        );
         let bson_bytes = bson::to_vec(new_doc).map_err(err_msg)?;
         let json = serde_json::to_value(new_doc).map_err(err_msg)?;
-        let n = tx.execute(&sql, &[&bson_bytes, &json, &id]).await.map_err(err_msg)?;
+        let n = tx
+            .execute(&sql, &[&bson_bytes, &json, &id])
+            .await
+            .map_err(err_msg)?;
         Ok(n)
     }
 
-    pub async fn insert_one_tx(&self, tx: &Transaction<'_>, db: &str, coll: &str, id: &[u8], bson_bytes: &[u8], json: &serde_json::Value) -> Result<u64> {
+    pub async fn insert_one_tx(
+        &self,
+        tx: &Transaction<'_>,
+        db: &str,
+        coll: &str,
+        id: &[u8],
+        bson_bytes: &[u8],
+        json: &serde_json::Value,
+    ) -> Result<u64> {
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
@@ -1186,11 +1599,20 @@ impl PgStore {
             "INSERT INTO {}.{} (id, doc_bson, doc) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING",
             q_schema, q_table
         );
-        let n = tx.execute(&sql, &[&id, &bson_bytes, &json]).await.map_err(err_msg)?;
+        let n = tx
+            .execute(&sql, &[&id, &bson_bytes, &json])
+            .await
+            .map_err(err_msg)?;
         Ok(n)
     }
 
-    pub async fn delete_by_id_tx(&self, tx: &Transaction<'_>, db: &str, coll: &str, id: &[u8]) -> Result<u64> {
+    pub async fn delete_by_id_tx(
+        &self,
+        tx: &Transaction<'_>,
+        db: &str,
+        coll: &str,
+        id: &[u8],
+    ) -> Result<u64> {
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);

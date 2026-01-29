@@ -1,5 +1,11 @@
 # AGENTS.md
 
+## Code hygiene
+
+- After each feature implementation, run `cargo fmt --all` and `cargo clippy -- -D warnings`.
+  - Fix all the reported issues.
+- Fix all the warnings reported by `cargo check --all`.
+
 ## Build/Lint/Test Commands
 
 - Build: `cargo build`
@@ -25,34 +31,40 @@
 ## Code Style Guidelines
 
 ### Imports
+
 - Group std imports first, then external crates, then internal modules
 - Use explicit imports rather than glob imports when possible
 - Sort imports alphabetically within each group
 
 ### Formatting
+
 - Use rustfmt for consistent code formatting
 - Max line length: 100 characters
 - Use 4 spaces for indentation (no tabs)
 
 ### Types
+
 - Use explicit types in function signatures
 - Prefer `&str` over `String` for function parameters when possible
 - Use `Option<T>` for values that may be absent
 - Use `Result<T, E>` for operations that may fail
 
 ### Naming Conventions
+
 - Use snake_case for variables and functions
 - Use PascalCase for types and structs
 - Use SCREAMING_SNAKE_CASE for constants
 - Use descriptive names that convey purpose
 
 ### Error Handling
+
 - Use `anyhow::Result` for most error handling
 - Use `thiserror` for defining custom error types
 - Return specific error types with context when appropriate
 - Log errors with tracing rather than printing
 
 ### Documentation
+
 - Document public APIs with rustdoc comments
 - Include examples in documentation when helpful
 - Keep documentation up-to-date with code changes
@@ -71,3 +83,4 @@ None found.
 ## Copilot Instructions
 
 None found.
+

@@ -58,7 +58,11 @@ async fn main() -> anyhow::Result<()> {
 }
 
 #[derive(Debug, Parser, Clone)]
-#[command(name = "oxidedb", version, about = "Mongo wire server on Postgres jsonb")]
+#[command(
+    name = "oxidedb",
+    version,
+    about = "Mongo wire server on Postgres jsonb"
+)]
 struct Cli {
     /// Path to config TOML file
     #[arg(short = 'c', long = "config", env = "OXIDEDB_CONFIG")]

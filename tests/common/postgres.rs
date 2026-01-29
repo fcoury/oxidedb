@@ -1,4 +1,4 @@
-use rand::{distributions::Alphanumeric, Rng};
+use rand::{Rng, distributions::Alphanumeric};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_postgres::NoTls;
 
@@ -16,19 +16,31 @@ impl TestDb {
         };
         let dbname = format!(
             "oxidedb_test_{}_{}",
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
             rand_suffix(6)
         );
         let url = replace_db_name(&admin_url, &dbname);
 
         // Create the database
         let (client, conn) = tokio_postgres::connect(&admin_url, NoTls).await.ok()?;
-        tokio::spawn(async move { let _ = conn.await; });
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
         let qname = q_ident(&dbname);
-        client.batch_execute(&format!("CREATE DATABASE {} TEMPLATE template0", qname)).await.ok()?;
+        client
+            .batch_execute(&format!("CREATE DATABASE {} TEMPLATE template0", qname))
+            .await
+            .ok()?;
         drop(client);
 
-        Some(Self { admin_url, dbname, url })
+        Some(Self {
+            admin_url,
+            dbname,
+            url,
+        })
     }
 }
 
@@ -85,6 +97,9 @@ fn replace_db_name(url: &str, new_db: &str) -> String {
     let prefix = &base[..pos + 1];
     let mut out = String::from(prefix);
     out.push_str(new_db);
-    if let Some(q) = query { out.push('?'); out.push_str(q); }
+    if let Some(q) = query {
+        out.push('?');
+        out.push_str(q);
+    }
     out
 }

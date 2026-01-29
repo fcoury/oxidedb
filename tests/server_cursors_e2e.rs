@@ -1,8 +1,8 @@
 use bson::doc;
 use oxidedb::config::Config;
-use oxidedb::protocol::{decode_op_msg_section0, encode_op_msg, MessageHeader, OP_MSG};
+use oxidedb::protocol::{MessageHeader, OP_MSG, decode_op_msg_section0, encode_op_msg};
 use oxidedb::server::spawn_with_shutdown;
-use rand::{distributions::Alphanumeric, Rng};
+use rand::{Rng, distributions::Alphanumeric};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -11,7 +11,11 @@ use tokio::net::TcpStream;
 mod pg;
 
 fn rand_suffix(n: usize) -> String {
-    rand::thread_rng().sample_iter(&Alphanumeric).take(n).map(char::from).collect()
+    rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(n)
+        .map(char::from)
+        .collect()
 }
 
 async fn read_one_op_msg(stream: &mut TcpStream) -> bson::Document {
@@ -27,7 +31,13 @@ async fn read_one_op_msg(stream: &mut TcpStream) -> bson::Document {
 
 #[tokio::test]
 async fn e2e_cursors_find_getmore_kill() {
-    let testdb = match pg::TestDb::provision_from_env().await { Some(db) => db, None => { eprintln!("skipping: set OXIDEDB_TEST_POSTGRES_URL"); return; } };
+    let testdb = match pg::TestDb::provision_from_env().await {
+        Some(db) => db,
+        None => {
+            eprintln!("skipping: set OXIDEDB_TEST_POSTGRES_URL");
+            return;
+        }
+    };
 
     let mut cfg = Config::default();
     cfg.listen_addr = "127.0.0.1:0".into();
@@ -39,15 +49,21 @@ async fn e2e_cursors_find_getmore_kill() {
     let dbname = format!("cursors_{}", rand_suffix(6));
 
     // create
-    let create = doc!{"create": "u", "$db": &dbname};
+    let create = doc! {"create": "u", "$db": &dbname};
     let msg = encode_op_msg(&create, 0, 1);
     stream.write_all(&msg).await.unwrap();
     let doc = read_one_op_msg(&mut stream).await;
     assert_eq!(doc.get_f64("ok").unwrap_or(0.0), 1.0);
 
     // insert 5 docs
-    let docs = vec![doc!{"i": 1}, doc!{"i": 2}, doc!{"i": 3}, doc!{"i": 4}, doc!{"i": 5}];
-    let ins = doc!{"insert": "u", "documents": docs, "$db": &dbname};
+    let docs = vec![
+        doc! {"i": 1},
+        doc! {"i": 2},
+        doc! {"i": 3},
+        doc! {"i": 4},
+        doc! {"i": 5},
+    ];
+    let ins = doc! {"insert": "u", "documents": docs, "$db": &dbname};
     let msg = encode_op_msg(&ins, 0, 2);
     stream.write_all(&msg).await.unwrap();
     let doc = read_one_op_msg(&mut stream).await;
@@ -55,7 +71,7 @@ async fn e2e_cursors_find_getmore_kill() {
     assert_eq!(doc.get_i32("n").unwrap_or(0), 5);
 
     // find with batchSize=2
-    let find = doc!{"find": "u", "filter": {}, "batchSize": 2i32, "$db": &dbname};
+    let find = doc! {"find": "u", "filter": {}, "batchSize": 2i32, "$db": &dbname};
     let msg = encode_op_msg(&find, 0, 3);
     stream.write_all(&msg).await.unwrap();
     let doc = read_one_op_msg(&mut stream).await;
@@ -67,7 +83,7 @@ async fn e2e_cursors_find_getmore_kill() {
     assert_eq!(first_batch.len(), 2);
 
     // getMore batchSize=2
-    let gm = doc!{"getMore": id1, "collection": "u", "batchSize": 2i32, "$db": &dbname};
+    let gm = doc! {"getMore": id1, "collection": "u", "batchSize": 2i32, "$db": &dbname};
     let msg = encode_op_msg(&gm, 0, 4);
     stream.write_all(&msg).await.unwrap();
     let doc = read_one_op_msg(&mut stream).await;
@@ -79,7 +95,7 @@ async fn e2e_cursors_find_getmore_kill() {
     assert_ne!(id2, 0);
 
     // getMore to exhaust
-    let gm2 = doc!{"getMore": id2, "collection": "u", "batchSize": 10i32, "$db": &dbname};
+    let gm2 = doc! {"getMore": id2, "collection": "u", "batchSize": 10i32, "$db": &dbname};
     let msg = encode_op_msg(&gm2, 0, 5);
     stream.write_all(&msg).await.unwrap();
     let doc = read_one_op_msg(&mut stream).await;
@@ -91,7 +107,7 @@ async fn e2e_cursors_find_getmore_kill() {
     assert_eq!(id3, 0);
 
     // New cursor to test killCursors
-    let find2 = doc!{"find": "u", "filter": {}, "batchSize": 1i32, "$db": &dbname};
+    let find2 = doc! {"find": "u", "filter": {}, "batchSize": 1i32, "$db": &dbname};
     let msg = encode_op_msg(&find2, 0, 6);
     stream.write_all(&msg).await.unwrap();
     let doc = read_one_op_msg(&mut stream).await;
@@ -100,7 +116,7 @@ async fn e2e_cursors_find_getmore_kill() {
     assert_ne!(id, 0);
 
     // killCursors
-    let kc = doc!{"killCursors": "u", "cursors": [bson::Bson::Int64(id)], "$db": &dbname};
+    let kc = doc! {"killCursors": "u", "cursors": [bson::Bson::Int64(id)], "$db": &dbname};
     let msg = encode_op_msg(&kc, 0, 7);
     stream.write_all(&msg).await.unwrap();
     let doc = read_one_op_msg(&mut stream).await;
@@ -109,7 +125,7 @@ async fn e2e_cursors_find_getmore_kill() {
     assert_eq!(killed.len(), 1);
 
     // getMore after kill should be empty, id=0
-    let gm3 = doc!{"getMore": id, "collection": "u", "batchSize": 1i32, "$db": &dbname};
+    let gm3 = doc! {"getMore": id, "collection": "u", "batchSize": 1i32, "$db": &dbname};
     let msg = encode_op_msg(&gm3, 0, 8);
     stream.write_all(&msg).await.unwrap();
     let doc = read_one_op_msg(&mut stream).await;
@@ -124,7 +140,13 @@ async fn e2e_cursors_find_getmore_kill() {
 
 #[tokio::test]
 async fn e2e_cursor_ttl_prune() {
-    let testdb = match pg::TestDb::provision_from_env().await { Some(db) => db, None => { eprintln!("skipping: set OXIDEDB_TEST_POSTGRES_URL"); return; } };
+    let testdb = match pg::TestDb::provision_from_env().await {
+        Some(db) => db,
+        None => {
+            eprintln!("skipping: set OXIDEDB_TEST_POSTGRES_URL");
+            return;
+        }
+    };
 
     let mut cfg = Config::default();
     cfg.listen_addr = "127.0.0.1:0".into();
@@ -138,19 +160,19 @@ async fn e2e_cursor_ttl_prune() {
     let dbname = format!("cursors_ttl_{}", rand_suffix(6));
 
     // create + insert
-    let create = doc!{"create": "u", "$db": &dbname};
+    let create = doc! {"create": "u", "$db": &dbname};
     let msg = encode_op_msg(&create, 0, 1);
     stream.write_all(&msg).await.unwrap();
     let _ = read_one_op_msg(&mut stream).await;
 
-    let docs = vec![doc!{"i": 1}, doc!{"i": 2}, doc!{"i": 3}];
-    let ins = doc!{"insert": "u", "documents": docs, "$db": &dbname};
+    let docs = vec![doc! {"i": 1}, doc! {"i": 2}, doc! {"i": 3}];
+    let ins = doc! {"insert": "u", "documents": docs, "$db": &dbname};
     let msg = encode_op_msg(&ins, 0, 2);
     stream.write_all(&msg).await.unwrap();
     let _ = read_one_op_msg(&mut stream).await;
 
     // find to create a cursor
-    let find = doc!{"find": "u", "filter": {}, "batchSize": 1i32, "$db": &dbname};
+    let find = doc! {"find": "u", "filter": {}, "batchSize": 1i32, "$db": &dbname};
     let msg = encode_op_msg(&find, 0, 3);
     stream.write_all(&msg).await.unwrap();
     let doc = read_one_op_msg(&mut stream).await;
@@ -162,7 +184,7 @@ async fn e2e_cursor_ttl_prune() {
     tokio::time::sleep(Duration::from_millis(2300)).await;
 
     // getMore should return id 0 and empty
-    let gm = doc!{"getMore": id, "collection": "u", "batchSize": 1i32, "$db": &dbname};
+    let gm = doc! {"getMore": id, "collection": "u", "batchSize": 1i32, "$db": &dbname};
     let msg = encode_op_msg(&gm, 0, 4);
     stream.write_all(&msg).await.unwrap();
     let doc = read_one_op_msg(&mut stream).await;
@@ -173,4 +195,3 @@ async fn e2e_cursor_ttl_prune() {
     let _ = shutdown.send(true);
     let _ = handle.await.unwrap();
 }
-

@@ -1,8 +1,8 @@
 use bson::doc;
 use oxidedb::config::Config;
-use oxidedb::protocol::{decode_op_msg_section0, encode_op_msg, MessageHeader, OP_MSG};
+use oxidedb::protocol::{MessageHeader, OP_MSG, decode_op_msg_section0, encode_op_msg};
 use oxidedb::server::spawn_with_shutdown;
-use rand::{distributions::Alphanumeric, Rng};
+use rand::{Rng, distributions::Alphanumeric};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -94,4 +94,3 @@ async fn e2e_list_databases_and_collections() {
     let _ = shutdown.send(true);
     let _ = handle.await.unwrap();
 }
-
