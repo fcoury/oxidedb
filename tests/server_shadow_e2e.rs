@@ -45,6 +45,7 @@ async fn e2e_shadow_hello_ping_buildinfo() {
         deterministic_sampling: false,
         username: None,
         password: None,
+        auth_db: "admin".to_string(),
     });
 
     let (state, addr, shutdown, handle) = spawn_with_shutdown(cfg).await.unwrap();

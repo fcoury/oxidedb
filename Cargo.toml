@@ -22,6 +22,10 @@ deadpool-postgres = { version = "0.10", features = ["rt_tokio_1"] }
 snap = "1.1"
 flate2 = "1.0"
 zstd = "0.13"
+hmac = "0.12"
+sha2 = "0.10"
+pbkdf2 = { version = "0.12", features = ["simple"] }
+base64 = "0.22"
 
 [dev-dependencies]
 tokio = { version = "1.39", features = ["full"] }

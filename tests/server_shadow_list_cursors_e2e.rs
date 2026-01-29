@@ -66,6 +66,7 @@ async fn e2e_shadow_list_indexes() {
         deterministic_sampling: false,
         username: None,
         password: None,
+        auth_db: "admin".to_string(),
     });
 
     let (state, addr, shutdown, handle) = spawn_with_shutdown(cfg).await.unwrap();
@@ -175,6 +176,7 @@ async fn e2e_shadow_cursors_getmore_killcursors() {
         deterministic_sampling: false,
         username: None,
         password: None,
+        auth_db: "admin".to_string(),
     });
 
     let (state, addr, shutdown, handle) = spawn_with_shutdown(cfg).await.unwrap();
@@ -291,6 +293,7 @@ async fn e2e_shadow_list_databases_collections() {
         deterministic_sampling: false,
         username: None,
         password: None,
+        auth_db: "admin".to_string(),
     });
 
     let (state, addr, shutdown, handle) = spawn_with_shutdown(cfg).await.unwrap();

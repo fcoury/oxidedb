@@ -170,6 +170,8 @@ pub struct ShadowConfig {
     pub username: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
+    #[serde(default = "default_shadow_auth_db")]
+    pub auth_db: String,
 }
 
 impl Default for ShadowConfig {
@@ -185,6 +187,7 @@ impl Default for ShadowConfig {
             deterministic_sampling: false,
             username: None,
             password: None,
+            auth_db: default_shadow_auth_db(),
         }
     }
 }
@@ -194,4 +197,7 @@ fn default_shadow_timeout_ms() -> u64 {
 }
 fn default_shadow_sample_rate() -> f64 {
     1.0
+}
+fn default_shadow_auth_db() -> String {
+    "admin".to_string()
 }

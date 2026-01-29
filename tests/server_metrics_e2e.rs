@@ -66,6 +66,7 @@ async fn e2e_oxidedb_shadow_metrics() {
         deterministic_sampling: false,
         username: None,
         password: None,
+        auth_db: "admin".to_string(),
     });
 
     let (state, addr, shutdown, handle) = spawn_with_shutdown(cfg).await.unwrap();

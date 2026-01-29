@@ -4,6 +4,7 @@ use crate::protocol::{
     MessageHeader, OP_COMPRESSED, OP_MSG, OP_QUERY, OpCompressed, decode_op_compressed_reply,
     decode_op_msg_section0, decode_op_reply_first_doc, encode_op_compressed, encode_op_msg,
 };
+use crate::scram::ScramAuth;
 use anyhow::{Context, Result, anyhow};
 use bson::{Bson, Document};
 use std::sync::Arc;
@@ -33,9 +34,21 @@ impl ShadowSession {
         }
         let dur = Duration::from_millis(self.cfg.timeout_ms);
         let addr = self.cfg.addr.clone();
-        let stream = timeout(dur, TcpStream::connect(&addr))
+        let mut stream = timeout(dur, TcpStream::connect(&addr))
             .await
             .context("shadow connect timeout")??;
+
+        // Perform SCRAM-SHA-256 authentication if credentials are provided
+        if let (Some(username), Some(password)) = (&self.cfg.username, &self.cfg.password) {
+            let auth_db = &self.cfg.auth_db;
+            tracing::info!(username = %username, auth_db = %auth_db, "performing SCRAM-SHA-256 authentication");
+            let mut auth = ScramAuth::new(username.clone(), password.clone(), auth_db.clone());
+            auth.authenticate(&mut stream, self.cfg.timeout_ms)
+                .await
+                .context("SCRAM-SHA-256 authentication failed")?;
+            tracing::info!("SCRAM-SHA-256 authentication successful");
+        }
+
         *guard = Some(stream);
         Ok(())
     }

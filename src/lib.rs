@@ -3,6 +3,7 @@ pub mod config;
 pub mod error;
 pub mod namespace;
 pub mod protocol;
+pub mod scram;
 pub mod server;
 pub mod shadow;
 pub mod store;
