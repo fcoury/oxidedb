@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_postgres::NoTls;
 // use rand::Rng; // not used directly
 
 static REQ_ID: AtomicI32 = AtomicI32::new(1);

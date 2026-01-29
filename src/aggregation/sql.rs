@@ -1,7 +1,7 @@
 use crate::aggregation::ast::AggregateStage;
 use crate::error::{Error, Result};
 use crate::translate::{
-    build_order_by, build_where_from_filter, escape_single, jsonpath_path, projection_pushdown_sql,
+    build_order_by, build_where_from_filter, escape_single, projection_pushdown_sql,
 };
 
 struct SelectState {
@@ -27,8 +27,6 @@ impl Default for SelectState {
 }
 
 pub struct SqlBuilder {
-    db: String,
-    coll: String,
     stages: Vec<AggregateStage>,
     ctes: Vec<(String, String)>,
     current_cte: String,
@@ -43,8 +41,6 @@ impl SqlBuilder {
         let initial_table = format!("{}.{}", schema, table);
 
         Self {
-            db: db.to_string(),
-            coll: coll.to_string(),
             stages,
             ctes: Vec::new(),
             current_cte: initial_table,
@@ -162,8 +158,7 @@ impl SqlBuilder {
                     };
 
                     // Correct path format for jsonb_array_elements path
-                    let path_segments: Vec<String> =
-                        path.split('.').map(|s| escape_single(s)).collect();
+                    let path_segments: Vec<String> = path.split('.').map(escape_single).collect();
                     let path_pg_fmt = format!("{{{}}}", path_segments.join(","));
 
                     let join_clause = format!(
@@ -217,32 +212,32 @@ impl SqlBuilder {
                         if k == "_id" {
                             continue;
                         }
-                        if let bson::Bson::Document(d) = v {
-                            if let Some(op) = d.keys().next() {
-                                let val = d.get(op).unwrap();
-                                let sql_expr = translate_expr(val).unwrap_or("NULL".to_string());
-                                let acc_sql = match op.as_str() {
-                                    "$sum" => format!("SUM(({})::numeric)", sql_expr),
-                                    "$avg" => format!("AVG(({})::numeric)", sql_expr),
-                                    "$min" => format!("MIN({})", sql_expr),
-                                    "$max" => format!("MAX({})", sql_expr),
-                                    "$first" => format!("(array_agg({}) ORDER BY id)[1]", sql_expr),
-                                    "$last" => {
-                                        format!("(array_agg({}) ORDER BY id DESC)[1]", sql_expr)
-                                    }
-                                    "$push" => format!("jsonb_agg({})", sql_expr),
-                                    "$addToSet" => format!("jsonb_agg(DISTINCT {})", sql_expr),
-                                    "$count" => "COUNT(*)".to_string(),
-                                    _ => {
-                                        return Err(Error::Msg(format!(
-                                            "Unsupported accumulator {}",
-                                            op
-                                        )));
-                                    }
-                                };
-                                json_pairs.push(format!("{}", k));
-                                json_pairs.push(acc_sql);
-                            }
+                        if let bson::Bson::Document(d) = v
+                            && let Some(op) = d.keys().next()
+                        {
+                            let val = d.get(op).unwrap();
+                            let sql_expr = translate_expr(val).unwrap_or("NULL".to_string());
+                            let acc_sql = match op.as_str() {
+                                "$sum" => format!("SUM(({})::numeric)", sql_expr),
+                                "$avg" => format!("AVG(({})::numeric)", sql_expr),
+                                "$min" => format!("MIN({})", sql_expr),
+                                "$max" => format!("MAX({})", sql_expr),
+                                "$first" => format!("(array_agg({}) ORDER BY id)[1]", sql_expr),
+                                "$last" => {
+                                    format!("(array_agg({}) ORDER BY id DESC)[1]", sql_expr)
+                                }
+                                "$push" => format!("jsonb_agg({})", sql_expr),
+                                "$addToSet" => format!("jsonb_agg(DISTINCT {})", sql_expr),
+                                "$count" => "COUNT(*)".to_string(),
+                                _ => {
+                                    return Err(Error::Msg(format!(
+                                        "Unsupported accumulator {}",
+                                        op
+                                    )));
+                                }
+                            };
+                            json_pairs.push(k.to_string());
+                            json_pairs.push(acc_sql);
                         }
                     }
 
@@ -292,7 +287,7 @@ fn translate_expr(v: &bson::Bson) -> Option<String> {
         bson::Bson::String(s) if s.starts_with('$') => {
             let path = &s[1..];
             // Escape single quotes in path segments
-            let segs: Vec<String> = path.split('.').map(|p| escape_single(p)).collect();
+            let segs: Vec<String> = path.split('.').map(escape_single).collect();
             let path_str = segs.join("','"); // e.g. 'a','b'
             Some(format!("doc #> '{{\"{}\"}}'", path_str))
         }

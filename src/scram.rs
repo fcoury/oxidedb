@@ -8,7 +8,6 @@ use hmac::{Hmac, Mac};
 use pbkdf2::pbkdf2_hmac;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use std::fmt::Write;
 
 use crate::protocol::{MessageHeader, OP_MSG, decode_op_msg_section0, encode_op_msg};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
