@@ -33,3 +33,16 @@ webpki-roots = "0.26"
 [dev-dependencies]
 tokio = { version = "1.39", features = ["full"] }
 rand = "0.8"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "insert_benchmark"
+harness = false
+
+[[bench]]
+name = "find_benchmark"
+harness = false
+
+[[bench]]
+name = "aggregate_benchmark"
+harness = false
