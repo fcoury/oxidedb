@@ -67,6 +67,11 @@ async fn e2e_shadow_list_indexes() {
         username: None,
         password: None,
         auth_db: "admin".to_string(),
+        tls_enabled: false,
+        tls_ca_file: None,
+        tls_client_cert: None,
+        tls_client_key: None,
+        tls_allow_invalid_certs: false,
     });
 
     let (state, addr, shutdown, handle) = spawn_with_shutdown(cfg).await.unwrap();
@@ -177,6 +182,11 @@ async fn e2e_shadow_cursors_getmore_killcursors() {
         username: None,
         password: None,
         auth_db: "admin".to_string(),
+        tls_enabled: false,
+        tls_ca_file: None,
+        tls_client_cert: None,
+        tls_client_key: None,
+        tls_allow_invalid_certs: false,
     });
 
     let (state, addr, shutdown, handle) = spawn_with_shutdown(cfg).await.unwrap();
@@ -294,6 +304,11 @@ async fn e2e_shadow_list_databases_collections() {
         username: None,
         password: None,
         auth_db: "admin".to_string(),
+        tls_enabled: false,
+        tls_ca_file: None,
+        tls_client_cert: None,
+        tls_client_key: None,
+        tls_allow_invalid_certs: false,
     });
 
     let (state, addr, shutdown, handle) = spawn_with_shutdown(cfg).await.unwrap();

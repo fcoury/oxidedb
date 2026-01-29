@@ -95,6 +95,11 @@ async fn e2e_shadow_with_scram_auth() {
         username: Some(username.clone()),
         password: Some(password.clone()),
         auth_db: "admin".to_string(),
+        tls_enabled: false,
+        tls_ca_file: None,
+        tls_client_cert: None,
+        tls_client_key: None,
+        tls_allow_invalid_certs: false,
     });
 
     let (state, addr, shutdown, handle) = spawn_with_shutdown(cfg).await.unwrap();
@@ -177,6 +182,11 @@ async fn e2e_shadow_with_invalid_scram_auth() {
         username: Some("invalid_user".to_string()),
         password: Some("wrong_password".to_string()),
         auth_db: "admin".to_string(),
+        tls_enabled: false,
+        tls_ca_file: None,
+        tls_client_cert: None,
+        tls_client_key: None,
+        tls_allow_invalid_certs: false,
     });
 
     let (state, addr, shutdown, handle) = spawn_with_shutdown(cfg).await.unwrap();

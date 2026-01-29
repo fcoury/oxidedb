@@ -26,6 +26,9 @@ hmac = "0.12"
 sha2 = "0.10"
 pbkdf2 = { version = "0.12", features = ["simple"] }
 base64 = "0.22"
+tokio-rustls = "0.26"
+rustls-pemfile = "2.0"
+webpki-roots = "0.26"
 
 [dev-dependencies]
 tokio = { version = "1.39", features = ["full"] }

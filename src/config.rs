@@ -172,6 +172,16 @@ pub struct ShadowConfig {
     pub password: Option<String>,
     #[serde(default = "default_shadow_auth_db")]
     pub auth_db: String,
+    #[serde(default)]
+    pub tls_enabled: bool,
+    #[serde(default)]
+    pub tls_ca_file: Option<String>,
+    #[serde(default)]
+    pub tls_client_cert: Option<String>,
+    #[serde(default)]
+    pub tls_client_key: Option<String>,
+    #[serde(default)]
+    pub tls_allow_invalid_certs: bool,
 }
 
 impl Default for ShadowConfig {
@@ -188,6 +198,11 @@ impl Default for ShadowConfig {
             username: None,
             password: None,
             auth_db: default_shadow_auth_db(),
+            tls_enabled: false,
+            tls_ca_file: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            tls_allow_invalid_certs: false,
         }
     }
 }

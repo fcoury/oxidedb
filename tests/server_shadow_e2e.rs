@@ -46,6 +46,11 @@ async fn e2e_shadow_hello_ping_buildinfo() {
         username: None,
         password: None,
         auth_db: "admin".to_string(),
+        tls_enabled: false,
+        tls_ca_file: None,
+        tls_client_cert: None,
+        tls_client_key: None,
+        tls_allow_invalid_certs: false,
     });
 
     let (state, addr, shutdown, handle) = spawn_with_shutdown(cfg).await.unwrap();
