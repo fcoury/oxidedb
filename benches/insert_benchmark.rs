@@ -10,7 +10,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 mod common;
-use common::*;
 
 async fn setup_server() -> (String, TcpStream) {
     let testdb = common::postgres::TestDb::provision_from_env()

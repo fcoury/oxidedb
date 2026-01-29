@@ -496,7 +496,7 @@ mod tests {
     #[test]
     fn merge_logic_appends_sequence_into_existing_array() {
         // Simulate server-side merge: append sequence docs into an existing array field
-        let mut cmd =
+        let cmd =
             doc! {"insert": "tenants", "$db": "methodiq", "documents": Bson::Array(Vec::new())};
         let d1 = doc! {"name": "hepquant"};
         let body = build_op_msg_body_with_sequence(cmd.clone(), "documents", vec![d1.clone()]);
@@ -567,7 +567,7 @@ mod tests {
         let uncompressed_body = &body[16..]; // Skip header
 
         // Compress it
-        let compressed = compress_snappy(uncompressed_body);
+        let _compressed = compress_snappy(uncompressed_body);
 
         // Create OP_COMPRESSED
         let compressed_msg =
@@ -599,7 +599,7 @@ mod tests {
         let reply_body_no_header = &reply_body[16..];
 
         // Compress it
-        let compressed = compress_snappy(reply_body_no_header);
+        let _compressed = compress_snappy(reply_body_no_header);
 
         // Create OP_COMPRESSED
         let compressed_reply =
