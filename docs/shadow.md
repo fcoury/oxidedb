@@ -29,7 +29,10 @@ Top-level `Config` has an optional `shadow` section (TOML/env/CLI supported):
 - `db_prefix` (string, optional): when set, rewrite `$db`/namespace to `<prefix>_<db>` on the upstream request
 - `timeout_ms` (u64; default 800)
 - `sample_rate` (f64; 0.0–1.0; default 1.0)
+- `deterministic_sampling` (bool; default false): use hash-based deterministic sampling
 - `mode` (`compare_only` | `compare_and_fail` | `record_only`); default `compare_only` (only compare + log)
+- `username` (string, optional): username for upstream MongoDB authentication
+- `password` (string, optional): password for upstream MongoDB authentication
 - `compare`:
   - `ignore_fields` (list of dot-path patterns; defaults include `$clusterTime`, `operationTime`, `topologyVersion`, `localTime`, `connectionId`)
   - `numeric_equivalence` (bool; default false)
@@ -54,7 +57,7 @@ CLI/env overrides:
     - Namespace fields: `getMore.collection`, `killCursors.collection`
     - Nested fields: `createIndexes.indexes[].ns` (some drivers include this)
   - OP_QUERY: rewrite `fullCollectionName` C-string from `db.$cmd` or `db.<coll>` to `<prefix>_<db>.$cmd`/`<prefix>_<db>.<coll>`.
-  - OP_COMPRESSED: decompress, rewrite inner payload, recompress with same compressor (Snappy supported)
+  - OP_COMPRESSED: decompress, rewrite inner payload, recompress with same compressor (Snappy, zlib, zstd supported)
 
 ## Comparer
 
@@ -73,7 +76,8 @@ CLI/env overrides:
   - Debug: timeouts/errors.
 - Metrics (in-memory counters on `AppState`):
   - `shadow_attempts`, `shadow_matches`, `shadow_mismatches`, `shadow_timeouts`.
-  - Exposed programmatically (tests read via `spawn_with_shutdown`); no public endpoint yet.
+  - Exposed via admin command: `oxidedbShadowMetrics` (use `$db: "admin"`)
+  - Returns: `{"shadow": {"attempts": N, "matches": N, "mismatches": N, "timeouts": N}, "ok": 1.0}`
 - Sampling:
   - Bernoulli per-request (`rand::random::<f64>() < sample_rate`). Default `1.0` in dev/tests.
   - Future: optional deterministic sampling based on a request hash.
@@ -96,6 +100,8 @@ CLI/env overrides:
 - End-to-end server tests with shadow enabled:
   - `tests/server_shadow_e2e.rs`: boots server on an ephemeral port; hello/ping/buildInfo; asserts shadow attempts and ok:1.
   - `tests/server_shadow_crud_e2e.rs`: boots server with Postgres + upstream Mongo; create/insert/find happy path; asserts ok:1 and shadow attempts.
+  - `tests/server_shadow_list_cursors_e2e.rs`: tests listIndexes, getMore/killCursors, listDatabases/listCollections with shadow mode and db_prefix; validates namespace rewriting.
+  - `tests/server_metrics_e2e.rs`: tests the `oxidedbShadowMetrics` admin command for querying shadow counters.
 - Running tests:
   - Set upstream Mongo: `export OXIDEDB_TEST_MONGODB_ADDR=127.0.0.1:27018`
   - Optional Postgres (for CRUD e2e): `export OXIDEDB_TEST_POSTGRES_URL=postgres://USER:PASS@HOST:PORT/postgres`
@@ -114,17 +120,16 @@ CLI/env overrides:
 - E2E tests (hello/ping/buildInfo) [x]
 - E2E CRUD test (create/insert/find) [x]
 - Comprehensive namespace rewrites for all commands [x]
-- Upstream auth (SCRAM-SHA-256) [ ]
-- Deterministic sampling (hash-based) [ ]
-- Metrics exposure/endpoint [ ]
-- Additional e2e coverage (getMore/killCursors/list*/indexes) [ ]
+- E2E coverage for getMore/killCursors/listDatabases/listCollections/listIndexes [x]
+- OP_COMPRESSED support for Snappy, zlib, zstd [x]
+- Metrics exposure via admin command (oxidedbShadowMetrics) [x]
+- Deterministic sampling (hash-based) [x]
+- Upstream auth config fields (username/password) [x]
 
 ## Next Steps
 
-1) Extend e2e coverage to getMore/killCursors and listDatabases/listCollections; align shapes as needed.
-2) Optional: deterministic sampling and a simple metrics dump endpoint or admin command.
-3) Consider upstream auth (SCRAM-SHA-256) to enable shadow against secured clusters.
-4) Add zlib/zstd compressor support for OP_COMPRESSED (currently only Snappy is supported).
+1) Implement full SCRAM-SHA-256 authentication handshake for shadow mode.
+2) Add TLS support for secure upstream connections.
 
 ---
 

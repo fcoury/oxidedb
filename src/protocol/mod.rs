@@ -335,7 +335,7 @@ impl OpCompressed {
 }
 
 /// Decompress OP_COMPRESSED data based on compressor ID
-/// Currently supports Snappy (1). Returns uncompressed data.
+/// Supports Snappy (1), zlib (2), and zstd (3). Returns uncompressed data.
 pub fn decompress_op_compressed(op: &OpCompressed) -> Option<Vec<u8>> {
     match op.compressor_id {
         COMPRESSOR_SNAPPY => {
@@ -345,8 +345,25 @@ pub fn decompress_op_compressed(op: &OpCompressed) -> Option<Vec<u8>> {
             decoder.decompress(&op.compressed_data, &mut output).ok()?;
             Some(output)
         }
-        // Other compressors not yet supported
+        COMPRESSOR_ZLIB => {
+            use std::io::Read;
+            let mut decoder = flate2::read::ZlibDecoder::new(&op.compressed_data[..]);
+            let mut output = Vec::with_capacity(op.uncompressed_size as usize);
+            decoder.read_to_end(&mut output).ok()?;
+            Some(output)
+        }
+        COMPRESSOR_ZSTD => zstd::decode_all(&op.compressed_data[..]).ok(),
         _ => None,
+    }
+}
+
+/// Compress data using the specified compressor
+pub fn compress_data(data: &[u8], compressor_id: i32) -> Vec<u8> {
+    match compressor_id {
+        COMPRESSOR_SNAPPY => compress_snappy(data),
+        COMPRESSOR_ZLIB => compress_zlib(data),
+        COMPRESSOR_ZSTD => compress_zstd(data),
+        _ => panic!("unsupported compressor: {}", compressor_id),
     }
 }
 
@@ -362,7 +379,20 @@ pub fn compress_snappy(data: &[u8]) -> Vec<u8> {
     output
 }
 
-/// Create OP_COMPRESSED message with Snappy compression
+/// Compress data using zlib for OP_COMPRESSED
+pub fn compress_zlib(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(data).expect("zlib write");
+    encoder.finish().expect("zlib finish")
+}
+
+/// Compress data using zstd for OP_COMPRESSED
+pub fn compress_zstd(data: &[u8]) -> Vec<u8> {
+    zstd::encode_all(data, 0).expect("zstd compress")
+}
+
+/// Create OP_COMPRESSED message with specified compression
 pub fn encode_op_compressed(
     original_opcode: i32,
     uncompressed_body: &[u8],
@@ -370,10 +400,7 @@ pub fn encode_op_compressed(
     response_to: i32,
     request_id: i32,
 ) -> Vec<u8> {
-    let compressed_data = match compressor_id {
-        COMPRESSOR_SNAPPY => compress_snappy(uncompressed_body),
-        _ => panic!("unsupported compressor"),
-    };
+    let compressed_data = compress_data(uncompressed_body, compressor_id);
 
     let uncompressed_size = uncompressed_body.len() as i32;
     let body_len = 4 + 4 + 1 + compressed_data.len();
@@ -583,5 +610,119 @@ mod tests {
         let decoded = decode_op_compressed_reply(body).expect("decode");
         assert_eq!(decoded.get_f64("ok").unwrap(), 1.0);
         assert_eq!(decoded.get_str("msg").unwrap(), "hello");
+    }
+
+    // zlib tests
+    #[test]
+    fn zlib_compress_decompress_roundtrip() {
+        let original = b"Hello, World! This is a test message for zlib compression.";
+        let compressed = compress_zlib(original);
+
+        // Decompress
+        let decompressed = decompress_op_compressed(&OpCompressed {
+            original_opcode: OP_MSG,
+            uncompressed_size: original.len() as i32,
+            compressor_id: COMPRESSOR_ZLIB,
+            compressed_data: compressed,
+        })
+        .expect("decompress");
+
+        assert_eq!(&decompressed[..original.len()], original.as_slice());
+    }
+
+    #[test]
+    fn op_compressed_zlib_full_roundtrip() {
+        // Create an OP_MSG body
+        let cmd = doc! {"find": "users", "$db": "testdb"};
+        let body = encode_op_msg(&cmd, 0, 12345);
+        let uncompressed_body = &body[16..]; // Skip header
+
+        // Create OP_COMPRESSED with zlib
+        let compressed_msg =
+            encode_op_compressed(OP_MSG, uncompressed_body, COMPRESSOR_ZLIB, 0, 12345);
+
+        // Parse the compressed message
+        let hdr = MessageHeader::parse(&compressed_msg)
+            .expect("parse header")
+            .0;
+        assert_eq!(hdr.op_code, OP_COMPRESSED);
+
+        let body = &compressed_msg[16..];
+        let op = OpCompressed::parse(body).expect("parse compressed");
+        assert_eq!(op.original_opcode, OP_MSG);
+        assert_eq!(op.compressor_id, COMPRESSOR_ZLIB);
+
+        // Decompress and verify we can decode the document
+        let decompressed = decompress_op_compressed(&op).expect("decompress");
+        let (_flags, decoded) = decode_op_msg_section0(&decompressed).expect("decode");
+        assert_eq!(decoded.get_str("find").unwrap(), "users");
+        assert_eq!(decoded.get_str("$db").unwrap(), "testdb");
+    }
+
+    // zstd tests
+    #[test]
+    fn zstd_compress_decompress_roundtrip() {
+        let original = b"Hello, World! This is a test message for zstd compression.";
+        let compressed = compress_zstd(original);
+
+        // Decompress
+        let decompressed = decompress_op_compressed(&OpCompressed {
+            original_opcode: OP_MSG,
+            uncompressed_size: original.len() as i32,
+            compressor_id: COMPRESSOR_ZSTD,
+            compressed_data: compressed,
+        })
+        .expect("decompress");
+
+        assert_eq!(&decompressed[..original.len()], original.as_slice());
+    }
+
+    #[test]
+    fn op_compressed_zstd_full_roundtrip() {
+        // Create an OP_MSG body
+        let cmd = doc! {"find": "users", "$db": "testdb"};
+        let body = encode_op_msg(&cmd, 0, 12345);
+        let uncompressed_body = &body[16..]; // Skip header
+
+        // Create OP_COMPRESSED with zstd
+        let compressed_msg =
+            encode_op_compressed(OP_MSG, uncompressed_body, COMPRESSOR_ZSTD, 0, 12345);
+
+        // Parse the compressed message
+        let hdr = MessageHeader::parse(&compressed_msg)
+            .expect("parse header")
+            .0;
+        assert_eq!(hdr.op_code, OP_COMPRESSED);
+
+        let body = &compressed_msg[16..];
+        let op = OpCompressed::parse(body).expect("parse compressed");
+        assert_eq!(op.original_opcode, OP_MSG);
+        assert_eq!(op.compressor_id, COMPRESSOR_ZSTD);
+
+        // Decompress and verify we can decode the document
+        let decompressed = decompress_op_compressed(&op).expect("decompress");
+        let (_flags, decoded) = decode_op_msg_section0(&decompressed).expect("decode");
+        assert_eq!(decoded.get_str("find").unwrap(), "users");
+        assert_eq!(decoded.get_str("$db").unwrap(), "testdb");
+    }
+
+    #[test]
+    fn op_compressed_all_compressors_reply() {
+        let reply_doc = doc! {"ok": 1.0, "msg": "hello"};
+        let reply_body = encode_op_reply(&[reply_doc.clone()], 0, 12345);
+        let reply_body_no_header = &reply_body[16..];
+
+        // Test all compressors
+        for compressor_id in [COMPRESSOR_SNAPPY, COMPRESSOR_ZLIB, COMPRESSOR_ZSTD] {
+            let compressed_reply =
+                encode_op_compressed(OP_REPLY, reply_body_no_header, compressor_id, 0, 12345);
+
+            // Decode the compressed reply
+            let body = &compressed_reply[16..];
+            let decoded = decode_op_compressed_reply(body)
+                .expect(&format!("decode for compressor {}", compressor_id));
+            assert_eq!(decoded.get_f64("ok").unwrap(), 1.0);
+            assert_eq!(decoded.get_str("msg").unwrap(), "hello");
+        }
     }
 }

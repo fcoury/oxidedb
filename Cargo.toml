@@ -20,6 +20,8 @@ tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-serde_json-
 rand = "0.8"
 deadpool-postgres = { version = "0.10", features = ["rt_tokio_1"] }
 snap = "1.1"
+flate2 = "1.0"
+zstd = "0.13"
 
 [dev-dependencies]
 tokio = { version = "1.39", features = ["full"] }

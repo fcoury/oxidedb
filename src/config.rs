@@ -69,15 +69,43 @@ impl Config {
             || shadow_sample_rate.is_some()
         {
             let mut sh = self.shadow.unwrap_or_else(ShadowConfig::default);
-            if let Some(v) = shadow_enabled { sh.enabled = v; }
-            if let Some(v) = shadow_addr { sh.addr = v; }
-            if let Some(v) = shadow_db_prefix { sh.db_prefix = Some(v); }
-            if let Some(v) = shadow_timeout_ms { sh.timeout_ms = v; }
-            if let Some(v) = shadow_sample_rate { sh.sample_rate = v; }
+            if let Some(v) = shadow_enabled {
+                sh.enabled = v;
+            }
+            if let Some(v) = shadow_addr {
+                sh.addr = v;
+            }
+            if let Some(v) = shadow_db_prefix {
+                sh.db_prefix = Some(v);
+            }
+            if let Some(v) = shadow_timeout_ms {
+                sh.timeout_ms = v;
+            }
+            if let Some(v) = shadow_sample_rate {
+                sh.sample_rate = v;
+            }
             self.shadow = Some(sh);
         }
         self
     }
+}
+
+/// Deterministic sampling using request_id and db namespace hash
+pub fn should_sample_deterministically(request_id: i32, db: &str, sample_rate: f64) -> bool {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    // Hash the combination of request_id and db
+    let mut hasher = DefaultHasher::new();
+    request_id.hash(&mut hasher);
+    db.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    // Convert hash to a value in [0, 1)
+    let normalized = (hash as f64) / (u64::MAX as f64);
+
+    // Sample if normalized value is less than sample_rate
+    normalized < sample_rate
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -89,7 +117,9 @@ pub enum ShadowMode {
 }
 
 impl Default for ShadowMode {
-    fn default() -> Self { ShadowMode::CompareOnly }
+    fn default() -> Self {
+        ShadowMode::CompareOnly
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -112,7 +142,10 @@ fn default_ignore_fields() -> Vec<String> {
 
 impl Default for ShadowCompareOptions {
     fn default() -> Self {
-        Self { ignore_fields: default_ignore_fields(), numeric_equivalence: false }
+        Self {
+            ignore_fields: default_ignore_fields(),
+            numeric_equivalence: false,
+        }
     }
 }
 
@@ -131,6 +164,12 @@ pub struct ShadowConfig {
     pub mode: ShadowMode,
     #[serde(default)]
     pub compare: ShadowCompareOptions,
+    #[serde(default)]
+    pub deterministic_sampling: bool,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 impl Default for ShadowConfig {
@@ -143,9 +182,16 @@ impl Default for ShadowConfig {
             sample_rate: default_shadow_sample_rate(),
             mode: ShadowMode::CompareOnly,
             compare: ShadowCompareOptions::default(),
+            deterministic_sampling: false,
+            username: None,
+            password: None,
         }
     }
 }
 
-fn default_shadow_timeout_ms() -> u64 { 800 }
-fn default_shadow_sample_rate() -> f64 { 1.0 }
+fn default_shadow_timeout_ms() -> u64 {
+    800
+}
+fn default_shadow_sample_rate() -> f64 {
+    1.0
+}
