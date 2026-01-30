@@ -25,27 +25,31 @@ async fn read_one_op_msg(stream: &mut TcpStream) -> bson::Document {
 
 struct BenchContext {
     _server: BenchServer,
-    stream: TcpStream,
+    addr: std::net::SocketAddr,
     dbname: String,
-    request_id: std::cell::Cell<i32>,
+    initial_req_id: i32,
 }
 
 impl BenchContext {
-    async fn with_data(doc_count: usize) -> Self {
-        let testdb = TestDb::provision_from_env()
-            .await
+    fn with_data(doc_count: usize) -> Self {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+        let testdb = rt
+            .block_on(TestDb::provision_from_env())
             .expect("Failed to provision test database");
-        let server = BenchServer::start(testdb).await;
-        let mut stream = TcpStream::connect(server.addr()).await.unwrap();
+        let server = BenchServer::new(testdb);
+        let addr = server.addr();
         let dbname = server.dbname().to_string();
 
         // Create collection
         let create = doc! {"create": "bench", "$db": &dbname};
-        stream
-            .write_all(&encode_op_msg(&create, 0, 1))
-            .await
-            .unwrap();
-        let _ = read_one_op_msg(&mut stream).await;
+        rt.block_on(async {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(&encode_op_msg(&create, 0, 1))
+                .await
+                .unwrap();
+            let _ = read_one_op_msg(&mut stream).await;
+        });
 
         // Insert test data
         let batch_size = 100;
@@ -66,11 +70,14 @@ impl BenchContext {
                 .collect();
 
             let insert = doc! {"insert": "bench", "documents": docs, "$db": &dbname};
-            stream
-                .write_all(&encode_op_msg(&insert, 0, req_id))
-                .await
-                .unwrap();
-            let _ = read_one_op_msg(&mut stream).await;
+            rt.block_on(async {
+                let mut stream = TcpStream::connect(addr).await.unwrap();
+                stream
+                    .write_all(&encode_op_msg(&insert, 0, req_id))
+                    .await
+                    .unwrap();
+                let _ = read_one_op_msg(&mut stream).await;
+            });
 
             inserted += to_insert;
             req_id += 1;
@@ -78,28 +85,33 @@ impl BenchContext {
 
         Self {
             _server: server,
-            stream,
+            addr,
             dbname,
-            request_id: std::cell::Cell::new(req_id),
+            initial_req_id: req_id,
         }
     }
 
-    async fn aggregate(&mut self, pipeline: Vec<bson::Bson>) -> bson::Document {
+    async fn aggregate(
+        &self,
+        pipeline: Vec<bson::Bson>,
+        stream: &mut TcpStream,
+        req_id: &mut i32,
+    ) -> bson::Document {
         let agg = doc! {
             "aggregate": "bench",
             "pipeline": pipeline,
             "cursor": {},
             "$db": &self.dbname
         };
-        let req_id = self.request_id.get();
+        let current_req_id = *req_id;
 
-        self.stream
-            .write_all(&encode_op_msg(&agg, 0, req_id))
+        stream
+            .write_all(&encode_op_msg(&agg, 0, current_req_id))
             .await
             .unwrap();
-        let response = read_one_op_msg(&mut self.stream).await;
+        let response = read_one_op_msg(stream).await;
 
-        self.request_id.set(req_id + 1);
+        *req_id = current_req_id + 1;
         response
     }
 }
@@ -115,13 +127,17 @@ fn bench_aggregate_match(c: &mut Criterion) {
             BenchmarkId::new("collection_size", collection_size),
             &collection_size,
             |b, &size| {
-                b.to_async(&rt).iter_batched(
-                    || rt.block_on(BenchContext::with_data(size)),
-                    |mut ctx| async move {
-                        let pipeline = vec![bson::Bson::Document(doc! {
-                            "$match": {"value": {"$gt": 500}}
-                        })];
-                        let response = ctx.aggregate(pipeline).await;
+                b.iter_batched(
+                    || (BenchContext::with_data(size), 2i32),
+                    |(ctx, mut req_id)| {
+                        let response = rt.block_on(async {
+                            let mut stream = TcpStream::connect(ctx.addr).await.unwrap();
+                            let pipeline = vec![bson::Bson::Document(doc! {
+                                "$match": {"value": {"$gt": 500}}
+                            })];
+                            let result = ctx.aggregate(pipeline, &mut stream, &mut req_id).await;
+                            result
+                        });
                         black_box(response);
                     },
                     criterion::BatchSize::PerIteration,
@@ -142,18 +158,22 @@ fn bench_aggregate_group(c: &mut Criterion) {
     let collection_size = 5000;
 
     group.bench_function("group_by_category", |b| {
-        b.to_async(&rt).iter_batched(
-            || rt.block_on(BenchContext::with_data(collection_size)),
-            |mut ctx| async move {
-                let pipeline = vec![bson::Bson::Document(doc! {
-                    "$group": {
-                        "_id": "$category",
-                        "total": {"$sum": "$value"},
-                        "count": {"$sum": 1},
-                        "avg": {"$avg": "$value"}
-                    }
-                })];
-                let response = ctx.aggregate(pipeline).await;
+        b.iter_batched(
+            || (BenchContext::with_data(collection_size), 2i32),
+            |(ctx, mut req_id)| {
+                let response = rt.block_on(async {
+                    let mut stream = TcpStream::connect(ctx.addr).await.unwrap();
+                    let pipeline = vec![bson::Bson::Document(doc! {
+                        "$group": {
+                            "_id": "$category",
+                            "total": {"$sum": "$value"},
+                            "count": {"$sum": 1},
+                            "avg": {"$avg": "$value"}
+                        }
+                    })];
+                    let result = ctx.aggregate(pipeline, &mut stream, &mut req_id).await;
+                    result
+                });
                 black_box(response);
             },
             criterion::BatchSize::PerIteration,
@@ -161,20 +181,24 @@ fn bench_aggregate_group(c: &mut Criterion) {
     });
 
     group.bench_function("match_then_group", |b| {
-        b.to_async(&rt).iter_batched(
-            || rt.block_on(BenchContext::with_data(collection_size)),
-            |mut ctx| async move {
-                let pipeline = vec![
-                    bson::Bson::Document(doc! {"$match": {"value": {"$gt": 300}}}),
-                    bson::Bson::Document(doc! {
-                        "$group": {
-                            "_id": "$category",
-                            "total": {"$sum": "$value"},
-                            "count": {"$sum": 1}
-                        }
-                    }),
-                ];
-                let response = ctx.aggregate(pipeline).await;
+        b.iter_batched(
+            || (BenchContext::with_data(collection_size), 2i32),
+            |(ctx, mut req_id)| {
+                let response = rt.block_on(async {
+                    let mut stream = TcpStream::connect(ctx.addr).await.unwrap();
+                    let pipeline = vec![
+                        bson::Bson::Document(doc! {"$match": {"value": {"$gt": 300}}}),
+                        bson::Bson::Document(doc! {
+                            "$group": {
+                                "_id": "$category",
+                                "total": {"$sum": "$value"},
+                                "count": {"$sum": 1}
+                            }
+                        }),
+                    ];
+                    let result = ctx.aggregate(pipeline, &mut stream, &mut req_id).await;
+                    result
+                });
                 black_box(response);
             },
             criterion::BatchSize::PerIteration,
@@ -193,14 +217,18 @@ fn bench_aggregate_sort_limit(c: &mut Criterion) {
     let collection_size = 5000;
 
     group.bench_function("sort_desc_limit", |b| {
-        b.to_async(&rt).iter_batched(
-            || rt.block_on(BenchContext::with_data(collection_size)),
-            |mut ctx| async move {
-                let pipeline = vec![
-                    bson::Bson::Document(doc! {"$sort": {"value": -1}}),
-                    bson::Bson::Document(doc! {"$limit": 10i32}),
-                ];
-                let response = ctx.aggregate(pipeline).await;
+        b.iter_batched(
+            || (BenchContext::with_data(collection_size), 2i32),
+            |(ctx, mut req_id)| {
+                let response = rt.block_on(async {
+                    let mut stream = TcpStream::connect(ctx.addr).await.unwrap();
+                    let pipeline = vec![
+                        bson::Bson::Document(doc! {"$sort": {"value": -1}}),
+                        bson::Bson::Document(doc! {"$limit": 10i32}),
+                    ];
+                    let result = ctx.aggregate(pipeline, &mut stream, &mut req_id).await;
+                    result
+                });
                 black_box(response);
             },
             criterion::BatchSize::PerIteration,
@@ -208,15 +236,19 @@ fn bench_aggregate_sort_limit(c: &mut Criterion) {
     });
 
     group.bench_function("match_sort_limit", |b| {
-        b.to_async(&rt).iter_batched(
-            || rt.block_on(BenchContext::with_data(collection_size)),
-            |mut ctx| async move {
-                let pipeline = vec![
-                    bson::Bson::Document(doc! {"$match": {"category": "cat_1"}}),
-                    bson::Bson::Document(doc! {"$sort": {"value": -1}}),
-                    bson::Bson::Document(doc! {"$limit": 20i32}),
-                ];
-                let response = ctx.aggregate(pipeline).await;
+        b.iter_batched(
+            || (BenchContext::with_data(collection_size), 2i32),
+            |(ctx, mut req_id)| {
+                let response = rt.block_on(async {
+                    let mut stream = TcpStream::connect(ctx.addr).await.unwrap();
+                    let pipeline = vec![
+                        bson::Bson::Document(doc! {"$match": {"category": "cat_1"}}),
+                        bson::Bson::Document(doc! {"$sort": {"value": -1}}),
+                        bson::Bson::Document(doc! {"$limit": 20i32}),
+                    ];
+                    let result = ctx.aggregate(pipeline, &mut stream, &mut req_id).await;
+                    result
+                });
                 black_box(response);
             },
             criterion::BatchSize::PerIteration,
@@ -235,18 +267,22 @@ fn bench_aggregate_project(c: &mut Criterion) {
     let collection_size = 5000;
 
     group.bench_function("project_fields", |b| {
-        b.to_async(&rt).iter_batched(
-            || rt.block_on(BenchContext::with_data(collection_size)),
-            |mut ctx| async move {
-                let pipeline = vec![bson::Bson::Document(doc! {
-                    "$project": {
-                        "category": 1,
-                        "value": 1,
-                        "doubled": {"$multiply": ["$value", 2]},
-                        "total": {"$add": ["$value", "$quantity"]}
-                    }
-                })];
-                let response = ctx.aggregate(pipeline).await;
+        b.iter_batched(
+            || (BenchContext::with_data(collection_size), 2i32),
+            |(ctx, mut req_id)| {
+                let response = rt.block_on(async {
+                    let mut stream = TcpStream::connect(ctx.addr).await.unwrap();
+                    let pipeline = vec![bson::Bson::Document(doc! {
+                        "$project": {
+                            "category": 1,
+                            "value": 1,
+                            "doubled": {"$multiply": ["$value", 2]},
+                            "total": {"$add": ["$value", "$quantity"]}
+                        }
+                    })];
+                    let result = ctx.aggregate(pipeline, &mut stream, &mut req_id).await;
+                    result
+                });
                 black_box(response);
             },
             criterion::BatchSize::PerIteration,
@@ -267,22 +303,26 @@ fn bench_aggregate_multistage(c: &mut Criterion) {
             BenchmarkId::new("collection_size", collection_size),
             &collection_size,
             |b, &size| {
-                b.to_async(&rt).iter_batched(
-                    || rt.block_on(BenchContext::with_data(size)),
-                    |mut ctx| async move {
-                        let pipeline = vec![
-                            bson::Bson::Document(doc! {"$match": {"value": {"$gt": 100}}}),
-                            bson::Bson::Document(doc! {"$sort": {"value": -1}}),
-                            bson::Bson::Document(doc! {"$limit": 50i32}),
-                            bson::Bson::Document(doc! {
-                                "$project": {
-                                    "category": 1,
-                                    "value": 1,
-                                    "computed": {"$add": ["$value", "$quantity"]}
-                                }
-                            }),
-                        ];
-                        let response = ctx.aggregate(pipeline).await;
+                b.iter_batched(
+                    || (BenchContext::with_data(size), 2i32),
+                    |(ctx, mut req_id)| {
+                        let response = rt.block_on(async {
+                            let mut stream = TcpStream::connect(ctx.addr).await.unwrap();
+                            let pipeline = vec![
+                                bson::Bson::Document(doc! {"$match": {"value": {"$gt": 100}}}),
+                                bson::Bson::Document(doc! {"$sort": {"value": -1}}),
+                                bson::Bson::Document(doc! {"$limit": 50i32}),
+                                bson::Bson::Document(doc! {
+                                    "$project": {
+                                        "category": 1,
+                                        "value": 1,
+                                        "computed": {"$add": ["$value", "$quantity"]}
+                                    }
+                                }),
+                            ];
+                            let result = ctx.aggregate(pipeline, &mut stream, &mut req_id).await;
+                            result
+                        });
                         black_box(response);
                     },
                     criterion::BatchSize::PerIteration,

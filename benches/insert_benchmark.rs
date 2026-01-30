@@ -69,66 +69,78 @@ async fn read_one_op_msg(stream: &mut TcpStream) -> bson::Document {
 
 struct BenchContext {
     _server: BenchServer,
-    stream: TcpStream,
+    addr: std::net::SocketAddr,
     dbname: String,
-    request_id: std::cell::Cell<i32>,
 }
 
 impl BenchContext {
-    async fn new(doc_size: DocumentSize) -> Self {
-        let testdb = TestDb::provision_from_env()
-            .await
+    fn new(_doc_size: DocumentSize) -> Self {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+        let testdb = rt
+            .block_on(TestDb::provision_from_env())
             .expect("Failed to provision test database");
-        let server = BenchServer::start(testdb).await;
-        let mut stream = TcpStream::connect(server.addr()).await.unwrap();
+        let server = BenchServer::new(testdb);
+        let addr = server.addr();
         let dbname = server.dbname().to_string();
 
         // Create collection once
         let create = doc! {"create": "bench", "$db": &dbname};
-        stream
-            .write_all(&encode_op_msg(&create, 0, 1))
-            .await
-            .unwrap();
-        let _ = read_one_op_msg(&mut stream).await;
+        rt.block_on(async {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(&encode_op_msg(&create, 0, 1))
+                .await
+                .unwrap();
+            let _ = read_one_op_msg(&mut stream).await;
+        });
 
         Self {
             _server: server,
-            stream,
+            addr,
             dbname,
-            request_id: std::cell::Cell::new(2),
         }
     }
 
-    async fn insert_single(&mut self, doc_size: DocumentSize) -> bson::Document {
+    async fn insert_single(
+        &self,
+        doc_size: DocumentSize,
+        stream: &mut TcpStream,
+        request_id: &mut i32,
+    ) -> bson::Document {
         let doc = generate_document(doc_size);
         let insert = doc! {"insert": "bench", "documents": [doc], "$db": &self.dbname};
-        let req_id = self.request_id.get();
+        let req_id = *request_id;
 
-        self.stream
+        stream
             .write_all(&encode_op_msg(&insert, 0, req_id))
             .await
             .unwrap();
-        let response = read_one_op_msg(&mut self.stream).await;
+        let response = read_one_op_msg(stream).await;
 
-        self.request_id.set(req_id + 1);
+        *request_id = req_id + 1;
         response
     }
 
-    async fn insert_batch(&mut self, batch_size: usize) -> bson::Document {
+    async fn insert_batch(
+        &self,
+        batch_size: usize,
+        stream: &mut TcpStream,
+        request_id: &mut i32,
+    ) -> bson::Document {
         let docs: Vec<bson::Document> = (0..batch_size)
             .map(|_| generate_document(DocumentSize::Medium))
             .collect();
 
         let insert = doc! {"insert": "bench", "documents": docs, "$db": &self.dbname};
-        let req_id = self.request_id.get();
+        let req_id = *request_id;
 
-        self.stream
+        stream
             .write_all(&encode_op_msg(&insert, 0, req_id))
             .await
             .unwrap();
-        let response = read_one_op_msg(&mut self.stream).await;
+        let response = read_one_op_msg(stream).await;
 
-        self.request_id.set(req_id + 1);
+        *request_id = req_id + 1;
         response
     }
 }
@@ -150,10 +162,15 @@ fn bench_insert_single(c: &mut Criterion) {
             BenchmarkId::new("size", &size_name),
             &size,
             |b, &doc_size| {
-                b.to_async(&rt).iter_batched(
-                    || rt.block_on(BenchContext::new(doc_size)),
-                    |mut ctx| async move {
-                        let response = ctx.insert_single(doc_size).await;
+                b.iter_batched(
+                    || (BenchContext::new(doc_size), 2i32),
+                    |(ctx, mut req_id)| {
+                        let response = rt.block_on(async {
+                            let mut stream = TcpStream::connect(ctx.addr).await.unwrap();
+                            let result =
+                                ctx.insert_single(doc_size, &mut stream, &mut req_id).await;
+                            result
+                        });
                         black_box(response);
                     },
                     criterion::BatchSize::PerIteration,
@@ -176,10 +193,14 @@ fn bench_insert_batch(c: &mut Criterion) {
             BenchmarkId::new("batch_size", batch_size),
             &batch_size,
             |b, &size| {
-                b.to_async(&rt).iter_batched(
-                    || rt.block_on(BenchContext::new(DocumentSize::Medium)),
-                    |mut ctx| async move {
-                        let response = ctx.insert_batch(size).await;
+                b.iter_batched(
+                    || (BenchContext::new(DocumentSize::Medium), 2i32),
+                    |(ctx, mut req_id)| {
+                        let response = rt.block_on(async {
+                            let mut stream = TcpStream::connect(ctx.addr).await.unwrap();
+                            let result = ctx.insert_batch(size, &mut stream, &mut req_id).await;
+                            result
+                        });
                         black_box(response);
                     },
                     criterion::BatchSize::PerIteration,

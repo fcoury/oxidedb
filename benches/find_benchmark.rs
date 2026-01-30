@@ -25,27 +25,31 @@ async fn read_one_op_msg(stream: &mut TcpStream) -> bson::Document {
 
 struct BenchContext {
     _server: BenchServer,
-    stream: TcpStream,
+    addr: std::net::SocketAddr,
     dbname: String,
-    request_id: std::cell::Cell<i32>,
+    initial_req_id: i32,
 }
 
 impl BenchContext {
-    async fn with_data(doc_count: usize) -> Self {
-        let testdb = TestDb::provision_from_env()
-            .await
+    fn with_data(doc_count: usize) -> Self {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+        let testdb = rt
+            .block_on(TestDb::provision_from_env())
             .expect("Failed to provision test database");
-        let server = BenchServer::start(testdb).await;
-        let mut stream = TcpStream::connect(server.addr()).await.unwrap();
+        let server = BenchServer::new(testdb);
+        let addr = server.addr();
         let dbname = server.dbname().to_string();
 
         // Create collection
         let create = doc! {"create": "bench", "$db": &dbname};
-        stream
-            .write_all(&encode_op_msg(&create, 0, 1))
-            .await
-            .unwrap();
-        let _ = read_one_op_msg(&mut stream).await;
+        rt.block_on(async {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(&encode_op_msg(&create, 0, 1))
+                .await
+                .unwrap();
+            let _ = read_one_op_msg(&mut stream).await;
+        });
 
         // Insert test data
         let batch_size = 100;
@@ -68,11 +72,14 @@ impl BenchContext {
                 .collect();
 
             let insert = doc! {"insert": "bench", "documents": docs, "$db": &dbname};
-            stream
-                .write_all(&encode_op_msg(&insert, 0, req_id))
-                .await
-                .unwrap();
-            let _ = read_one_op_msg(&mut stream).await;
+            rt.block_on(async {
+                let mut stream = TcpStream::connect(addr).await.unwrap();
+                stream
+                    .write_all(&encode_op_msg(&insert, 0, req_id))
+                    .await
+                    .unwrap();
+                let _ = read_one_op_msg(&mut stream).await;
+            });
 
             inserted += to_insert;
             req_id += 1;
@@ -80,36 +87,43 @@ impl BenchContext {
 
         Self {
             _server: server,
-            stream,
+            addr,
             dbname,
-            request_id: std::cell::Cell::new(req_id),
+            initial_req_id: req_id,
         }
     }
 
-    async fn find(&mut self, filter: bson::Document) -> bson::Document {
+    async fn find(
+        &self,
+        filter: bson::Document,
+        stream: &mut TcpStream,
+        req_id: &mut i32,
+    ) -> bson::Document {
         let find = doc! {
             "find": "bench",
             "filter": filter,
             "$db": &self.dbname
         };
-        let req_id = self.request_id.get();
+        let current_req_id = *req_id;
 
-        self.stream
-            .write_all(&encode_op_msg(&find, 0, req_id))
+        stream
+            .write_all(&encode_op_msg(&find, 0, current_req_id))
             .await
             .unwrap();
-        let response = read_one_op_msg(&mut self.stream).await;
+        let response = read_one_op_msg(stream).await;
 
-        self.request_id.set(req_id + 1);
+        *req_id = current_req_id + 1;
         response
     }
 
     async fn find_with_options(
-        &mut self,
+        &self,
         filter: bson::Document,
         projection: Option<bson::Document>,
         sort: Option<bson::Document>,
         limit: Option<i32>,
+        stream: &mut TcpStream,
+        req_id: &mut i32,
     ) -> bson::Document {
         let mut find = doc! {
             "find": "bench",
@@ -126,14 +140,14 @@ impl BenchContext {
             find.insert("limit", l);
         }
 
-        let req_id = self.request_id.get();
-        self.stream
-            .write_all(&encode_op_msg(&find, 0, req_id))
+        let current_req_id = *req_id;
+        stream
+            .write_all(&encode_op_msg(&find, 0, current_req_id))
             .await
             .unwrap();
-        let response = read_one_op_msg(&mut self.stream).await;
+        let response = read_one_op_msg(stream).await;
 
-        self.request_id.set(req_id + 1);
+        *req_id = current_req_id + 1;
         response
     }
 }
@@ -149,10 +163,15 @@ fn bench_find_by_id(c: &mut Criterion) {
             BenchmarkId::new("collection_size", collection_size),
             &collection_size,
             |b, &size| {
-                b.to_async(&rt).iter_batched(
-                    || rt.block_on(BenchContext::with_data(size)),
-                    |mut ctx| async move {
-                        let response = ctx.find(doc! {"index": 0}).await;
+                b.iter_batched(
+                    || (BenchContext::with_data(size), 2i32),
+                    |(ctx, mut req_id)| {
+                        let response = rt.block_on(async {
+                            let mut stream = TcpStream::connect(ctx.addr).await.unwrap();
+                            let result =
+                                ctx.find(doc! {"index": 0}, &mut stream, &mut req_id).await;
+                            result
+                        });
                         black_box(response);
                     },
                     criterion::BatchSize::PerIteration,
@@ -173,10 +192,16 @@ fn bench_find_with_filter(c: &mut Criterion) {
     let collection_size = 1000;
 
     group.bench_function("equality", |b| {
-        b.to_async(&rt).iter_batched(
-            || rt.block_on(BenchContext::with_data(collection_size)),
-            |mut ctx| async move {
-                let response = ctx.find(doc! {"active": true}).await;
+        b.iter_batched(
+            || (BenchContext::with_data(collection_size), 2i32),
+            |(ctx, mut req_id)| {
+                let response = rt.block_on(async {
+                    let mut stream = TcpStream::connect(ctx.addr).await.unwrap();
+                    let result = ctx
+                        .find(doc! {"active": true}, &mut stream, &mut req_id)
+                        .await;
+                    result
+                });
                 black_box(response);
             },
             criterion::BatchSize::PerIteration,
@@ -184,10 +209,16 @@ fn bench_find_with_filter(c: &mut Criterion) {
     });
 
     group.bench_function("range_gt", |b| {
-        b.to_async(&rt).iter_batched(
-            || rt.block_on(BenchContext::with_data(collection_size)),
-            |mut ctx| async move {
-                let response = ctx.find(doc! {"age": {"$gt": 50}}).await;
+        b.iter_batched(
+            || (BenchContext::with_data(collection_size), 2i32),
+            |(ctx, mut req_id)| {
+                let response = rt.block_on(async {
+                    let mut stream = TcpStream::connect(ctx.addr).await.unwrap();
+                    let result = ctx
+                        .find(doc! {"age": {"$gt": 50}}, &mut stream, &mut req_id)
+                        .await;
+                    result
+                });
                 black_box(response);
             },
             criterion::BatchSize::PerIteration,
@@ -195,10 +226,20 @@ fn bench_find_with_filter(c: &mut Criterion) {
     });
 
     group.bench_function("in_operator", |b| {
-        b.to_async(&rt).iter_batched(
-            || rt.block_on(BenchContext::with_data(collection_size)),
-            |mut ctx| async move {
-                let response = ctx.find(doc! {"age": {"$in": [25, 35, 45, 55, 65]}}).await;
+        b.iter_batched(
+            || (BenchContext::with_data(collection_size), 2i32),
+            |(ctx, mut req_id)| {
+                let response = rt.block_on(async {
+                    let mut stream = TcpStream::connect(ctx.addr).await.unwrap();
+                    let result = ctx
+                        .find(
+                            doc! {"age": {"$in": [25, 35, 45, 55, 65]}},
+                            &mut stream,
+                            &mut req_id,
+                        )
+                        .await;
+                    result
+                });
                 black_box(response);
             },
             criterion::BatchSize::PerIteration,
@@ -206,12 +247,20 @@ fn bench_find_with_filter(c: &mut Criterion) {
     });
 
     group.bench_function("or_operator", |b| {
-        b.to_async(&rt).iter_batched(
-            || rt.block_on(BenchContext::with_data(collection_size)),
-            |mut ctx| async move {
-                let response = ctx
-                    .find(doc! {"$or": [{"age": {"$lt": 30}}, {"age": {"$gt": 60}}]})
-                    .await;
+        b.iter_batched(
+            || (BenchContext::with_data(collection_size), 2i32),
+            |(ctx, mut req_id)| {
+                let response = rt.block_on(async {
+                    let mut stream = TcpStream::connect(ctx.addr).await.unwrap();
+                    let result = ctx
+                        .find(
+                            doc! {"$or": [{"age": {"$lt": 30}}, {"age": {"$gt": 60}}]},
+                            &mut stream,
+                            &mut req_id,
+                        )
+                        .await;
+                    result
+                });
                 black_box(response);
             },
             criterion::BatchSize::PerIteration,
@@ -219,18 +268,26 @@ fn bench_find_with_filter(c: &mut Criterion) {
     });
 
     group.bench_function("complex", |b| {
-        b.to_async(&rt).iter_batched(
-            || rt.block_on(BenchContext::with_data(collection_size)),
-            |mut ctx| async move {
-                let response = ctx
-                    .find(doc! {
-                        "$and": [
-                            {"active": true},
-                            {"age": {"$gte": 25, "$lte": 55}},
-                            {"score": {"$gt": 50.0}}
-                        ]
-                    })
-                    .await;
+        b.iter_batched(
+            || (BenchContext::with_data(collection_size), 2i32),
+            |(ctx, mut req_id)| {
+                let response = rt.block_on(async {
+                    let mut stream = TcpStream::connect(ctx.addr).await.unwrap();
+                    let result = ctx
+                        .find(
+                            doc! {
+                                "$and": [
+                                    {"active": true},
+                                    {"age": {"$gte": 25, "$lte": 55}},
+                                    {"score": {"$gt": 50.0}}
+                                ]
+                            },
+                            &mut stream,
+                            &mut req_id,
+                        )
+                        .await;
+                    result
+                });
                 black_box(response);
             },
             criterion::BatchSize::PerIteration,
@@ -249,17 +306,23 @@ fn bench_find_with_projection(c: &mut Criterion) {
     let collection_size = 1000;
 
     group.bench_function("include_fields", |b| {
-        b.to_async(&rt).iter_batched(
-            || rt.block_on(BenchContext::with_data(collection_size)),
-            |mut ctx| async move {
-                let response = ctx
-                    .find_with_options(
-                        doc! {},
-                        Some(doc! {"name": 1, "age": 1}),
-                        None,
-                        Some(100i32),
-                    )
-                    .await;
+        b.iter_batched(
+            || (BenchContext::with_data(collection_size), 2i32),
+            |(ctx, mut req_id)| {
+                let response = rt.block_on(async {
+                    let mut stream = TcpStream::connect(ctx.addr).await.unwrap();
+                    let result = ctx
+                        .find_with_options(
+                            doc! {},
+                            Some(doc! {"name": 1, "age": 1}),
+                            None,
+                            Some(100i32),
+                            &mut stream,
+                            &mut req_id,
+                        )
+                        .await;
+                    result
+                });
                 black_box(response);
             },
             criterion::BatchSize::PerIteration,
@@ -267,17 +330,23 @@ fn bench_find_with_projection(c: &mut Criterion) {
     });
 
     group.bench_function("exclude_fields", |b| {
-        b.to_async(&rt).iter_batched(
-            || rt.block_on(BenchContext::with_data(collection_size)),
-            |mut ctx| async move {
-                let response = ctx
-                    .find_with_options(
-                        doc! {},
-                        Some(doc! {"tags": 0, "metadata": 0}),
-                        None,
-                        Some(100i32),
-                    )
-                    .await;
+        b.iter_batched(
+            || (BenchContext::with_data(collection_size), 2i32),
+            |(ctx, mut req_id)| {
+                let response = rt.block_on(async {
+                    let mut stream = TcpStream::connect(ctx.addr).await.unwrap();
+                    let result = ctx
+                        .find_with_options(
+                            doc! {},
+                            Some(doc! {"tags": 0, "metadata": 0}),
+                            None,
+                            Some(100i32),
+                            &mut stream,
+                            &mut req_id,
+                        )
+                        .await;
+                    result
+                });
                 black_box(response);
             },
             criterion::BatchSize::PerIteration,
@@ -296,12 +365,23 @@ fn bench_find_with_sort(c: &mut Criterion) {
     let collection_size = 1000;
 
     group.bench_function("sort_single", |b| {
-        b.to_async(&rt).iter_batched(
-            || rt.block_on(BenchContext::with_data(collection_size)),
-            |mut ctx| async move {
-                let response = ctx
-                    .find_with_options(doc! {}, None, Some(doc! {"age": 1}), Some(100i32))
-                    .await;
+        b.iter_batched(
+            || (BenchContext::with_data(collection_size), 2i32),
+            |(ctx, mut req_id)| {
+                let response = rt.block_on(async {
+                    let mut stream = TcpStream::connect(ctx.addr).await.unwrap();
+                    let result = ctx
+                        .find_with_options(
+                            doc! {},
+                            None,
+                            Some(doc! {"age": 1}),
+                            Some(100i32),
+                            &mut stream,
+                            &mut req_id,
+                        )
+                        .await;
+                    result
+                });
                 black_box(response);
             },
             criterion::BatchSize::PerIteration,
@@ -309,17 +389,23 @@ fn bench_find_with_sort(c: &mut Criterion) {
     });
 
     group.bench_function("sort_multiple", |b| {
-        b.to_async(&rt).iter_batched(
-            || rt.block_on(BenchContext::with_data(collection_size)),
-            |mut ctx| async move {
-                let response = ctx
-                    .find_with_options(
-                        doc! {},
-                        None,
-                        Some(doc! {"active": -1, "age": 1, "score": -1}),
-                        Some(100i32),
-                    )
-                    .await;
+        b.iter_batched(
+            || (BenchContext::with_data(collection_size), 2i32),
+            |(ctx, mut req_id)| {
+                let response = rt.block_on(async {
+                    let mut stream = TcpStream::connect(ctx.addr).await.unwrap();
+                    let result = ctx
+                        .find_with_options(
+                            doc! {},
+                            None,
+                            Some(doc! {"active": -1, "age": 1, "score": -1}),
+                            Some(100i32),
+                            &mut stream,
+                            &mut req_id,
+                        )
+                        .await;
+                    result
+                });
                 black_box(response);
             },
             criterion::BatchSize::PerIteration,
