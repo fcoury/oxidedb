@@ -25,3 +25,5 @@ go.sum
 
 # mdBook build output
 docs/book/book/
+scripts/driver-matrix/target
+scripts/driver-matrix/nodw_modules
