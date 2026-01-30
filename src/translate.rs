@@ -112,9 +112,33 @@ pub fn build_where_from_filter_internal(filter: &bson::Document, is_nested: bool
                 // Search across the entire document text
                 // Escape single quotes to prevent SQL injection
                 let escaped_query = query.replace('"', "\"\"").replace('\'', "''");
+                // Validate language against known PostgreSQL text search configurations
+                let valid_languages = [
+                    "danish",
+                    "dutch",
+                    "english",
+                    "finnish",
+                    "french",
+                    "german",
+                    "hungarian",
+                    "italian",
+                    "norwegian",
+                    "portuguese",
+                    "romanian",
+                    "russian",
+                    "simple",
+                    "spanish",
+                    "swedish",
+                    "turkish",
+                ];
+                let safe_language = if valid_languages.contains(&language) {
+                    language
+                } else {
+                    "english"
+                };
                 let text_clause = format!(
                     "to_tsvector('{}', doc::text) @@ plainto_tsquery('{}', '{}')",
-                    language, language, escaped_query
+                    safe_language, safe_language, escaped_query
                 );
                 where_clauses.push(text_clause);
             }
@@ -978,8 +1002,25 @@ fn build_geo_box_clause(path: &str, box_coords: &bson::Array) -> String {
 
 /// Build SQL clause for legacy $polygon operator
 fn build_geo_polygon_clause(path: &str, poly_coords: &bson::Array) -> String {
-    // For legacy polygon, use the same bounding box approach
-    build_geo_box_clause(path, poly_coords)
+    // Compute bounding box from all polygon vertices
+    let escaped_path = escape_single(path.trim_start_matches("$"));
+    let (min_lon, max_lon, min_lat, max_lat) = extract_bounding_box(poly_coords);
+
+    // Check if we got valid bounds
+    if min_lon <= max_lon && min_lat <= max_lat {
+        return format!(
+            "(doc->'{}'->'coordinates'->>0)::float >= {} AND (doc->'{}'->'coordinates'->>0)::float <= {} AND (doc->'{}'->'coordinates'->>1)::float >= {} AND (doc->'{}'->'coordinates'->>1)::float <= {}",
+            escaped_path,
+            min_lon,
+            escaped_path,
+            max_lon,
+            escaped_path,
+            min_lat,
+            escaped_path,
+            max_lat
+        );
+    }
+    "FALSE".to_string()
 }
 
 /// Build SQL clause for $near/$nearSphere operators

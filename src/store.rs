@@ -951,6 +951,31 @@ impl PgStore {
 
         let t = Instant::now();
 
+        // Validate language against known PostgreSQL text search configurations
+        let valid_languages = [
+            "danish",
+            "dutch",
+            "english",
+            "finnish",
+            "french",
+            "german",
+            "hungarian",
+            "italian",
+            "norwegian",
+            "portuguese",
+            "romanian",
+            "russian",
+            "simple",
+            "spanish",
+            "swedish",
+            "turkish",
+        ];
+        let safe_language = if valid_languages.contains(&language) {
+            language.to_string()
+        } else {
+            "english".to_string()
+        };
+
         // Build the to_tsvector expression for multiple fields
         let tsvector_parts: Vec<String> = fields
             .iter()
@@ -961,7 +986,7 @@ impl PgStore {
         // Create GIN index on the concatenated text fields
         let ddl = format!(
             "CREATE INDEX IF NOT EXISTS {} ON {}.{} USING GIN (to_tsvector('{}', {}))",
-            q_idx, q_schema, q_table, language, tsvector_expr
+            q_idx, q_schema, q_table, safe_language, tsvector_expr
         );
 
         let client = self.pool.get().await.map_err(err_msg)?;
@@ -1001,6 +1026,31 @@ impl PgStore {
         // Escape single quotes for SQL string literal
         let escaped_search = search_text.replace("'", "''");
 
+        // Validate language against known PostgreSQL text search configurations
+        let valid_languages = [
+            "danish",
+            "dutch",
+            "english",
+            "finnish",
+            "french",
+            "german",
+            "hungarian",
+            "italian",
+            "norwegian",
+            "portuguese",
+            "romanian",
+            "russian",
+            "simple",
+            "spanish",
+            "swedish",
+            "turkish",
+        ];
+        let safe_language = if valid_languages.contains(&language) {
+            language.to_string()
+        } else {
+            "english".to_string()
+        };
+
         // Build the tsvector expression from the provided fields (must match index definition)
         let tsvector_parts: Vec<String> = if fields.is_empty() {
             // Default to searching all text fields if no fields specified
@@ -1015,7 +1065,7 @@ impl PgStore {
 
         let sql = format!(
             "SELECT id, doc FROM {}.{} WHERE to_tsvector('{}', {}) @@ plainto_tsquery('{}', '{}') LIMIT {}",
-            q_schema, q_table, language, tsvector_expr, language, escaped_search, limit
+            q_schema, q_table, safe_language, tsvector_expr, safe_language, escaped_search, limit
         );
 
         let client = self.pool.get().await.map_err(err_msg)?;
