@@ -989,6 +989,7 @@ impl PgStore {
         _case_sensitive: bool,
         _diacritic_sensitive: bool,
         limit: i64,
+        fields: &[String],
     ) -> Result<Vec<bson::Document>> {
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
@@ -1000,9 +1001,21 @@ impl PgStore {
         // Escape single quotes for SQL string literal
         let escaped_search = search_text.replace("'", "''");
 
+        // Build the tsvector expression from the provided fields (must match index definition)
+        let tsvector_parts: Vec<String> = if fields.is_empty() {
+            // Default to searching all text fields if no fields specified
+            vec!["doc::text".to_string()]
+        } else {
+            fields
+                .iter()
+                .map(|f| format!("COALESCE(doc->>'{}', '')", f.replace('"', "\"\"")))
+                .collect()
+        };
+        let tsvector_expr = tsvector_parts.join(" || ' ' || ");
+
         let sql = format!(
-            "SELECT id, doc FROM {}.{} WHERE to_tsvector('{}', doc->>'title' || ' ' || COALESCE(doc->>'content', '')) @@ plainto_tsquery('{}', '{}') LIMIT {}",
-            q_schema, q_table, language, language, escaped_search, limit
+            "SELECT id, doc FROM {}.{} WHERE to_tsvector('{}', {}) @@ plainto_tsquery('{}', '{}') LIMIT {}",
+            q_schema, q_table, language, tsvector_expr, language, escaped_search, limit
         );
 
         let client = self.pool.get().await.map_err(err_msg)?;
@@ -2458,8 +2471,17 @@ fn build_geo_box_clause(field: &str, box_coords: &bson::Array) -> String {
 
 /// Build SQL clause for legacy $polygon operator (using bson::Array)
 fn build_geo_polygon_clause(field: &str, poly_coords: &bson::Array) -> String {
-    // For legacy polygon, use the same bounding box approach
-    build_geo_box_clause(field, poly_coords)
+    // Compute bounding box from all polygon vertices
+    let (min_lon, max_lon, min_lat, max_lat) = extract_bounding_box_bson(poly_coords);
+
+    // Check if we got valid bounds (not the initial MAX/MIN values)
+    if min_lon <= max_lon && min_lat <= max_lat {
+        return format!(
+            "(doc->'{}'->'coordinates'->>0)::float >= {} AND (doc->'{}'->'coordinates'->>0)::float <= {} AND (doc->'{}'->'coordinates'->>1)::float >= {} AND (doc->'{}'->'coordinates'->>1)::float <= {}",
+            field, min_lon, field, max_lon, field, min_lat, field, max_lat
+        );
+    }
+    "FALSE".to_string()
 }
 
 /// Build SQL clause for $near/$nearSphere operators

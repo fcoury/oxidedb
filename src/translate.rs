@@ -110,7 +110,8 @@ pub fn build_where_from_filter_internal(filter: &bson::Document, is_nested: bool
 
                 // Build text search clause using to_tsvector and plainto_tsquery
                 // Search across the entire document text
-                let escaped_query = query.replace('"', "\"\"");
+                // Escape single quotes to prevent SQL injection
+                let escaped_query = query.replace('"', "\"\"").replace('\'', "''");
                 let text_clause = format!(
                     "to_tsvector('{}', doc::text) @@ plainto_tsquery('{}', '{}')",
                     language, language, escaped_query

@@ -169,6 +169,7 @@ async fn text_search_single_field() {
             false,
             false,
             10,
+            &["title".to_string()],
         )
         .await
         .expect("text search should succeed");
@@ -260,7 +261,16 @@ async fn text_search_multiple_fields() {
 
     // Test text search - should match in both title and content
     let results = store
-        .find_with_text_search("test", "articles", "Rust", "english", false, false, 10)
+        .find_with_text_search(
+            "test",
+            "articles",
+            "Rust",
+            "english",
+            false,
+            false,
+            10,
+            &["title".to_string(), "content".to_string()],
+        )
         .await
         .expect("text search should succeed");
 
@@ -336,7 +346,16 @@ async fn text_search_language_option() {
 
     // Test text search with English language (should handle stemming)
     let results = store
-        .find_with_text_search("test", "articles", "running", "english", false, false, 10)
+        .find_with_text_search(
+            "test",
+            "articles",
+            "running",
+            "english",
+            false,
+            false,
+            10,
+            &["title".to_string()],
+        )
         .await
         .expect("text search should succeed");
 
@@ -417,7 +436,16 @@ async fn text_search_with_filter() {
 
     // Test text search
     let results = store
-        .find_with_text_search("test", "articles", "Rust", "english", false, false, 10)
+        .find_with_text_search(
+            "test",
+            "articles",
+            "Rust",
+            "english",
+            false,
+            false,
+            10,
+            &["title".to_string()],
+        )
         .await
         .expect("text search should succeed");
 
