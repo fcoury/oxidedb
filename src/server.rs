@@ -3,6 +3,9 @@ use crate::error::Result;
 use crate::protocol::{
     MessageHeader, OP_MSG, OP_QUERY, decode_op_query, encode_op_msg, encode_op_reply,
 };
+use crate::session::{
+    ERROR_ILLEGAL_OPERATION, ERROR_NO_SUCH_TRANSACTION, ERROR_TRANSACTION_EXPIRED, SessionManager,
+};
 use crate::shadow::{ShadowSession, compare_docs};
 use crate::store::PgStore;
 use bson::{Document, doc};
@@ -11,6 +14,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use uuid::Uuid;
 
 /// Specification for $bucket aggregation stage
 #[derive(Clone, Debug)]
@@ -44,6 +48,8 @@ pub struct AppState {
     pub shadow_matches: std::sync::atomic::AtomicU64,
     pub shadow_mismatches: std::sync::atomic::AtomicU64,
     pub shadow_timeouts: std::sync::atomic::AtomicU64,
+    // Session management
+    pub session_manager: std::sync::Arc<SessionManager>,
 }
 
 pub async fn run(cfg: Config) -> Result<()> {
@@ -65,6 +71,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                     shadow_matches: std::sync::atomic::AtomicU64::new(0),
                     shadow_mismatches: std::sync::atomic::AtomicU64::new(0),
                     shadow_timeouts: std::sync::atomic::AtomicU64::new(0),
+                    session_manager: std::sync::Arc::new(SessionManager::new()),
                 }
             }
             Err(e) => {
@@ -78,6 +85,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                     shadow_matches: std::sync::atomic::AtomicU64::new(0),
                     shadow_mismatches: std::sync::atomic::AtomicU64::new(0),
                     shadow_timeouts: std::sync::atomic::AtomicU64::new(0),
+                    session_manager: std::sync::Arc::new(SessionManager::new()),
                 }
             }
         }
@@ -91,6 +99,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             shadow_matches: std::sync::atomic::AtomicU64::new(0),
             shadow_mismatches: std::sync::atomic::AtomicU64::new(0),
             shadow_timeouts: std::sync::atomic::AtomicU64::new(0),
+            session_manager: std::sync::Arc::new(SessionManager::new()),
         }
     };
     let state = Arc::new(state);
@@ -103,6 +112,22 @@ pub async fn run(cfg: Config) -> Result<()> {
         loop {
             tokio::time::sleep(sweep_interval).await;
             prune_cursors_once(&sweeper_state, ttl).await;
+        }
+    });
+
+    // Spawn session cleanup task
+    let session_cleanup_state = state.clone();
+    tokio::spawn(async move {
+        let cleanup_interval = Duration::from_secs(60); // Check every minute
+        loop {
+            tokio::time::sleep(cleanup_interval).await;
+            let removed = session_cleanup_state
+                .session_manager
+                .cleanup_expired_sessions()
+                .await;
+            if removed > 0 {
+                tracing::debug!(removed_sessions = removed, "cleaned up expired sessions");
+            }
         }
     });
 
@@ -150,6 +175,7 @@ pub async fn spawn_with_shutdown(
                     shadow_matches: std::sync::atomic::AtomicU64::new(0),
                     shadow_mismatches: std::sync::atomic::AtomicU64::new(0),
                     shadow_timeouts: std::sync::atomic::AtomicU64::new(0),
+                    session_manager: std::sync::Arc::new(SessionManager::new()),
                 }
             }
             Err(e) => {
@@ -163,6 +189,7 @@ pub async fn spawn_with_shutdown(
                     shadow_matches: std::sync::atomic::AtomicU64::new(0),
                     shadow_mismatches: std::sync::atomic::AtomicU64::new(0),
                     shadow_timeouts: std::sync::atomic::AtomicU64::new(0),
+                    session_manager: std::sync::Arc::new(SessionManager::new()),
                 }
             }
         }
@@ -176,6 +203,7 @@ pub async fn spawn_with_shutdown(
             shadow_matches: std::sync::atomic::AtomicU64::new(0),
             shadow_mismatches: std::sync::atomic::AtomicU64::new(0),
             shadow_timeouts: std::sync::atomic::AtomicU64::new(0),
+            session_manager: std::sync::Arc::new(SessionManager::new()),
         }
     };
     let state = std::sync::Arc::new(state);
@@ -194,6 +222,26 @@ pub async fn spawn_with_shutdown(
                 }
                 _ = sweeper_shutdown.changed() => {
                     if *sweeper_shutdown.borrow() { break; }
+                }
+            }
+        }
+    });
+
+    // Session cleanup task with shutdown
+    let session_cleanup_state = state.clone();
+    let mut session_cleanup_shutdown = shutdown_rx.clone();
+    tokio::spawn(async move {
+        let cleanup_interval = Duration::from_secs(60); // Check every minute
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(cleanup_interval) => {
+                    let removed = session_cleanup_state.session_manager.cleanup_expired_sessions().await;
+                    if removed > 0 {
+                        tracing::debug!(removed_sessions = removed, "cleaned up expired sessions");
+                    }
+                }
+                _ = session_cleanup_shutdown.changed() => {
+                    if *session_cleanup_shutdown.borrow() { break; }
                 }
             }
         }
@@ -481,6 +529,10 @@ async fn handle_command(state: &AppState, db: Option<&str>, mut cmd: Document) -
         "dropIndexes" => drop_indexes_reply(state, db, &cmd).await,
         "killCursors" => kill_cursors_reply(state, &cmd).await,
         "oxidedbShadowMetrics" => shadow_metrics_reply(state).await,
+        "startTransaction" => start_transaction_reply(state, db, &cmd).await,
+        "commitTransaction" => commit_transaction_reply(state, db, &cmd).await,
+        "abortTransaction" => abort_transaction_reply(state, db, &cmd).await,
+        "endSessions" => end_sessions_reply(state, &cmd).await,
         _ => {
             tracing::debug!(cmd = ?cmd, "unrecognized command; replying ok:0");
             error_doc(59, format!("Command '{}' not implemented", cmd_name))
@@ -2378,7 +2430,6 @@ fn apply_bucket(docs: &Vec<Document>, spec: &BucketSpec) -> Vec<Document> {
                     Acc::Count(c) => {
                         doc.insert(name.clone(), bson::Bson::Int64(*c));
                     }
-                    _ => {}
                 }
             }
 
@@ -2434,7 +2485,6 @@ fn apply_bucket(docs: &Vec<Document>, spec: &BucketSpec) -> Vec<Document> {
                 Acc::Count(c) => {
                     doc.insert(name.clone(), bson::Bson::Int64(*c));
                 }
-                _ => {}
             }
         }
 
@@ -4259,6 +4309,175 @@ async fn prune_cursors_once(state: &AppState, ttl: Duration) {
     }
 }
 
+// Helper to extract UUID from lsid document
+fn extract_lsid(cmd: &Document) -> Option<Uuid> {
+    cmd.get_document("lsid").ok().and_then(|lsid_doc| {
+        lsid_doc.get("id").and_then(|bson_val| {
+            if let bson::Bson::Binary(binary) = bson_val {
+                // UUID is stored as a Binary with subtype 4
+                if binary.subtype == bson::spec::BinarySubtype::Uuid {
+                    Uuid::from_slice(binary.bytes.as_slice()).ok()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+    })
+}
+
+// Helper to extract txnNumber from command
+fn extract_txn_number(cmd: &Document) -> Option<i64> {
+    cmd.get_i64("txnNumber")
+        .ok()
+        .or_else(|| cmd.get_i32("txnNumber").ok().map(|v| v as i64))
+}
+
+// Helper to extract autocommit from command
+fn extract_autocommit(cmd: &Document) -> Option<bool> {
+    cmd.get_bool("autocommit").ok()
+}
+
+async fn start_transaction_reply(state: &AppState, _db: Option<&str>, cmd: &Document) -> Document {
+    let lsid = match extract_lsid(cmd) {
+        Some(id) => id,
+        None => return error_doc(ERROR_ILLEGAL_OPERATION, "Missing or invalid lsid"),
+    };
+
+    let txn_number = match extract_txn_number(cmd) {
+        Some(n) => n,
+        None => return error_doc(ERROR_ILLEGAL_OPERATION, "Missing txnNumber"),
+    };
+
+    let session_arc = state.session_manager.get_or_create_session(lsid).await;
+    let mut session = session_arc.lock().await;
+
+    // Validate txnNumber is monotonically increasing
+    if let Err(code) = session.validate_txn_number(txn_number) {
+        return error_doc(code, "Invalid txnNumber");
+    }
+
+    // Check if already in transaction
+    if session.in_transaction {
+        return error_doc(ERROR_ILLEGAL_OPERATION, "Transaction already in progress");
+    }
+
+    // Get the pool from store
+    let pg = match state.store.as_ref() {
+        Some(pg) => pg,
+        None => return error_doc(13, "No storage configured"),
+    };
+
+    // Start the transaction
+    if let Err(e) = session.start_transaction(pg.pool()).await {
+        return error_doc(ERROR_NO_SUCH_TRANSACTION, e);
+    }
+
+    // Update session state
+    session.txn_number = txn_number;
+    session.autocommit = extract_autocommit(cmd).unwrap_or(true);
+
+    doc! { "ok": 1.0 }
+}
+
+async fn commit_transaction_reply(state: &AppState, _db: Option<&str>, cmd: &Document) -> Document {
+    let lsid = match extract_lsid(cmd) {
+        Some(id) => id,
+        None => return error_doc(ERROR_ILLEGAL_OPERATION, "Missing or invalid lsid"),
+    };
+
+    let txn_number = match extract_txn_number(cmd) {
+        Some(n) => n,
+        None => return error_doc(ERROR_ILLEGAL_OPERATION, "Missing txnNumber"),
+    };
+
+    let session_arc = match state.session_manager.get_session(lsid).await {
+        Some(s) => s,
+        None => return error_doc(ERROR_NO_SUCH_TRANSACTION, "Session not found"),
+    };
+
+    let mut session = session_arc.lock().await;
+
+    // Check if in transaction
+    if !session.in_transaction {
+        return error_doc(ERROR_NO_SUCH_TRANSACTION, "No transaction in progress");
+    }
+
+    // Check for transaction expiry
+    if session.is_transaction_expired(Duration::from_secs(60)) {
+        let _ = session.abort_transaction().await;
+        return error_doc(ERROR_TRANSACTION_EXPIRED, "Transaction has expired");
+    }
+
+    // Validate txnNumber
+    if txn_number < session.txn_number {
+        // This is a retry - check for cached result
+        if let Some(result) = session.get_retryable_write(txn_number).cloned() {
+            return result.to_document();
+        }
+    }
+
+    // Commit the transaction
+    if let Err(e) = session.commit_transaction().await {
+        return error_doc(ERROR_NO_SUCH_TRANSACTION, e);
+    }
+
+    // Update session state
+    session.txn_number = txn_number;
+
+    doc! { "ok": 1.0 }
+}
+
+async fn abort_transaction_reply(state: &AppState, _db: Option<&str>, cmd: &Document) -> Document {
+    let lsid = match extract_lsid(cmd) {
+        Some(id) => id,
+        None => return error_doc(ERROR_ILLEGAL_OPERATION, "Missing or invalid lsid"),
+    };
+
+    let session_arc = match state.session_manager.get_session(lsid).await {
+        Some(s) => s,
+        None => return error_doc(ERROR_NO_SUCH_TRANSACTION, "Session not found"),
+    };
+
+    let mut session = session_arc.lock().await;
+
+    // Check if in transaction
+    if !session.in_transaction {
+        return error_doc(ERROR_NO_SUCH_TRANSACTION, "No transaction in progress");
+    }
+
+    // Abort the transaction
+    if let Err(e) = session.abort_transaction().await {
+        return error_doc(ERROR_NO_SUCH_TRANSACTION, e);
+    }
+
+    doc! { "ok": 1.0 }
+}
+
+async fn end_sessions_reply(state: &AppState, cmd: &Document) -> Document {
+    let ids = match cmd.get_array("endSessions") {
+        Ok(arr) => arr,
+        Err(_) => return error_doc(ERROR_ILLEGAL_OPERATION, "Missing endSessions array"),
+    };
+
+    for id_bson in ids {
+        if let Some(lsid_doc) = id_bson.as_document() {
+            if let Some(bson_val) = lsid_doc.get("id") {
+                if let bson::Bson::Binary(binary) = bson_val {
+                    if binary.subtype == bson::spec::BinarySubtype::Uuid {
+                        if let Ok(uuid) = Uuid::from_slice(binary.bytes.as_slice()) {
+                            state.session_manager.end_session(uuid).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    doc! { "ok": 1.0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4274,6 +4493,7 @@ mod tests {
             shadow_matches: std::sync::atomic::AtomicU64::new(0),
             shadow_mismatches: std::sync::atomic::AtomicU64::new(0),
             shadow_timeouts: std::sync::atomic::AtomicU64::new(0),
+            session_manager: std::sync::Arc::new(SessionManager::new()),
         };
         {
             let mut map = state.cursors.lock().await;

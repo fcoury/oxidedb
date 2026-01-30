@@ -29,6 +29,7 @@ base64 = "0.22"
 tokio-rustls = "0.26"
 rustls-pemfile = "2.0"
 webpki-roots = "0.26"
+uuid = { version = "1.10", features = ["v4", "serde"] }
 
 [dev-dependencies]
 tokio = { version = "1.39", features = ["full"] }

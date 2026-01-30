@@ -33,6 +33,10 @@ impl PgStore {
         })
     }
 
+    pub fn pool(&self) -> &Pool {
+        &self.pool
+    }
+
     pub async fn bootstrap(&self) -> Result<()> {
         // Create metadata schema and tables
         let client = self.pool.get().await.map_err(err_msg)?;
@@ -1733,6 +1737,190 @@ impl PgStore {
         let sql = format!("DELETE FROM {}.{} WHERE id = $1", q_schema, q_table);
         let n = tx.execute(&sql, &[&id]).await.map_err(err_msg)?;
         Ok(n)
+    }
+
+    /// Transaction-aware insert: uses transaction client if provided, otherwise uses pool
+    pub async fn insert_one_tx_opt(
+        &self,
+        tx: Option<&Transaction<'_>>,
+        db: &str,
+        coll: &str,
+        id: &[u8],
+        bson_bytes: &[u8],
+        json: &serde_json::Value,
+    ) -> Result<u64> {
+        self.ensure_collection(db, coll).await?;
+        let schema = schema_name(db);
+        let q_schema = q_ident(&schema);
+        let q_table = q_ident(coll);
+        let sql = format!(
+            "INSERT INTO {}.{} (id, doc_bson, doc) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING",
+            q_schema, q_table
+        );
+        let t = Instant::now();
+        let n = if let Some(transaction) = tx {
+            transaction
+                .execute(&sql, &[&id, &bson_bytes, &json])
+                .await
+                .map_err(err_msg)?
+        } else {
+            let client = self.pool.get().await.map_err(err_msg)?;
+            client
+                .execute(&sql, &[&id, &bson_bytes, &json])
+                .await
+                .map_err(err_msg)?
+        };
+        tracing::debug!(op="insert_one_tx_opt", db=%db, coll=%coll, elapsed_ms=?t.elapsed().as_millis());
+        Ok(n)
+    }
+
+    /// Transaction-aware update: uses transaction client if provided, otherwise uses pool
+    pub async fn update_doc_by_id_tx_opt(
+        &self,
+        tx: Option<&Transaction<'_>>,
+        db: &str,
+        coll: &str,
+        id: &[u8],
+        new_doc: &bson::Document,
+    ) -> Result<u64> {
+        let schema = schema_name(db);
+        let q_schema = q_ident(&schema);
+        let q_table = q_ident(coll);
+        let sql = format!(
+            "UPDATE {}.{} SET doc_bson = $1, doc = $2 WHERE id = $3",
+            q_schema, q_table
+        );
+        let bson_bytes = bson::to_vec(new_doc).map_err(err_msg)?;
+        let json = serde_json::to_value(new_doc).map_err(err_msg)?;
+        let t = Instant::now();
+        let n = if let Some(transaction) = tx {
+            transaction
+                .execute(&sql, &[&bson_bytes, &json, &id])
+                .await
+                .map_err(err_msg)?
+        } else {
+            let client = self.pool.get().await.map_err(err_msg)?;
+            client
+                .execute(&sql, &[&bson_bytes, &json, &id])
+                .await
+                .map_err(err_msg)?
+        };
+        tracing::debug!(op="update_doc_by_id_tx_opt", db=%db, coll=%coll, elapsed_ms=?t.elapsed().as_millis());
+        Ok(n)
+    }
+
+    /// Transaction-aware delete: uses transaction client if provided, otherwise uses pool
+    pub async fn delete_by_id_tx_opt(
+        &self,
+        tx: Option<&Transaction<'_>>,
+        db: &str,
+        coll: &str,
+        id: &[u8],
+    ) -> Result<u64> {
+        let schema = schema_name(db);
+        let q_schema = q_ident(&schema);
+        let q_table = q_ident(coll);
+        let sql = format!("DELETE FROM {}.{} WHERE id = $1", q_schema, q_table);
+        let t = Instant::now();
+        let n = if let Some(transaction) = tx {
+            transaction.execute(&sql, &[&id]).await.map_err(err_msg)?
+        } else {
+            let client = self.pool.get().await.map_err(err_msg)?;
+            client.execute(&sql, &[&id]).await.map_err(err_msg)?
+        };
+        tracing::debug!(op="delete_by_id_tx_opt", db=%db, coll=%coll, elapsed_ms=?t.elapsed().as_millis());
+        Ok(n)
+    }
+
+    /// Transaction-aware find: uses transaction client if provided, otherwise uses pool
+    pub async fn find_docs_tx_opt(
+        &self,
+        tx: Option<&Transaction<'_>>,
+        db: &str,
+        coll: &str,
+        filter: Option<&bson::Document>,
+        sort: Option<&bson::Document>,
+        projection: Option<&bson::Document>,
+        limit: i64,
+    ) -> Result<Vec<bson::Document>> {
+        let schema = schema_name(db);
+        let q_schema = q_ident(&schema);
+        let q_table = q_ident(coll);
+        let where_sql = filter.map(build_where_from_filter);
+        let order_sql = build_order_by(sort);
+
+        let t = Instant::now();
+        let res = if let Some(transaction) = tx {
+            match &where_sql {
+                Some(where_clause) => {
+                    let sql = format!(
+                        "SELECT doc_bson, doc FROM {}.{} WHERE {} {} LIMIT {}",
+                        q_schema, q_table, where_clause, order_sql, limit
+                    );
+                    transaction.query(&sql, &[]).await
+                }
+                None => {
+                    let sql = format!(
+                        "SELECT doc_bson, doc FROM {}.{} WHERE TRUE {} LIMIT {}",
+                        q_schema, q_table, order_sql, limit
+                    );
+                    transaction.query(&sql, &[]).await
+                }
+            }
+        } else {
+            let client = self.pool.get().await.map_err(err_msg)?;
+            match &where_sql {
+                Some(where_clause) => {
+                    let sql = format!(
+                        "SELECT doc_bson, doc FROM {}.{} WHERE {} {} LIMIT {}",
+                        q_schema, q_table, where_clause, order_sql, limit
+                    );
+                    client.query(&sql, &[]).await
+                }
+                None => {
+                    let sql = format!(
+                        "SELECT doc_bson, doc FROM {}.{} WHERE TRUE {} LIMIT {}",
+                        q_schema, q_table, order_sql, limit
+                    );
+                    client.query(&sql, &[]).await
+                }
+            }
+        };
+
+        let rows = match res {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("does not exist") {
+                    return Ok(Vec::new());
+                }
+                return Err(err_msg(e));
+            }
+        };
+
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let bson_bytes: Option<Vec<u8>> = r.try_get(0).ok();
+            if let Some(bytes) = bson_bytes {
+                if let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes)) {
+                    out.push(if let Some(p) = projection {
+                        project_document(&doc, p)
+                    } else {
+                        doc
+                    });
+                    continue;
+                }
+            }
+            let json: serde_json::Value = r.get(1);
+            let d = to_doc_from_json(json);
+            out.push(if let Some(p) = projection {
+                project_document(&d, p)
+            } else {
+                d
+            });
+        }
+        tracing::debug!(op="find_docs_tx_opt", db=%db, coll=%coll, elapsed_ms=?t.elapsed().as_millis());
+        Ok(out)
     }
 }
 

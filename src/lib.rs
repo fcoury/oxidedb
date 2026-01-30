@@ -5,6 +5,7 @@ pub mod namespace;
 pub mod protocol;
 pub mod scram;
 pub mod server;
+pub mod session;
 pub mod shadow;
 pub mod store;
 pub mod translate;
