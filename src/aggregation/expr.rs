@@ -16,6 +16,9 @@ pub enum Expr {
     Remove,  // $$REMOVE
     Now,     // $$NOW
 
+    // User-defined variables
+    Var(String), // $$varname
+
     // Arithmetic
     Add(Vec<Expr>),
     Subtract(Box<Expr>, Box<Expr>),
@@ -142,7 +145,7 @@ pub fn parse_expr(bson: &Bson) -> anyhow::Result<Expr> {
                 "$$NOW" => Ok(Expr::Now),
                 _ => {
                     // User-defined variable
-                    Ok(Expr::Literal(Bson::String(s.clone())))
+                    Ok(Expr::Var(s[2..].to_string()))
                 }
             }
         }
@@ -392,11 +395,16 @@ pub fn eval_expr(expr: &Expr, ctx: &ExprEvalContext) -> anyhow::Result<Bson> {
         }
         Expr::Root => Ok(Bson::Document(ctx.root.clone())),
         Expr::Current => Ok(Bson::Document(ctx.current.clone())),
-        Expr::Remove => Ok(Bson::Null), // Special marker
+        Expr::Remove => Ok(Bson::Undefined), // Special marker for $$REMOVE
         Expr::Now => {
             // Return current timestamp
             Ok(Bson::DateTime(bson::DateTime::now()))
         }
+        Expr::Var(name) => ctx
+            .vars
+            .get(name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Use of undefined variable: {}", name)),
         Expr::Add(exprs) => {
             let mut sum_i128: i128 = 0;
             let mut has_double = false;

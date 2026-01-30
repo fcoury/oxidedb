@@ -87,7 +87,10 @@ pub fn execute(docs: Vec<Document>, spec: &Document) -> anyhow::Result<Vec<Docum
                         // Computed field - evaluate expression
                         let expr = parse_expr(value)?;
                         let evaluated = eval_expr(&expr, &ctx)?;
-                        projected.insert(key, evaluated);
+                        // Skip fields that evaluate to $$REMOVE (Bson::Undefined)
+                        if !matches!(evaluated, Bson::Undefined) {
+                            projected.insert(key, evaluated);
+                        }
                     }
                 }
             }

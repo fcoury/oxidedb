@@ -71,10 +71,20 @@ pub async fn execute_pipeline(
     let mut main_coll_fetched = false;
 
     for stage in pipeline.stages {
+        // Fetch collection if not yet fetched and this is not a $match stage
+        if !main_coll_fetched && !matches!(stage, Stage::Match(_)) {
+            if let Some(pg) = ctx.pg {
+                docs = pg
+                    .find_docs(&ctx.db, &ctx.coll, None, None, None, 100_000)
+                    .await?;
+                main_coll_fetched = true;
+            }
+        }
+
         match stage {
             Stage::Match(filter) => {
                 if !main_coll_fetched {
-                    // First match - fetch from collection
+                    // First match - fetch from collection with filter
                     if let Some(pg) = ctx.pg {
                         docs = pg
                             .find_docs(&ctx.db, &ctx.coll, Some(&filter), None, None, 100_000)
@@ -114,7 +124,10 @@ pub async fn execute_pipeline(
                 docs = crate::aggregation::stages::skip::execute(docs, n)?;
             }
             Stage::Count(field) => {
-                return Ok(ExecResult::Cursor(vec![doc! { field: docs.len() as i32 }]));
+                // Transform docs into a single document with the count
+                // This is NOT terminal - subsequent stages can process the count document
+                let count = docs.len() as i32;
+                docs = vec![doc! { field: count }];
             }
             Stage::Group { id, accumulators } => {
                 docs = crate::aggregation::stages::group::execute(docs, &id, &accumulators)?;

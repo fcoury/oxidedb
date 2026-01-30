@@ -8,7 +8,7 @@ use crate::session::{
 };
 use crate::shadow::{ShadowSession, compare_docs};
 use crate::store::PgStore;
-use bson::{Document, doc};
+use bson::{Bson, Document, doc};
 
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -3596,13 +3596,20 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
     let cursor_spec = cmd.get_document("cursor").unwrap_or(&doc! {}).clone();
     let batch_size = cursor_spec.get_i32("batchSize").unwrap_or(101) as i64;
 
-    // Create execution context
+    // Create execution context with let variables
     let allow_disk_use = pipeline.options.allow_disk_use;
-    let ctx = crate::aggregation::ExecContext::new(
+    let let_vars: std::collections::HashMap<String, Bson> = pipeline
+        .options
+        .let_vars
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let ctx = crate::aggregation::ExecContext::with_vars(
         Some(pg),
         dbname.clone(),
         coll.clone(),
         allow_disk_use,
+        let_vars,
     );
 
     // Execute the pipeline

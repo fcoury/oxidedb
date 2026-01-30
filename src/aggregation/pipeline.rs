@@ -473,7 +473,7 @@ impl Pipeline {
                     let pipeline = if let Ok(arr) = doc.get_array("pipeline") {
                         arr.iter()
                             .filter_map(|v| v.as_document())
-                            .map(|d| Self::parse_stage(d))
+                            .map(Self::parse_stage)
                             .collect::<Result<Vec<_>, _>>()?
                     } else {
                         Vec::new()

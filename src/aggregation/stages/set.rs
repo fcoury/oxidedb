@@ -1,5 +1,5 @@
 use crate::aggregation::expr::{ExprEvalContext, eval_expr, parse_expr};
-use bson::Document;
+use bson::{Bson, Document};
 
 pub fn execute(docs: Vec<Document>, spec: &Document) -> anyhow::Result<Vec<Document>> {
     let mut result = Vec::new();
@@ -11,7 +11,10 @@ pub fn execute(docs: Vec<Document>, spec: &Document) -> anyhow::Result<Vec<Docum
         for (key, value) in spec.iter() {
             let expr = parse_expr(value)?;
             let evaluated = eval_expr(&expr, &ctx)?;
-            new_doc.insert(key, evaluated);
+            // Skip fields that evaluate to $$REMOVE (Bson::Undefined)
+            if !matches!(evaluated, Bson::Undefined) {
+                new_doc.insert(key, evaluated);
+            }
         }
 
         result.push(new_doc);

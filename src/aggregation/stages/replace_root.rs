@@ -9,6 +9,11 @@ pub fn execute(docs: Vec<Document>, replacement: &Bson) -> anyhow::Result<Vec<Do
         let expr = parse_expr(replacement)?;
         let evaluated = eval_expr(&expr, &ctx)?;
 
+        // Check for $$REMOVE which is not allowed in $replaceRoot
+        if matches!(evaluated, Bson::Undefined) {
+            return Err(anyhow::anyhow!("$replaceRoot with $$REMOVE is not allowed"));
+        }
+
         // Must be a document
         if let Bson::Document(new_doc) = evaluated {
             result.push(new_doc);
