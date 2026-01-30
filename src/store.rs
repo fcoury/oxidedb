@@ -932,6 +932,104 @@ impl PgStore {
         Ok(())
     }
 
+    /// Create a text index for full-text search using PostgreSQL GIN index with to_tsvector
+    pub async fn create_index_text(
+        &self,
+        db: &str,
+        coll: &str,
+        name: &str,
+        fields: &[String],
+        language: &str,
+        spec: &serde_json::Value,
+    ) -> Result<()> {
+        // Ensure collection (schema/table) exists
+        self.ensure_collection(db, coll).await?;
+        let schema = schema_name(db);
+        let q_schema = q_ident(&schema);
+        let q_table = q_ident(coll);
+        let q_idx = q_ident(name);
+
+        let t = Instant::now();
+
+        // Build the to_tsvector expression for multiple fields
+        let tsvector_parts: Vec<String> = fields
+            .iter()
+            .map(|f| format!("COALESCE(doc->>'{}', '')", f.replace('"', "\"\"")))
+            .collect();
+        let tsvector_expr = tsvector_parts.join(" || ' ' || ");
+
+        // Create GIN index on the concatenated text fields
+        let ddl = format!(
+            "CREATE INDEX IF NOT EXISTS {} ON {}.{} USING GIN (to_tsvector('{}', {}))",
+            q_idx, q_schema, q_table, language, tsvector_expr
+        );
+
+        let client = self.pool.get().await.map_err(err_msg)?;
+        client.batch_execute(&ddl).await.map_err(err_msg)?;
+
+        // Persist metadata
+        client
+            .execute(
+                "INSERT INTO mdb_meta.indexes(db, coll, name, spec, sql) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (db, coll, name) DO UPDATE SET spec = EXCLUDED.spec, sql = EXCLUDED.sql",
+                &[&db, &coll, &name, &spec, &ddl],
+            )
+            .await
+            .map_err(err_msg)?;
+        tracing::debug!(op="create_index_text", db=%db, coll=%coll, name=%name, fields=?fields, language=%language, elapsed_ms=?t.elapsed().as_millis());
+        Ok(())
+    }
+
+    /// Find documents using full-text search
+    pub async fn find_with_text_search(
+        &self,
+        db: &str,
+        coll: &str,
+        search_text: &str,
+        language: &str,
+        _case_sensitive: bool,
+        _diacritic_sensitive: bool,
+        limit: i64,
+    ) -> Result<Vec<bson::Document>> {
+        let schema = schema_name(db);
+        let q_schema = q_ident(&schema);
+        let q_table = q_ident(coll);
+
+        let t = Instant::now();
+
+        // Build the text search query using plainto_tsquery for safe parsing
+        // Escape single quotes for SQL string literal
+        let escaped_search = search_text.replace("'", "''");
+
+        let sql = format!(
+            "SELECT id, doc FROM {}.{} WHERE to_tsvector('{}', doc->>'title' || ' ' || COALESCE(doc->>'content', '')) @@ plainto_tsquery('{}', '{}') LIMIT {}",
+            q_schema, q_table, language, language, escaped_search, limit
+        );
+
+        let client = self.pool.get().await.map_err(err_msg)?;
+        let rows = client.query(&sql, &[]).await.map_err(err_msg)?;
+
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            let _id: Vec<u8> = row.get("id");
+            let doc_json: serde_json::Value = row.get("doc");
+            let mut doc = bson::to_document(&doc_json)
+                .map_err(|e| Error::Msg(format!("Failed to convert JSON to BSON: {}", e)))?;
+            // Restore _id as ObjectId or String
+            if _id.len() == 12 {
+                doc.insert(
+                    "_id",
+                    bson::oid::ObjectId::from_bytes(_id.try_into().unwrap()),
+                );
+            } else {
+                doc.insert("_id", String::from_utf8_lossy(&_id).to_string());
+            }
+            results.push(doc);
+        }
+
+        tracing::debug!(op="find_with_text_search", db=%db, coll=%coll, search_text=%search_text, results_count=%results.len(), elapsed_ms=?t.elapsed().as_millis());
+        Ok(results)
+    }
+
     pub async fn count_docs(
         &self,
         db: &str,
