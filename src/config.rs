@@ -243,16 +243,12 @@ pub fn should_sample_deterministically(request_id: i32, db: &str, sample_rate: f
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ShadowMode {
+    #[default]
     CompareOnly,
     CompareAndFail,
     RecordOnly,
-}
-
-impl Default for ShadowMode {
-    fn default() -> Self {
-        ShadowMode::CompareOnly
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -288,10 +288,7 @@ pub fn decode_op_reply_first_doc(body: &[u8]) -> Option<Document> {
     }
     let doc_bytes = &body[i..];
     let mut cur = std::io::Cursor::new(doc_bytes);
-    match bson::Document::from_reader(&mut cur) {
-        Ok(doc) => Some(doc),
-        Err(_) => None,
-    }
+    bson::Document::from_reader(&mut cur).ok()
 }
 
 /// OP_COMPRESSED body structure:

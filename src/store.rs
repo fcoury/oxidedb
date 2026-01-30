@@ -256,11 +256,11 @@ impl PgStore {
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
             let bson_bytes: Option<Vec<u8>> = r.try_get(0).ok();
-            if let Some(bytes) = bson_bytes {
-                if let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes)) {
-                    out.push(doc);
-                    continue;
-                }
+            if let Some(bytes) = bson_bytes
+                && let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes))
+            {
+                out.push(doc);
+                continue;
             }
             let json: serde_json::Value = r.get(1);
             let doc = to_doc_from_json(json);
@@ -299,11 +299,11 @@ impl PgStore {
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
             let bson_bytes: Option<Vec<u8>> = r.try_get(0).ok();
-            if let Some(bytes) = bson_bytes {
-                if let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes)) {
-                    out.push(doc);
-                    continue;
-                }
+            if let Some(bytes) = bson_bytes
+                && let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes))
+            {
+                out.push(doc);
+                continue;
             }
             let json: serde_json::Value = r.get(1);
             let doc = to_doc_from_json(json);
@@ -343,11 +343,11 @@ impl PgStore {
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
             let bson_bytes: Option<Vec<u8>> = r.try_get(0).ok();
-            if let Some(bytes) = bson_bytes {
-                if let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes)) {
-                    out.push(doc);
-                    continue;
-                }
+            if let Some(bytes) = bson_bytes
+                && let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes))
+            {
+                out.push(doc);
+                continue;
             }
             let json: serde_json::Value = r.get(1);
             let doc = to_doc_from_json(json);
@@ -383,14 +383,14 @@ impl PgStore {
                     for (op, val) in d.iter() {
                         match op.as_str() {
                             "$elemMatch" => {
-                                if let bson::Bson::Document(em) = val {
-                                    if let Some(pred) = build_elem_match_pred(&path, em) {
-                                        let jsonpath = format!("{}[*] ? ({})", path, pred);
-                                        where_clauses.push(format!(
-                                            "jsonb_path_exists(doc, '{}')",
-                                            escape_single(&jsonpath)
-                                        ));
-                                    }
+                                if let bson::Bson::Document(em) = val
+                                    && let Some(pred) = build_elem_match_pred(&path, em)
+                                {
+                                    let jsonpath = format!("{}[*] ? ({})", path, pred);
+                                    where_clauses.push(format!(
+                                        "jsonb_path_exists(doc, '{}')",
+                                        escape_single(&jsonpath)
+                                    ));
                                 }
                             }
                             "$exists" => {
@@ -503,11 +503,11 @@ impl PgStore {
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
             let bson_bytes: Option<Vec<u8>> = r.try_get(0).ok();
-            if let Some(bytes) = bson_bytes {
-                if let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes)) {
-                    out.push(doc);
-                    continue;
-                }
+            if let Some(bytes) = bson_bytes
+                && let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes))
+            {
+                out.push(doc);
+                continue;
             }
             let json: serde_json::Value = r.get(1);
             let doc = to_doc_from_json(json);
@@ -528,12 +528,12 @@ impl PgStore {
         limit: i64,
     ) -> Result<Vec<bson::Document>> {
         // Check for $text operator - should be handled by server layer
-        if let Some(f) = filter {
-            if f.contains_key("$text") {
-                return Err(Error::Msg(
-                    "$text must be handled by the server layer, not find_docs".into(),
-                ));
-            }
+        if let Some(f) = filter
+            && f.contains_key("$text")
+        {
+            return Err(Error::Msg(
+                "$text must be handled by the server layer, not find_docs".into(),
+            ));
         }
 
         let schema = schema_name(db);
@@ -611,15 +611,15 @@ impl PgStore {
             let mut out = Vec::with_capacity(rows.len());
             for r in rows {
                 let bson_bytes: Option<Vec<u8>> = r.try_get(0).ok();
-                if let Some(bytes) = bson_bytes {
-                    if let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes)) {
-                        out.push(if let Some(p) = projection {
-                            project_document(&doc, p)
-                        } else {
-                            doc
-                        });
-                        continue;
-                    }
+                if let Some(bytes) = bson_bytes
+                    && let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes))
+                {
+                    out.push(if let Some(p) = projection {
+                        project_document(&doc, p)
+                    } else {
+                        doc
+                    });
+                    continue;
                 }
                 let json: serde_json::Value = r.get(1);
                 let d = to_doc_from_json(json);
@@ -635,6 +635,7 @@ impl PgStore {
     }
 
     /// Find with a specific client (for transaction support)
+    #[allow(clippy::too_many_arguments)]
     pub async fn find_docs_with_client(
         &self,
         client: &tokio_postgres::Client,
@@ -717,15 +718,15 @@ impl PgStore {
             let mut out = Vec::with_capacity(rows.len());
             for r in rows {
                 let bson_bytes: Option<Vec<u8>> = r.try_get(0).ok();
-                if let Some(bytes) = bson_bytes {
-                    if let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes)) {
-                        out.push(if let Some(p) = projection {
-                            project_document(&doc, p)
-                        } else {
-                            doc
-                        });
-                        continue;
-                    }
+                if let Some(bytes) = bson_bytes
+                    && let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes))
+                {
+                    out.push(if let Some(p) = projection {
+                        project_document(&doc, p)
+                    } else {
+                        doc
+                    });
+                    continue;
                 }
                 let json: serde_json::Value = r.get(1);
                 let d = to_doc_from_json(json);
@@ -763,11 +764,11 @@ impl PgStore {
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
             let bson_bytes: Option<Vec<u8>> = r.try_get(0).ok();
-            if let Some(bytes) = bson_bytes {
-                if let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes)) {
-                    out.push(doc);
-                    continue;
-                }
+            if let Some(bytes) = bson_bytes
+                && let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes))
+            {
+                out.push(doc);
+                continue;
             }
             let json: serde_json::Value = r.get(1);
             let b = bson::to_bson(&json).unwrap_or(bson::Bson::Document(bson::Document::new()));
@@ -1071,6 +1072,7 @@ impl PgStore {
     }
 
     /// Find documents using full-text search
+    #[allow(clippy::too_many_arguments)]
     pub async fn find_with_text_search(
         &self,
         db: &str,
@@ -1170,12 +1172,12 @@ impl PgStore {
         filter: Option<&bson::Document>,
     ) -> Result<i64> {
         // Check for $text operator - not supported in count operations
-        if let Some(f) = filter {
-            if f.contains_key("$text") {
-                return Err(Error::Msg(
-                    "$text is not supported in count operations".into(),
-                ));
-            }
+        if let Some(f) = filter
+            && f.contains_key("$text")
+        {
+            return Err(Error::Msg(
+                "$text is not supported in count operations".into(),
+            ));
         }
 
         let schema = schema_name(db);
@@ -1240,10 +1242,10 @@ impl PgStore {
             }
             let r = &rows[0];
             let id: Vec<u8> = r.get(0);
-            if let Ok(bytes) = r.try_get::<usize, Vec<u8>>(1) {
-                if let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes)) {
-                    return Ok(Some((id, doc)));
-                }
+            if let Ok(bytes) = r.try_get::<usize, Vec<u8>>(1)
+                && let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes))
+            {
+                return Ok(Some((id, doc)));
             }
             let json: serde_json::Value = r.get(2);
             let b = bson::to_bson(&json).unwrap_or(bson::Bson::Document(bson::Document::new()));
@@ -1267,10 +1269,10 @@ impl PgStore {
         let r = &rows[0];
         let id: Vec<u8> = r.get(0);
         // Prefer bson if present
-        if let Ok(bytes) = r.try_get::<usize, Vec<u8>>(1) {
-            if let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes)) {
-                return Ok(Some((id, doc)));
-            }
+        if let Ok(bytes) = r.try_get::<usize, Vec<u8>>(1)
+            && let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes))
+        {
+            return Ok(Some((id, doc)));
         }
         let json: serde_json::Value = r.get(2);
         let b = bson::to_bson(&json).unwrap_or(bson::Bson::Document(bson::Document::new()));
@@ -1405,81 +1407,81 @@ fn build_where_from_filter_internal(filter: &bson::Document, is_nested: bool) ->
     let mut where_clauses: Vec<String> = Vec::new();
 
     // Handle logical operators at the top level first
-    if let Some(or_val) = filter.get("$or") {
-        if let bson::Bson::Array(arr) = or_val {
-            let mut or_clauses: Vec<String> = Vec::new();
-            for item in arr {
-                if let bson::Bson::Document(d) = item {
-                    let clause = build_where_from_filter_internal(d, true);
-                    if clause != "TRUE" {
-                        or_clauses.push(clause);
-                    }
+    if let Some(or_val) = filter.get("$or")
+        && let bson::Bson::Array(arr) = or_val
+    {
+        let mut or_clauses: Vec<String> = Vec::new();
+        for item in arr {
+            if let bson::Bson::Document(d) = item {
+                let clause = build_where_from_filter_internal(d, true);
+                if clause != "TRUE" {
+                    or_clauses.push(clause);
                 }
             }
-            if !or_clauses.is_empty() {
-                let joined = or_clauses.join(" OR ");
-                where_clauses.push(if or_clauses.len() > 1 {
+        }
+        if !or_clauses.is_empty() {
+            let joined = or_clauses.join(" OR ");
+            where_clauses.push(if or_clauses.len() > 1 {
+                format!("({})", joined)
+            } else {
+                joined
+            });
+        }
+    }
+
+    if let Some(and_val) = filter.get("$and")
+        && let bson::Bson::Array(arr) = and_val
+    {
+        let mut and_clauses: Vec<String> = Vec::new();
+        for item in arr {
+            if let bson::Bson::Document(d) = item {
+                let clause = build_where_from_filter_internal(d, true);
+                if clause != "TRUE" {
+                    and_clauses.push(clause);
+                }
+            }
+        }
+        if !and_clauses.is_empty() {
+            let joined = and_clauses.join(" AND ");
+            where_clauses.push(if and_clauses.len() > 1 {
+                format!("({})", joined)
+            } else {
+                joined
+            });
+        }
+    }
+
+    if let Some(not_val) = filter.get("$not")
+        && let bson::Bson::Document(d) = not_val
+    {
+        let clause = build_where_from_filter_internal(d, true);
+        if clause != "TRUE" {
+            where_clauses.push(format!("NOT ({})", clause));
+        }
+    }
+
+    if let Some(nor_val) = filter.get("$nor")
+        && let bson::Bson::Array(arr) = nor_val
+    {
+        let mut nor_clauses: Vec<String> = Vec::new();
+        for item in arr {
+            if let bson::Bson::Document(d) = item {
+                let clause = build_where_from_filter_internal(d, true);
+                if clause != "TRUE" {
+                    nor_clauses.push(clause);
+                }
+            }
+        }
+        if !nor_clauses.is_empty() {
+            let joined = nor_clauses.join(" OR ");
+            where_clauses.push(format!(
+                "NOT ({})",
+                if nor_clauses.len() > 1 {
                     format!("({})", joined)
                 } else {
                     joined
-                });
-            }
-        }
-    }
-
-    if let Some(and_val) = filter.get("$and") {
-        if let bson::Bson::Array(arr) = and_val {
-            let mut and_clauses: Vec<String> = Vec::new();
-            for item in arr {
-                if let bson::Bson::Document(d) = item {
-                    let clause = build_where_from_filter_internal(d, true);
-                    if clause != "TRUE" {
-                        and_clauses.push(clause);
-                    }
                 }
-            }
-            if !and_clauses.is_empty() {
-                let joined = and_clauses.join(" AND ");
-                where_clauses.push(if and_clauses.len() > 1 {
-                    format!("({})", joined)
-                } else {
-                    joined
-                });
-            }
-        }
-    }
-
-    if let Some(not_val) = filter.get("$not") {
-        if let bson::Bson::Document(d) = not_val {
-            let clause = build_where_from_filter_internal(d, true);
-            if clause != "TRUE" {
-                where_clauses.push(format!("NOT ({})", clause));
-            }
-        }
-    }
-
-    if let Some(nor_val) = filter.get("$nor") {
-        if let bson::Bson::Array(arr) = nor_val {
-            let mut nor_clauses: Vec<String> = Vec::new();
-            for item in arr {
-                if let bson::Bson::Document(d) = item {
-                    let clause = build_where_from_filter_internal(d, true);
-                    if clause != "TRUE" {
-                        nor_clauses.push(clause);
-                    }
-                }
-            }
-            if !nor_clauses.is_empty() {
-                let joined = nor_clauses.join(" OR ");
-                where_clauses.push(format!(
-                    "NOT ({})",
-                    if nor_clauses.len() > 1 {
-                        format!("({})", joined)
-                    } else {
-                        joined
-                    }
-                ));
-            }
+            ));
         }
     }
 
@@ -1494,14 +1496,14 @@ fn build_where_from_filter_internal(filter: &bson::Document, is_nested: bool) ->
                 for (op, val) in d.iter() {
                     match op.as_str() {
                         "$elemMatch" => {
-                            if let bson::Bson::Document(em) = val {
-                                if let Some(pred) = build_elem_match_pred(&path, em) {
-                                    where_clauses.push(format!(
-                                        "jsonb_path_exists(doc, '{}[*] ? ({} )')",
-                                        escape_single(&path),
-                                        pred
-                                    ));
-                                }
+                            if let bson::Bson::Document(em) = val
+                                && let Some(pred) = build_elem_match_pred(&path, em)
+                            {
+                                where_clauses.push(format!(
+                                    "jsonb_path_exists(doc, '{}[*] ? ({} )')",
+                                    escape_single(&path),
+                                    pred
+                                ));
                             }
                         }
                         "$exists" => {
@@ -1668,24 +1670,22 @@ fn build_where_from_filter_internal(filter: &bson::Document, is_nested: bool) ->
                             if let bson::Bson::Document(gw) = val {
                                 if let Some(geom) = gw.get("$geometry") {
                                     // GeoJSON format
-                                    if let bson::Bson::Document(geom_doc) = geom {
-                                        if let Some(geom_type) = geom_doc.get_str("type").ok() {
-                                            if let Ok(coords) = geom_doc.get_array("coordinates") {
-                                                let clause =
-                                                    build_geo_within_clause(&k, geom_type, &coords);
-                                                where_clauses.push(clause);
-                                            }
-                                        }
+                                    if let bson::Bson::Document(geom_doc) = geom
+                                        && let Ok(geom_type) = geom_doc.get_str("type")
+                                        && let Ok(coords) = geom_doc.get_array("coordinates")
+                                    {
+                                        let clause = build_geo_within_clause(k, geom_type, coords);
+                                        where_clauses.push(clause);
                                     }
                                 } else if let Some(bson::Bson::Array(box_coords)) = gw.get("$box") {
                                     // Legacy $box format
-                                    let clause = build_geo_box_clause(&k, box_coords);
+                                    let clause = build_geo_box_clause(k, box_coords);
                                     where_clauses.push(clause);
                                 } else if let Some(bson::Bson::Array(poly_coords)) =
                                     gw.get("$polygon")
                                 {
                                     // Legacy $polygon format
-                                    let clause = build_geo_polygon_clause(&k, poly_coords);
+                                    let clause = build_geo_polygon_clause(k, poly_coords);
                                     where_clauses.push(clause);
                                 }
                             }
@@ -1742,7 +1742,7 @@ fn build_where_from_filter_internal(filter: &bson::Document, is_nested: bool) ->
                                     .ok();
 
                                 let clause = build_near_clause(
-                                    &k,
+                                    k,
                                     near_lon,
                                     near_lat,
                                     max_distance,
@@ -1791,9 +1791,9 @@ fn build_regex_clause(path: &str, pattern: &str, flags: &str) -> String {
 
     // Extract field name from JSONPath format $.”field” or $."field"
     // Remove leading '$' and extract quoted segments
-    let field_name = if path.starts_with("$.") {
+    let field_name = if let Some(stripped) = path.strip_prefix("$.") {
         // Extract content between quotes: $."field" -> field
-        path[2..]
+        stripped
             .split(".")
             .map(|s| s.trim_matches('"'))
             .collect::<Vec<_>>()
@@ -1998,7 +1998,7 @@ fn json_literal_from_bson(v: &bson::Bson) -> Option<String> {
         bson::Bson::Int32(n) => Some(n.to_string()),
         bson::Bson::Int64(n) => Some(n.to_string()),
         bson::Bson::Double(n) => Some(n.to_string()),
-        bson::Bson::String(s) => Some(format!("{}", serde_json::to_string(s).ok()?)),
+        bson::Bson::String(s) => Some((serde_json::to_string(s).ok()?).to_string()),
         _ => None,
     }
 }
@@ -2094,10 +2094,8 @@ fn project_document(doc: &bson::Document, projection: &bson::Document) -> bson::
 
     if include_mode {
         let mut out = bson::Document::new();
-        if include_id {
-            if let Some(idv) = doc.get("_id").cloned() {
-                out.insert("_id", idv);
-            }
+        if include_id && let Some(idv) = doc.get("_id").cloned() {
+            out.insert("_id", idv);
         }
         for (k, v) in projection.iter() {
             if k == "_id" {
@@ -2108,10 +2106,8 @@ fn project_document(doc: &bson::Document, projection: &bson::Document) -> bson::
                 bson::Bson::Boolean(b) => *b,
                 _ => false,
             };
-            if on {
-                if let Some(val) = get_path(doc, k) {
-                    set_path(&mut out, k, val);
-                }
+            if on && let Some(val) = get_path(doc, k) {
+                set_path(&mut out, k, val);
             }
         }
         out
@@ -2172,7 +2168,7 @@ fn set_path(doc: &mut bson::Document, path: &str, value: bson::Bson) {
             cur.insert(seg, bson::Bson::Document(bson::Document::new()));
         }
         let entry = cur.get_mut(seg).unwrap();
-        if !entry.as_document().is_some() {
+        if entry.as_document().is_none() {
             *entry = bson::Bson::Document(bson::Document::new());
         }
         cur = entry.as_document_mut().unwrap();
@@ -2238,10 +2234,10 @@ impl PgStore {
                 }
                 let r = &rows[0];
                 let id: Vec<u8> = r.get(0);
-                if let Ok(bytes) = r.try_get::<usize, Vec<u8>>(1) {
-                    if let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes)) {
-                        return Ok(Some((id, doc)));
-                    }
+                if let Ok(bytes) = r.try_get::<usize, Vec<u8>>(1)
+                    && let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes))
+                {
+                    return Ok(Some((id, doc)));
                 }
                 let json: serde_json::Value = r.get(2);
                 let b = bson::to_bson(&json).unwrap_or(bson::Bson::Document(bson::Document::new()));
@@ -2418,6 +2414,7 @@ impl PgStore {
     }
 
     /// Transaction-aware find: uses transaction client if provided, otherwise uses pool
+    #[allow(clippy::too_many_arguments)]
     pub async fn find_docs_tx_opt(
         &self,
         tx: Option<&Transaction<'_>>,
@@ -2486,15 +2483,15 @@ impl PgStore {
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
             let bson_bytes: Option<Vec<u8>> = r.try_get(0).ok();
-            if let Some(bytes) = bson_bytes {
-                if let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes)) {
-                    out.push(if let Some(p) = projection {
-                        project_document(&doc, p)
-                    } else {
-                        doc
-                    });
-                    continue;
-                }
+            if let Some(bytes) = bson_bytes
+                && let Ok(doc) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes))
+            {
+                out.push(if let Some(p) = projection {
+                    project_document(&doc, p)
+                } else {
+                    doc
+                });
+                continue;
             }
             let json: serde_json::Value = r.get(1);
             let d = to_doc_from_json(json);
@@ -2597,30 +2594,31 @@ fn build_geo_box_clause(field: &str, box_coords: &bson::Array) -> String {
         let bottom_left = box_coords[0].as_array();
         let top_right = box_coords[1].as_array();
 
-        if let (Some(bl), Some(tr)) = (bottom_left, top_right) {
-            if bl.len() >= 2 && tr.len() >= 2 {
-                let min_lon = bl[0]
-                    .as_f64()
-                    .or_else(|| bl[0].as_i64().map(|v| v as f64))
-                    .unwrap_or(0.0);
-                let min_lat = bl[1]
-                    .as_f64()
-                    .or_else(|| bl[1].as_i64().map(|v| v as f64))
-                    .unwrap_or(0.0);
-                let max_lon = tr[0]
-                    .as_f64()
-                    .or_else(|| tr[0].as_i64().map(|v| v as f64))
-                    .unwrap_or(0.0);
-                let max_lat = tr[1]
-                    .as_f64()
-                    .or_else(|| tr[1].as_i64().map(|v| v as f64))
-                    .unwrap_or(0.0);
+        if let (Some(bl), Some(tr)) = (bottom_left, top_right)
+            && bl.len() >= 2
+            && tr.len() >= 2
+        {
+            let min_lon = bl[0]
+                .as_f64()
+                .or_else(|| bl[0].as_i64().map(|v| v as f64))
+                .unwrap_or(0.0);
+            let min_lat = bl[1]
+                .as_f64()
+                .or_else(|| bl[1].as_i64().map(|v| v as f64))
+                .unwrap_or(0.0);
+            let max_lon = tr[0]
+                .as_f64()
+                .or_else(|| tr[0].as_i64().map(|v| v as f64))
+                .unwrap_or(0.0);
+            let max_lat = tr[1]
+                .as_f64()
+                .or_else(|| tr[1].as_i64().map(|v| v as f64))
+                .unwrap_or(0.0);
 
-                return format!(
-                    "(doc->'{}'->'coordinates'->>0)::float8 >= {} AND (doc->'{}'->'coordinates'->>0)::float8 <= {} AND (doc->'{}'->'coordinates'->>1)::float8 >= {} AND (doc->'{}'->'coordinates'->>1)::float8 <= {}",
-                    field, min_lon, field, max_lon, field, min_lat, field, max_lat
-                );
-            }
+            return format!(
+                "(doc->'{}'->'coordinates'->>0)::float8 >= {} AND (doc->'{}'->'coordinates'->>0)::float8 <= {} AND (doc->'{}'->'coordinates'->>1)::float8 >= {} AND (doc->'{}'->'coordinates'->>1)::float8 <= {}",
+                field, min_lon, field, max_lon, field, min_lat, field, max_lat
+            );
         }
     }
     "FALSE".to_string()

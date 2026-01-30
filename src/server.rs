@@ -516,16 +516,12 @@ async fn handle_connection(state: Arc<AppState>, mut socket: TcpStream) -> Resul
                         // already has an array placeholder (e.g., documents: []), append to it.
                         for (name, docs) in seqs.into_iter() {
                             let seq_arr: Vec<bson::Bson> =
-                                docs.into_iter().map(|d| bson::Bson::Document(d)).collect();
+                                docs.into_iter().map(bson::Bson::Document).collect();
                             match cmd.get_mut(&name) {
-                                Some(existing) => {
-                                    if let bson::Bson::Array(a) = existing {
-                                        a.extend(seq_arr);
-                                    } else {
-                                        cmd.insert(name.clone(), bson::Bson::Array(seq_arr));
-                                    }
+                                Some(bson::Bson::Array(a)) => {
+                                    a.extend(seq_arr);
                                 }
-                                None => {
+                                Some(_) | None => {
                                     cmd.insert(name.clone(), bson::Bson::Array(seq_arr));
                                 }
                             }
@@ -555,7 +551,7 @@ async fn handle_connection(state: Arc<AppState>, mut socket: TcpStream) -> Resul
                 // Shadow forwarding (non-blocking)
                 if let Some(sh) = &shadow_session {
                     let cfg = sh.cfg.clone();
-                    let header_bytes = header_buf.clone();
+                    let header_bytes = header_buf;
                     let body_bytes = body.clone();
                     let ours = reply_doc.clone();
                     let cmd_name = cmd_opt
@@ -627,15 +623,18 @@ async fn handle_connection(state: Arc<AppState>, mut socket: TcpStream) -> Resul
                         tracing::debug!(command=%cmd_name, db=%db.as_deref().unwrap_or(""), cmd=?cmd, "received OP_QUERY");
                         let reply_doc = handle_command(&state, db.as_deref(), cmd).await;
                         let request_id = REQ_ID.fetch_add(1, Ordering::Relaxed);
-                        let resp =
-                            encode_op_reply(&[reply_doc.clone()], hdr.request_id, request_id);
+                        let resp = encode_op_reply(
+                            std::slice::from_ref(&reply_doc),
+                            hdr.request_id,
+                            request_id,
+                        );
                         socket.write_all(&resp).await?;
                         socket.flush().await?;
 
                         // Shadow forwarding (non-blocking)
                         if let Some(sh) = &shadow_session {
                             let cfg = sh.cfg.clone();
-                            let header_bytes = header_buf.clone();
+                            let header_bytes = header_buf;
                             let body_bytes = body.clone();
                             let ours = reply_doc.clone();
                             let sample = rand::random::<f64>() < cfg.sample_rate;
@@ -1103,15 +1102,16 @@ async fn insert_reply(state: &AppState, db: Option<&str>, cmd: &mut Document) ->
 
         if in_transaction {
             // In transaction - get session and perform all inserts with transaction client
-            if let Some(lsid) = extract_lsid(cmd) {
-                if let Some(session_arc) = state.session_manager.get_session(lsid).await {
-                    let session = session_arc.lock().await;
-                    if let Some(ref client) = session.postgres_client {
-                        for (i, b) in docs_bson.iter().enumerate() {
-                            if let bson::Bson::Document(d0) = b {
-                                let mut d = d0.clone();
-                                ensure_id(&mut d);
-                                match id_bytes(d.get("_id")) {
+            if let Some(lsid) = extract_lsid(cmd)
+                && let Some(session_arc) = state.session_manager.get_session(lsid).await
+            {
+                let session = session_arc.lock().await;
+                if let Some(ref client) = session.postgres_client {
+                    for (i, b) in docs_bson.iter().enumerate() {
+                        if let bson::Bson::Document(d0) = b {
+                            let mut d = d0.clone();
+                            ensure_id(&mut d);
+                            match id_bytes(d.get("_id")) {
                                     Some(idb) => {
                                         let json = match serde_json::to_value(&d) {
                                             Ok(v) => v,
@@ -1156,11 +1156,10 @@ async fn insert_reply(state: &AppState, db: Option<&str>, cmd: &mut Document) ->
                                         doc! {"index": i as i32, "code": 2i32, "errmsg": "unsupported _id type"},
                                     ),
                                 }
-                            } else {
-                                write_errors.push(
+                        } else {
+                            write_errors.push(
                                     doc! {"index": i as i32, "code": 2i32, "errmsg": "document must be object"},
                                 );
-                            }
                         }
                     }
                 }
@@ -1413,7 +1412,7 @@ async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
                         }
                     }
                     ensure_id(&mut new_doc);
-                    let idb = match new_doc.get("_id").and_then(|b| id_bytes_bson(b)) {
+                    let idb = match new_doc.get("_id").and_then(id_bytes_bson) {
                         Some(v) => v,
                         None => return error_doc(2, "unsupported _id type"),
                     };
@@ -1438,7 +1437,7 @@ async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
                 continue;
             }
             for mut d in docs {
-                let idb = match d.get("_id").and_then(|b| id_bytes_bson(b)) {
+                let idb = match d.get("_id").and_then(id_bytes_bson) {
                     Some(v) => v,
                     None => continue,
                 };
@@ -1602,7 +1601,7 @@ async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
                     }
                 }
                 ensure_id(&mut new_doc);
-                let idb = match new_doc.get("_id").and_then(|b| id_bytes_bson(b)) {
+                let idb = match new_doc.get("_id").and_then(id_bytes_bson) {
                     Some(v) => v,
                     None => return error_doc(2, "unsupported _id type"),
                 };
@@ -1671,10 +1670,8 @@ async fn find_and_modify_reply(state: &AppState, db: Option<&str>, cmd: &Documen
     }
 
     // Ensure collection exists if we may insert (upsert)
-    if upsert {
-        if let Err(e) = pg.ensure_collection(dbname, coll).await {
-            return error_doc(59, format!("ensure_collection failed: {}", e));
-        }
+    if upsert && let Err(e) = pg.ensure_collection(dbname, coll).await {
+        return error_doc(59, format!("ensure_collection failed: {}", e));
     }
 
     // Transactional path using pooled connection
@@ -1709,11 +1706,11 @@ async fn find_and_modify_reply(state: &AppState, db: Option<&str>, cmd: &Documen
                     if let Some(ref p) = proj {
                         value = apply_project_with_expr(&value, p);
                     }
-                    return doc! { "lastErrorObject": { "n": (n as i32), "updatedExisting": false }, "value": value, "ok": 1.0 };
+                    doc! { "lastErrorObject": { "n": (n as i32), "updatedExisting": false }, "value": value, "ok": 1.0 }
                 }
                 Err(e) => {
                     let _ = tx.rollback().await;
-                    return error_doc(59, format!("delete failed: {}", e));
+                    error_doc(59, format!("delete failed: {}", e))
                 }
             }
         } else {
@@ -1801,11 +1798,11 @@ async fn find_and_modify_reply(state: &AppState, db: Option<&str>, cmd: &Documen
                     } else {
                         value
                     };
-                    return doc! { "lastErrorObject": { "n": 1i32, "updatedExisting": true }, "value": value, "ok": 1.0 };
+                    doc! { "lastErrorObject": { "n": 1i32, "updatedExisting": true }, "value": value, "ok": 1.0 }
                 }
                 Err(e) => {
                     let _ = tx.rollback().await;
-                    return error_doc(59, format!("update failed: {}", e));
+                    error_doc(59, format!("update failed: {}", e))
                 }
             }
         }
@@ -1883,7 +1880,7 @@ async fn find_and_modify_reply(state: &AppState, db: Option<&str>, cmd: &Documen
             }
         }
         ensure_id(&mut new_doc);
-        let idb = match new_doc.get("_id").and_then(|b| id_bytes_bson(b)) {
+        let idb = match new_doc.get("_id").and_then(id_bytes_bson) {
             Some(v) => v,
             None => return error_doc(2, "unsupported _id type"),
         };
@@ -1922,16 +1919,16 @@ async fn find_and_modify_reply(state: &AppState, db: Option<&str>, cmd: &Documen
                     bson::Bson::Null
                 };
                 let mut leo = doc! { "n": (n as i32), "updatedExisting": false };
-                if n == 1 {
-                    if let Some(idv) = new_doc.get("_id").cloned() {
-                        leo.insert("upserted", idv);
-                    }
+                if n == 1
+                    && let Some(idv) = new_doc.get("_id").cloned()
+                {
+                    leo.insert("upserted", idv);
                 }
-                return doc! { "lastErrorObject": leo, "value": value, "ok": 1.0 };
+                doc! { "lastErrorObject": leo, "value": value, "ok": 1.0 }
             }
             Err(e) => {
                 let _ = tx2.rollback().await;
-                return error_doc(59, format!("insert failed: {}", e));
+                error_doc(59, format!("insert failed: {}", e))
             }
         }
     }
@@ -1968,7 +1965,7 @@ fn set_path_bson(cur: &mut bson::Bson, segs: &[&str], value: bson::Bson) {
                 let desired_len = idx + 1;
                 if arr.len() < desired_len {
                     let pad = desired_len - arr.len();
-                    arr.extend(std::iter::repeat(bson::Bson::Null).take(pad));
+                    arr.extend(std::iter::repeat_n(bson::Bson::Null, pad));
                 }
                 if segs.len() == 1 {
                     arr[idx] = value;
@@ -2024,13 +2021,13 @@ fn unset_path_bson(cur: &mut bson::Bson, segs: &[&str]) {
     let seg = segs[0];
     match seg.parse::<usize>().ok() {
         Some(idx) => {
-            if let bson::Bson::Array(arr) = cur {
-                if idx < arr.len() {
-                    if segs.len() == 1 {
-                        arr[idx] = bson::Bson::Null;
-                    } else {
-                        unset_path_bson(&mut arr[idx], &segs[1..]);
-                    }
+            if let bson::Bson::Array(arr) = cur
+                && idx < arr.len()
+            {
+                if segs.len() == 1 {
+                    arr[idx] = bson::Bson::Null;
+                } else {
+                    unset_path_bson(&mut arr[idx], &segs[1..]);
                 }
             }
         }
@@ -2048,10 +2045,10 @@ fn unset_path_bson(cur: &mut bson::Bson, segs: &[&str]) {
 
 fn path_has_negative_index(path: &str) -> bool {
     for seg in path.split('.') {
-        if let Ok(n) = seg.parse::<i32>() {
-            if n < 0 {
-                return true;
-            }
+        if let Ok(n) = seg.parse::<i32>()
+            && n < 0
+        {
+            return true;
         }
     }
     false
@@ -2083,7 +2080,7 @@ fn validate_rename_pairs(pairs: &[(String, String)]) -> Option<Document> {
     None
 }
 
-fn parse_path<'a>(path: &'a str) -> Vec<&'a str> {
+fn parse_path(path: &str) -> Vec<&str> {
     path.split('.').collect()
 }
 
@@ -2221,7 +2218,7 @@ fn apply_push(doc: &mut Document, path: &str, val: bson::Bson) -> bool {
                     if insert_at > arr.len() {
                         insert_at = arr.len();
                     }
-                    arr.splice(insert_at..insert_at, each.into_iter());
+                    arr.splice(insert_at..insert_at, each);
                     // Apply slice trimming if provided
                     if let Some(n) = slice {
                         if n >= 0 {
@@ -2273,18 +2270,18 @@ fn apply_pull(doc: &mut Document, path: &str, criterion: bson::Bson) {
             _ => return,
         }
     }
-    if let bson::Bson::Document(d) = parent {
-        if let Some(bson::Bson::Array(arr)) = d.get_mut(last) {
-            match criterion {
-                bson::Bson::Array(ref vals) => {
-                    arr.retain(|e| !vals.contains(e));
-                }
-                bson::Bson::Document(ref doc_crit) => {
-                    arr.retain(|e| !matches_predicate(e, doc_crit));
-                }
-                ref v => {
-                    arr.retain(|e| e != v);
-                }
+    if let bson::Bson::Document(d) = parent
+        && let Some(bson::Bson::Array(arr)) = d.get_mut(last)
+    {
+        match criterion {
+            bson::Bson::Array(ref vals) => {
+                arr.retain(|e| !vals.contains(e));
+            }
+            bson::Bson::Document(ref doc_crit) => {
+                arr.retain(|e| !matches_predicate(e, doc_crit));
+            }
+            ref v => {
+                arr.retain(|e| e != v);
             }
         }
     }
@@ -2412,7 +2409,7 @@ fn key_repr(v: &bson::Bson) -> String {
     format!("{:?}", v)
 }
 
-fn apply_group(docs: &Vec<Document>, spec: &Document) -> Vec<Document> {
+fn apply_group(docs: &[Document], spec: &Document) -> Vec<Document> {
     use std::collections::HashMap;
     #[derive(Clone)]
     enum Acc {
@@ -2608,8 +2605,11 @@ fn apply_group(docs: &Vec<Document>, spec: &Document) -> Vec<Document> {
 }
 
 /// Apply $bucket aggregation stage
-fn apply_bucket(docs: &Vec<Document>, spec: &BucketSpec) -> Vec<Document> {
+fn apply_bucket(docs: &[Document], spec: &BucketSpec) -> Vec<Document> {
     use std::collections::HashMap;
+
+    // Type alias for bucket accumulator data
+    type BucketData = (Option<bson::Bson>, HashMap<String, Acc>, i64);
 
     // Validate boundaries are sorted and same type
     if spec.boundaries.len() < 2 {
@@ -2672,9 +2672,8 @@ fn apply_bucket(docs: &Vec<Document>, spec: &BucketSpec) -> Vec<Document> {
     }
 
     // Group documents into buckets
-    let mut buckets: HashMap<usize, (Option<bson::Bson>, HashMap<String, Acc>, i64)> =
-        HashMap::new();
-    let mut default_bucket: Option<(Option<bson::Bson>, HashMap<String, Acc>, i64)> = None;
+    let mut buckets: HashMap<usize, BucketData> = HashMap::new();
+    let mut default_bucket: Option<BucketData> = None;
 
     for d in docs.iter() {
         let value = eval_expr(d, &bson::Bson::String(spec.group_by.clone()));
@@ -2948,11 +2947,11 @@ async fn apply_lookup(
         let arr = key
             .and_then(|k| map.get(&k))
             .cloned()
-            .unwrap_or_else(|| Vec::new());
+            .unwrap_or_else(Vec::new);
         set_path_nested(
             d,
             as_field,
-            bson::Bson::Array(arr.into_iter().map(|m| bson::Bson::Document(m)).collect()),
+            bson::Bson::Array(arr.into_iter().map(bson::Bson::Document).collect()),
         );
     }
     Ok(docs)
@@ -3033,55 +3032,29 @@ fn execute_sub_pipeline(
                 let path = u.trim_start_matches('$').to_string();
                 let mut out: Vec<Document> = Vec::new();
                 for d in result.into_iter() {
-                    match get_path_bson_value(&d, &path) {
-                        Some(bson::Bson::Array(arr)) => {
-                            for item in arr {
-                                let mut nd = d.clone();
-                                set_path_nested(&mut nd, &path, item);
-                                out.push(nd);
-                            }
+                    if let Some(bson::Bson::Array(arr)) = get_path_bson_value(&d, &path) {
+                        for item in arr {
+                            let mut nd = d.clone();
+                            set_path_nested(&mut nd, &path, item);
+                            out.push(nd);
                         }
-                        _ => {}
                     }
                 }
                 result = out;
                 continue;
             }
 
-            if let Ok(ud) = stage_doc.get_document("$unwind") {
-                if let Ok(pth) = ud.get_str("path") {
-                    let path = pth.trim_start_matches('$').to_string();
-                    let preserve = ud.get_bool("preserveNullAndEmptyArrays").unwrap_or(false);
-                    let include = ud.get_str("includeArrayIndex").ok().map(|s| s.to_string());
-                    let mut out: Vec<Document> = Vec::new();
-                    for d in result.into_iter() {
-                        match get_path_bson_value(&d, &path) {
-                            Some(bson::Bson::Array(arr)) => {
-                                if arr.is_empty() {
-                                    if preserve {
-                                        let mut nd = d.clone();
-                                        set_path_nested(&mut nd, &path, bson::Bson::Null);
-                                        if let Some(ref fpath) = include {
-                                            set_path_nested(&mut nd, fpath, bson::Bson::Null);
-                                        }
-                                        out.push(nd);
-                                    }
-                                    continue;
-                                }
-                                for (i, item) in arr.into_iter().enumerate() {
-                                    let mut nd = d.clone();
-                                    set_path_nested(&mut nd, &path, item);
-                                    if let Some(ref fpath) = include {
-                                        set_path_nested(
-                                            &mut nd,
-                                            fpath,
-                                            bson::Bson::Int32(i as i32),
-                                        );
-                                    }
-                                    out.push(nd);
-                                }
-                            }
-                            None | Some(bson::Bson::Null) => {
+            if let Ok(ud) = stage_doc.get_document("$unwind")
+                && let Ok(pth) = ud.get_str("path")
+            {
+                let path = pth.trim_start_matches('$').to_string();
+                let preserve = ud.get_bool("preserveNullAndEmptyArrays").unwrap_or(false);
+                let include = ud.get_str("includeArrayIndex").ok().map(|s| s.to_string());
+                let mut out: Vec<Document> = Vec::new();
+                for d in result.into_iter() {
+                    match get_path_bson_value(&d, &path) {
+                        Some(bson::Bson::Array(arr)) => {
+                            if arr.is_empty() {
                                 if preserve {
                                     let mut nd = d.clone();
                                     set_path_nested(&mut nd, &path, bson::Bson::Null);
@@ -3090,13 +3063,32 @@ fn execute_sub_pipeline(
                                     }
                                     out.push(nd);
                                 }
+                                continue;
                             }
-                            _ => {}
+                            for (i, item) in arr.into_iter().enumerate() {
+                                let mut nd = d.clone();
+                                set_path_nested(&mut nd, &path, item);
+                                if let Some(ref fpath) = include {
+                                    set_path_nested(&mut nd, fpath, bson::Bson::Int32(i as i32));
+                                }
+                                out.push(nd);
+                            }
                         }
+                        None | Some(bson::Bson::Null) => {
+                            if preserve {
+                                let mut nd = d.clone();
+                                set_path_nested(&mut nd, &path, bson::Bson::Null);
+                                if let Some(ref fpath) = include {
+                                    set_path_nested(&mut nd, fpath, bson::Bson::Null);
+                                }
+                                out.push(nd);
+                            }
+                        }
+                        _ => {}
                     }
-                    result = out;
-                    continue;
                 }
+                result = out;
+                continue;
             }
 
             // $group
@@ -3207,10 +3199,10 @@ fn field_matches(doc: &Document, field: &str, expected: &bson::Bson) -> bool {
                     }
                     "$nin" => {
                         if let bson::Bson::Array(arr) = op_val {
-                            if let Some(ref a) = actual {
-                                if arr.contains(a) {
-                                    return false;
-                                }
+                            if let Some(ref a) = actual
+                                && arr.contains(a)
+                            {
+                                return false;
                             }
                         } else {
                             return false;
@@ -3260,7 +3252,7 @@ fn eval_expr(doc: &Document, v: &bson::Bson) -> Option<bson::Bson> {
                     return Some(bson::Bson::Document(out));
                 }
             }
-            if let Some(arrs) = d.get_array("$concatArrays").ok() {
+            if let Ok(arrs) = d.get_array("$concatArrays") {
                 let mut out: Vec<bson::Bson> = Vec::new();
                 for op in arrs {
                     let ev = eval_expr(doc, op)?;
@@ -3299,21 +3291,21 @@ fn eval_expr(doc: &Document, v: &bson::Bson) -> Option<bson::Bson> {
                 let val = eval_expr(doc, arg).unwrap_or(bson::Bson::Null);
                 return Some(to_bool(&val));
             }
-            if let Some(arr) = d.get_array("$ifNull").ok() {
-                if arr.len() == 2 {
-                    let first = eval_expr(doc, &arr[0]);
-                    match first {
-                        Some(bson::Bson::Null) | None => {
-                            let second = eval_expr(doc, &arr[1]).unwrap_or(bson::Bson::Null);
-                            return Some(second);
-                        }
-                        Some(v) => {
-                            return Some(v);
-                        }
+            if let Ok(arr) = d.get_array("$ifNull")
+                && arr.len() == 2
+            {
+                let first = eval_expr(doc, &arr[0]);
+                match first {
+                    Some(bson::Bson::Null) | None => {
+                        let second = eval_expr(doc, &arr[1]).unwrap_or(bson::Bson::Null);
+                        return Some(second);
+                    }
+                    Some(v) => {
+                        return Some(v);
                     }
                 }
             }
-            if let Some(arr) = d.get_array("$add").ok() {
+            if let Ok(arr) = d.get_array("$add") {
                 // Evaluate operands first
                 let mut vals: Vec<bson::Bson> = Vec::with_capacity(arr.len());
                 for op in arr {
@@ -3347,27 +3339,27 @@ fn eval_expr(doc: &Document, v: &bson::Bson) -> Option<bson::Bson> {
                     sum += n;
                 }
                 Some(bson::Bson::Double(sum))
-            } else if let Some(arr) = d.get_array("$subtract").ok() {
+            } else if let Ok(arr) = d.get_array("$subtract") {
                 if arr.len() != 2 {
                     return None;
                 }
                 let a = number_as_f64(&eval_expr(doc, &arr[0])?)?;
                 let b = number_as_f64(&eval_expr(doc, &arr[1])?)?;
                 Some(bson::Bson::Double(a - b))
-            } else if let Some(arr) = d.get_array("$multiply").ok() {
+            } else if let Ok(arr) = d.get_array("$multiply") {
                 let mut prod = 1.0f64;
                 for op in arr {
                     prod *= number_as_f64(&eval_expr(doc, op)?)?;
                 }
                 Some(bson::Bson::Double(prod))
-            } else if let Some(arr) = d.get_array("$divide").ok() {
+            } else if let Ok(arr) = d.get_array("$divide") {
                 if arr.len() != 2 {
                     return None;
                 }
                 let a = number_as_f64(&eval_expr(doc, &arr[0])?)?;
                 let b = number_as_f64(&eval_expr(doc, &arr[1])?)?;
                 Some(bson::Bson::Double(a / b))
-            } else if let Some(arr) = d.get_array("$concat").ok() {
+            } else if let Ok(arr) = d.get_array("$concat") {
                 let mut out = String::new();
                 for op in arr {
                     let ev = eval_expr(doc, op).unwrap_or(bson::Bson::Null);
@@ -3494,10 +3486,8 @@ fn apply_project_with_expr(input: &Document, proj: &Document) -> Document {
 
     if include_mode {
         let mut out = Document::new();
-        if include_id {
-            if let Some(idv) = input.get("_id").cloned() {
-                out.insert("_id", idv);
-            }
+        if include_id && let Some(idv) = input.get("_id").cloned() {
+            out.insert("_id", idv);
         }
         for k in includes {
             if let Some(val) = get_path_bson_value(input, k) {
@@ -3609,6 +3599,10 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
                 count_field = Some(cf.to_string());
                 continue;
             }
+            // $geoNear: must be the first stage in the pipeline
+            if stage.contains_key("$geoNear") && stage_count > 1 {
+                return error_doc(9, "$geoNear is only valid as the first stage in a pipeline");
+            }
             // $facet: document with sub-pipelines (must be last stage)
             if let Ok(facet_doc) = stage.get_document("$facet") {
                 if stage_count < pipeline.len() {
@@ -3671,10 +3665,14 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
         let mut filter: Option<bson::Document> = None;
         let mut skip: Option<i64> = None;
         let mut limit: Option<i64> = None;
-        for st in pipeline {
+        let mut match_stage_position: Option<usize> = None;
+        for (idx, st) in pipeline.iter().enumerate() {
             if let bson::Bson::Document(stage) = st {
-                if let Ok(m) = stage.get_document("$match") {
+                if let Ok(m) = stage.get_document("$match")
+                    && filter.is_none()
+                {
                     filter = Some(m.clone());
+                    match_stage_position = Some(idx);
                 }
                 if let Some(sk) = stage
                     .get_i64("$skip")
@@ -3692,10 +3690,79 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
                 }
             }
         }
-        let total = match pg.count_docs(dbname, coll, filter.as_ref()).await {
-            Ok(n) => n,
-            Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
+
+        // Check if filter contains $text
+        let total = if let Some(ref f) = filter {
+            match extract_text_search_params(f) {
+                Ok(Some((search, language, case_sensitive, diacritic_sensitive))) => {
+                    // $text is present - validate it's in the first stage (MongoDB restriction)
+                    if match_stage_position != Some(0) {
+                        return error_doc(
+                            2,
+                            "$match with $text is only allowed as the first pipeline stage",
+                        );
+                    }
+
+                    // Get text index fields
+                    match pg.get_text_index_fields(dbname, coll).await {
+                        Ok(fields) if !fields.is_empty() => {
+                            // Use find_with_text_search and count results
+                            let text_docs = match pg
+                                .find_with_text_search(
+                                    dbname,
+                                    coll,
+                                    &search,
+                                    &language,
+                                    case_sensitive,
+                                    diacritic_sensitive,
+                                    100_000,
+                                    &fields,
+                                )
+                                .await
+                            {
+                                Ok(docs) => docs,
+                                Err(e) => {
+                                    return error_doc(2, format!("text search failed: {}", e));
+                                }
+                            };
+
+                            // Apply remaining filters (non-$text) if any
+                            let mut remaining_doc = f.clone();
+                            remaining_doc.remove("$text");
+                            if remaining_doc.is_empty() {
+                                text_docs.len() as i64
+                            } else {
+                                text_docs
+                                    .into_iter()
+                                    .filter(|d| document_matches_filter(d, &remaining_doc))
+                                    .count() as i64
+                            }
+                        }
+                        Ok(_) => {
+                            return error_doc(2, "text index required for $text query");
+                        }
+                        Err(e) => {
+                            return error_doc(2, format!("failed to get text index: {}", e));
+                        }
+                    }
+                }
+                Ok(None) => {
+                    // No $text operator, use regular count
+                    match pg.count_docs(dbname, coll, Some(f)).await {
+                        Ok(n) => n,
+                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
+                    }
+                }
+                Err(err_doc) => return err_doc,
+            }
+        } else {
+            // No filter, count all documents
+            match pg.count_docs(dbname, coll, None).await {
+                Ok(n) => n,
+                Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
+            }
         };
+
         let mut n = total;
         if let Some(sk) = skip {
             n = (n - sk).max(0);
@@ -3806,6 +3873,167 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
                 continue;
             }
 
+            // $geoNear: geospatial near query with distance calculation
+            if let Ok(geo_doc) = stage.get_document("$geoNear") {
+                // Parse "near" field (GeoJSON Point)
+                let near_doc = match geo_doc.get_document("near") {
+                    Ok(d) => d,
+                    Err(_) => {
+                        return error_doc(9, "$geoNear requires 'near' field");
+                    }
+                };
+                // Try to get geometry from $geometry field, or use near_doc directly if it's GeoJSON
+                let geometry = match near_doc.get_document("$geometry") {
+                    Ok(d) => d,
+                    Err(_) => {
+                        // Check if near_doc itself is a GeoJSON object (has 'type' and 'coordinates')
+                        if near_doc.contains_key("type") && near_doc.contains_key("coordinates") {
+                            near_doc
+                        } else {
+                            return error_doc(
+                                9,
+                                "$geoNear 'near' must have '$geometry' field or be a GeoJSON object",
+                            );
+                        }
+                    }
+                };
+                let coords = match geometry.get_array("coordinates") {
+                    Ok(a) => a,
+                    Err(_) => {
+                        return error_doc(9, "$geoNear geometry must have 'coordinates'");
+                    }
+                };
+                if coords.len() < 2 {
+                    return error_doc(9, "$geoNear coordinates must have at least 2 elements");
+                }
+                let near_lon = coords[0]
+                    .as_f64()
+                    .or_else(|| coords[0].as_i64().map(|v| v as f64))
+                    .unwrap_or(0.0);
+                let near_lat = coords[1]
+                    .as_f64()
+                    .or_else(|| coords[1].as_i64().map(|v| v as f64))
+                    .unwrap_or(0.0);
+
+                // Parse required fields
+                let distance_field = match geo_doc.get_str("distanceField") {
+                    Ok(s) => s.to_string(),
+                    Err(_) => {
+                        return error_doc(9, "$geoNear requires 'distanceField'");
+                    }
+                };
+                let key = geo_doc.get_str("key").unwrap_or("location").to_string();
+                let max_distance = geo_doc
+                    .get_f64("maxDistance")
+                    .ok()
+                    .or_else(|| geo_doc.get_i64("maxDistance").ok().map(|v| v as f64));
+                let spherical = geo_doc.get_bool("spherical").unwrap_or(true);
+                let query_filter = geo_doc.get_document("query").ok().cloned();
+
+                // Build filter for geospatial query
+                let geo_filter = doc! {
+                    key.clone(): doc! {
+                        "$near": doc! {
+                            "$geometry": doc! {
+                                "type": "Point",
+                                "coordinates": [near_lon, near_lat]
+                            },
+                            "$maxDistance": max_distance.unwrap_or(100000.0)
+                        }
+                    }
+                };
+
+                // Merge query filter with geo filter if present
+                let combined_filter = if let Some(q) = query_filter {
+                    doc! {
+                        "$and": vec![bson::Bson::Document(geo_filter), bson::Bson::Document(q)]
+                    }
+                } else {
+                    geo_filter
+                };
+
+                // Fetch documents with geospatial query
+                docs = match pg
+                    .find_docs(
+                        dbname,
+                        coll,
+                        Some(&combined_filter),
+                        None,
+                        None,
+                        batch_size * 10,
+                    )
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return error_doc(59, format!("aggregate $geoNear failed: {}", e));
+                    }
+                };
+                main_coll_fetched = true;
+
+                // Calculate and add distance field to each document
+                for d in docs.iter_mut() {
+                    let dist = if spherical {
+                        // Haversine distance in meters
+                        let doc_lon = d
+                            .get_document(&key)
+                            .ok()
+                            .and_then(|loc| loc.get_array("coordinates").ok())
+                            .and_then(|coords| coords.first())
+                            .and_then(|c| c.as_f64())
+                            .unwrap_or(0.0);
+                        let doc_lat = d
+                            .get_document(&key)
+                            .ok()
+                            .and_then(|loc| loc.get_array("coordinates").ok())
+                            .and_then(|coords| coords.get(1))
+                            .and_then(|c| c.as_f64())
+                            .unwrap_or(0.0);
+
+                        // Haversine formula
+                        let r = 6371000.0; // Earth radius in meters
+                        let d_lat = (doc_lat - near_lat).to_radians();
+                        let d_lon = (doc_lon - near_lon).to_radians();
+                        let a = (d_lat / 2.0).sin().powi(2)
+                            + near_lat.to_radians().cos()
+                                * doc_lat.to_radians().cos()
+                                * (d_lon / 2.0).sin().powi(2);
+                        let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+                        r * c
+                    } else {
+                        // Euclidean distance (in degrees)
+                        let doc_lon = d
+                            .get_document(&key)
+                            .ok()
+                            .and_then(|loc| loc.get_array("coordinates").ok())
+                            .and_then(|coords| coords.first())
+                            .and_then(|c| c.as_f64())
+                            .unwrap_or(0.0);
+                        let doc_lat = d
+                            .get_document(&key)
+                            .ok()
+                            .and_then(|loc| loc.get_array("coordinates").ok())
+                            .and_then(|coords| coords.get(1))
+                            .and_then(|c| c.as_f64())
+                            .unwrap_or(0.0);
+
+                        ((doc_lon - near_lon).powi(2) + (doc_lat - near_lat).powi(2)).sqrt()
+                    };
+                    d.insert(&distance_field, bson::Bson::Double(dist));
+                }
+
+                // Sort by distance
+                docs.sort_by(|a, b| {
+                    let a_dist = a.get_f64(&distance_field).unwrap_or(f64::MAX);
+                    let b_dist = b.get_f64(&distance_field).unwrap_or(f64::MAX);
+                    a_dist
+                        .partial_cmp(&b_dist)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                continue;
+            }
+
             // $sort: sort current docs
             if let Ok(sort_spec) = stage.get_document("$sort") {
                 // Fetch main collection if not yet fetched
@@ -3876,7 +4104,7 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
                 // Check if this is a computed projection (has field refs like "$v" or exprs like {"$add": [...]})
                 let has_computed = proj.iter().any(|(_k, v)| {
                     !matches!(v, bson::Bson::Int32(n) if *n == 0 || *n == 1)
-                        && !matches!(v, bson::Bson::Boolean(b) if *b || !*b)
+                        && !matches!(v, bson::Bson::Boolean(_))
                 });
                 // Fetch main collection if not yet fetched
                 if !main_coll_fetched {
@@ -3955,65 +4183,39 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
                 }
                 let mut out: Vec<Document> = Vec::new();
                 for d in docs.into_iter() {
-                    match get_path_bson_value(&d, &path) {
-                        Some(bson::Bson::Array(arr)) => {
-                            for item in arr {
-                                let mut nd = d.clone();
-                                set_path_nested(&mut nd, &path, item);
-                                out.push(nd);
-                            }
+                    if let Some(bson::Bson::Array(arr)) = get_path_bson_value(&d, &path) {
+                        for item in arr {
+                            let mut nd = d.clone();
+                            set_path_nested(&mut nd, &path, item);
+                            out.push(nd);
                         }
-                        _ => {}
                     }
                 }
                 docs = out;
                 continue;
             }
-            if let Ok(ud) = stage.get_document("$unwind") {
-                if let Ok(pth) = ud.get_str("path") {
-                    let path = pth.trim_start_matches('$').to_string();
-                    let preserve = ud.get_bool("preserveNullAndEmptyArrays").unwrap_or(false);
-                    let include = ud.get_str("includeArrayIndex").ok().map(|s| s.to_string());
-                    // Fetch main collection if not yet fetched
-                    if !main_coll_fetched {
-                        docs = match pg
-                            .find_docs(dbname, coll, None, None, None, batch_size * 10)
-                            .await
-                        {
-                            Ok(v) => v,
-                            Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
-                        };
-                        main_coll_fetched = true;
-                    }
-                    let mut out: Vec<Document> = Vec::new();
-                    for d in docs.into_iter() {
-                        match get_path_bson_value(&d, &path) {
-                            Some(bson::Bson::Array(arr)) => {
-                                if arr.is_empty() {
-                                    if preserve {
-                                        let mut nd = d.clone();
-                                        set_path_nested(&mut nd, &path, bson::Bson::Null);
-                                        if let Some(ref fpath) = include {
-                                            set_path_nested(&mut nd, fpath, bson::Bson::Null);
-                                        }
-                                        out.push(nd);
-                                    }
-                                    continue;
-                                }
-                                for (i, item) in arr.into_iter().enumerate() {
-                                    let mut nd = d.clone();
-                                    set_path_nested(&mut nd, &path, item);
-                                    if let Some(ref fpath) = include {
-                                        set_path_nested(
-                                            &mut nd,
-                                            fpath,
-                                            bson::Bson::Int32(i as i32),
-                                        );
-                                    }
-                                    out.push(nd);
-                                }
-                            }
-                            None | Some(bson::Bson::Null) => {
+            if let Ok(ud) = stage.get_document("$unwind")
+                && let Ok(pth) = ud.get_str("path")
+            {
+                let path = pth.trim_start_matches('$').to_string();
+                let preserve = ud.get_bool("preserveNullAndEmptyArrays").unwrap_or(false);
+                let include = ud.get_str("includeArrayIndex").ok().map(|s| s.to_string());
+                // Fetch main collection if not yet fetched
+                if !main_coll_fetched {
+                    docs = match pg
+                        .find_docs(dbname, coll, None, None, None, batch_size * 10)
+                        .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
+                    };
+                    main_coll_fetched = true;
+                }
+                let mut out: Vec<Document> = Vec::new();
+                for d in docs.into_iter() {
+                    match get_path_bson_value(&d, &path) {
+                        Some(bson::Bson::Array(arr)) => {
+                            if arr.is_empty() {
                                 if preserve {
                                     let mut nd = d.clone();
                                     set_path_nested(&mut nd, &path, bson::Bson::Null);
@@ -4022,13 +4224,32 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
                                     }
                                     out.push(nd);
                                 }
+                                continue;
                             }
-                            _ => {}
+                            for (i, item) in arr.into_iter().enumerate() {
+                                let mut nd = d.clone();
+                                set_path_nested(&mut nd, &path, item);
+                                if let Some(ref fpath) = include {
+                                    set_path_nested(&mut nd, fpath, bson::Bson::Int32(i as i32));
+                                }
+                                out.push(nd);
+                            }
                         }
+                        None | Some(bson::Bson::Null) => {
+                            if preserve {
+                                let mut nd = d.clone();
+                                set_path_nested(&mut nd, &path, bson::Bson::Null);
+                                if let Some(ref fpath) = include {
+                                    set_path_nested(&mut nd, fpath, bson::Bson::Null);
+                                }
+                                out.push(nd);
+                            }
+                        }
+                        _ => {}
                     }
-                    docs = out;
-                    continue;
                 }
+                docs = out;
+                continue;
             }
 
             // $group: group current docs
@@ -4205,10 +4426,8 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
         for (facet_name, sub_pipeline) in facets {
             match execute_sub_pipeline(docs.clone(), &sub_pipeline) {
                 Ok(facet_docs) => {
-                    let facet_array: Vec<bson::Bson> = facet_docs
-                        .into_iter()
-                        .map(|d| bson::Bson::Document(d))
-                        .collect();
+                    let facet_array: Vec<bson::Bson> =
+                        facet_docs.into_iter().map(bson::Bson::Document).collect();
                     facet_result.insert(facet_name, bson::Bson::Array(facet_array));
                 }
                 Err(err_msg) => {
@@ -4287,7 +4506,7 @@ async fn handle_out_stage(
     for doc in docs {
         let mut d = doc;
         ensure_id(&mut d);
-        let idb = match d.get("_id").and_then(|b| id_bytes_bson(b)) {
+        let idb = match d.get("_id").and_then(id_bytes_bson) {
             Some(v) => v,
             None => {
                 continue;
@@ -4376,10 +4595,10 @@ async fn handle_merge_stage(
         };
 
         // Check if document exists in target
-        let existing = match pg.find_one_for_update(dbname, &target_coll, &filter).await {
-            Ok(v) => v,
-            Err(_) => None,
-        };
+        let existing = pg
+            .find_one_for_update(dbname, &target_coll, &filter)
+            .await
+            .unwrap_or_default();
 
         if let Some((idb, mut existing_doc)) = existing {
             // Document exists - handle whenMatched
@@ -4393,9 +4612,10 @@ async fn handle_merge_stage(
                             set_path_nested(&mut existing_doc, k, v.clone());
                         }
                     }
-                    if let Err(_) = pg
+                    if pg
                         .update_doc_by_id(dbname, &target_coll, &idb, &existing_doc)
                         .await
+                        .is_err()
                     {
                         // Continue on error
                     } else {
@@ -4406,7 +4626,11 @@ async fn handle_merge_stage(
                     // Replace entire document but keep _id
                     let id_val = existing_doc.get("_id").cloned();
                     doc.insert("_id", id_val.unwrap_or(bson::Bson::Null));
-                    if let Err(_) = pg.update_doc_by_id(dbname, &target_coll, &idb, &doc).await {
+                    if pg
+                        .update_doc_by_id(dbname, &target_coll, &idb, &doc)
+                        .await
+                        .is_err()
+                    {
                         // Continue on error
                     } else {
                         modified_count += 1;
@@ -4425,9 +4649,10 @@ async fn handle_merge_stage(
                             set_path_nested(&mut existing_doc, k, v.clone());
                         }
                     }
-                    if let Err(_) = pg
+                    if pg
                         .update_doc_by_id(dbname, &target_coll, &idb, &existing_doc)
                         .await
+                        .is_err()
                     {
                         // Continue on error
                     } else {
@@ -4439,7 +4664,7 @@ async fn handle_merge_stage(
             // Document doesn't exist - handle whenNotMatched
             match when_not_matched {
                 "insert" => {
-                    let idb = match doc.get("_id").and_then(|b| id_bytes_bson(b)) {
+                    let idb = match doc.get("_id").and_then(id_bytes_bson) {
                         Some(v) => v,
                         None => continue,
                     };
@@ -4470,7 +4695,7 @@ async fn handle_merge_stage(
                 }
                 _ => {
                     // Default to insert
-                    let idb = match doc.get("_id").and_then(|b| id_bytes_bson(b)) {
+                    let idb = match doc.get("_id").and_then(id_bytes_bson) {
                         Some(v) => v,
                         None => continue,
                     };
@@ -4543,7 +4768,7 @@ async fn find_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Docum
 
     if let Some(ref pg) = state.store {
         // Check for $text query and handle it specially
-        let text_query_result = if let Some(ref f) = filter {
+        let text_query_result = if let Some(f) = filter {
             match extract_text_search_params(f) {
                 Ok(Some((search, language, case_sensitive, diacritic_sensitive))) => {
                     // Get text index fields
@@ -4572,7 +4797,7 @@ async fn find_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Docum
                             {
                                 Ok(docs) => {
                                     // Apply remaining filters (non-$text) if any
-                                    let mut remaining_doc = (*f).clone();
+                                    let mut remaining_doc = f.clone();
                                     remaining_doc.remove("$text");
                                     let remaining_filter = if remaining_doc.is_empty() {
                                         None
@@ -4615,7 +4840,7 @@ async fn find_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Docum
             let mut remainder: Vec<Document> = Vec::new();
             for (idx, mut d) in docs.into_iter().enumerate() {
                 // Apply projection if specified
-                if let Some(ref proj) = projection {
+                if let Some(proj) = projection {
                     d = apply_project_with_expr(&d, proj);
                 }
                 if (idx as i64) < first_batch_limit {
@@ -5080,16 +5305,13 @@ async fn end_sessions_reply(state: &AppState, cmd: &Document) -> Document {
     };
 
     for id_bson in ids {
-        if let Some(lsid_doc) = id_bson.as_document() {
-            if let Some(bson_val) = lsid_doc.get("id") {
-                if let bson::Bson::Binary(binary) = bson_val {
-                    if binary.subtype == bson::spec::BinarySubtype::Uuid {
-                        if let Ok(uuid) = Uuid::from_slice(binary.bytes.as_slice()) {
-                            state.session_manager.end_session(uuid).await;
-                        }
-                    }
-                }
-            }
+        if let Some(lsid_doc) = id_bson.as_document()
+            && let Some(bson_val) = lsid_doc.get("id")
+            && let bson::Bson::Binary(binary) = bson_val
+            && binary.subtype == bson::spec::BinarySubtype::Uuid
+            && let Ok(uuid) = Uuid::from_slice(binary.bytes.as_slice())
+        {
+            state.session_manager.end_session(uuid).await;
         }
     }
 

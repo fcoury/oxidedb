@@ -344,6 +344,78 @@ impl SqlBuilder {
                         "$merge requires special handling beyond SQL pushdown".into(),
                     ));
                 }
+                AggregateStage::GeoNear(spec) => {
+                    // $geoNear must be first stage - this is enforced at pipeline validation time
+                    // Build distance calculation SQL
+                    let jsonb_path = format!(
+                        "doc->'{}'",
+                        spec.key.replace('"', "\"\"").replace('\'', "''")
+                    );
+
+                    let distance_expr = if spec.spherical {
+                        // Haversine distance in meters
+                        format!(
+                            "6371000 * acos(
+                                cos(radians({})) * cos(radians(({}->'coordinates'->>1)::double precision)) *
+                                cos(radians(({}->'coordinates'->>0)::double precision) - radians({})) +
+                                sin(radians({})) * sin(radians(({}->'coordinates'->>1)::double precision))
+                            )",
+                            spec.near_lat, jsonb_path, jsonb_path, spec.near_lon, spec.near_lat, jsonb_path
+                        )
+                    } else {
+                        // Simple Euclidean distance
+                        format!(
+                            "sqrt(
+                                power(({}->'coordinates'->>0)::double precision - {}, 2) +
+                                power(({}->'coordinates'->>1)::double precision - {}, 2)
+                            )",
+                            jsonb_path, spec.near_lon, jsonb_path, spec.near_lat
+                        )
+                    };
+
+                    // Build WHERE clause with query filter and maxDistance
+                    let mut where_clauses = vec![
+                        format!(
+                            "jsonb_path_exists(doc, '$.\"{}\".type ? (@ == \"Point\")')",
+                            spec.key
+                        ),
+                        format!("jsonb_path_exists(doc, '$.\"{}\".coordinates')", spec.key),
+                    ];
+
+                    // Add query filter if present
+                    if let Some(ref query) = spec.query {
+                        let query_sql = build_where_from_filter(query);
+                        if query_sql != "TRUE" {
+                            where_clauses.push(query_sql);
+                        }
+                    }
+
+                    // Add maxDistance filter if present
+                    if let Some(max_dist) = spec.max_distance {
+                        where_clauses.push(format!("{} <= {}", distance_expr, max_dist));
+                    }
+
+                    let where_sql = where_clauses.join(" AND ");
+
+                    // Build the CTE for $geoNear
+                    let cte_name = format!("cte_{}", self.cte_counter);
+                    self.cte_counter += 1;
+
+                    // Select includes the distance field
+                    let sql = format!(
+                        "SELECT id, doc, {} AS \"{}\" FROM {} WHERE {} ORDER BY {} ASC",
+                        distance_expr,
+                        spec.distance_field,
+                        self.current_cte,
+                        where_sql,
+                        distance_expr
+                    );
+
+                    self.ctes.push((cte_name.clone(), sql));
+                    self.current_cte = cte_name;
+                    self.state = SelectState::default();
+                    self.state.select = "id, doc".to_string();
+                }
             }
         }
 

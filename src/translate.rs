@@ -13,81 +13,81 @@ pub fn build_where_from_filter_internal(filter: &bson::Document, is_nested: bool
     let mut where_clauses: Vec<String> = Vec::new();
 
     // Handle logical operators at the top level first
-    if let Some(or_val) = filter.get("$or") {
-        if let bson::Bson::Array(arr) = or_val {
-            let mut or_clauses: Vec<String> = Vec::new();
-            for item in arr {
-                if let bson::Bson::Document(d) = item {
-                    let clause = build_where_from_filter_internal(d, true);
-                    if clause != "TRUE" {
-                        or_clauses.push(clause);
-                    }
+    if let Some(or_val) = filter.get("$or")
+        && let bson::Bson::Array(arr) = or_val
+    {
+        let mut or_clauses: Vec<String> = Vec::new();
+        for item in arr {
+            if let bson::Bson::Document(d) = item {
+                let clause = build_where_from_filter_internal(d, true);
+                if clause != "TRUE" {
+                    or_clauses.push(clause);
                 }
             }
-            if !or_clauses.is_empty() {
-                let joined = or_clauses.join(" OR ");
-                where_clauses.push(if or_clauses.len() > 1 {
+        }
+        if !or_clauses.is_empty() {
+            let joined = or_clauses.join(" OR ");
+            where_clauses.push(if or_clauses.len() > 1 {
+                format!("({})", joined)
+            } else {
+                joined
+            });
+        }
+    }
+
+    if let Some(and_val) = filter.get("$and")
+        && let bson::Bson::Array(arr) = and_val
+    {
+        let mut and_clauses: Vec<String> = Vec::new();
+        for item in arr {
+            if let bson::Bson::Document(d) = item {
+                let clause = build_where_from_filter_internal(d, true);
+                if clause != "TRUE" {
+                    and_clauses.push(clause);
+                }
+            }
+        }
+        if !and_clauses.is_empty() {
+            let joined = and_clauses.join(" AND ");
+            where_clauses.push(if and_clauses.len() > 1 {
+                format!("({})", joined)
+            } else {
+                joined
+            });
+        }
+    }
+
+    if let Some(not_val) = filter.get("$not")
+        && let bson::Bson::Document(d) = not_val
+    {
+        let clause = build_where_from_filter_internal(d, true);
+        if clause != "TRUE" {
+            where_clauses.push(format!("NOT ({})", clause));
+        }
+    }
+
+    if let Some(nor_val) = filter.get("$nor")
+        && let bson::Bson::Array(arr) = nor_val
+    {
+        let mut nor_clauses: Vec<String> = Vec::new();
+        for item in arr {
+            if let bson::Bson::Document(d) = item {
+                let clause = build_where_from_filter_internal(d, true);
+                if clause != "TRUE" {
+                    nor_clauses.push(clause);
+                }
+            }
+        }
+        if !nor_clauses.is_empty() {
+            let joined = nor_clauses.join(" OR ");
+            where_clauses.push(format!(
+                "NOT ({})",
+                if nor_clauses.len() > 1 {
                     format!("({})", joined)
                 } else {
                     joined
-                });
-            }
-        }
-    }
-
-    if let Some(and_val) = filter.get("$and") {
-        if let bson::Bson::Array(arr) = and_val {
-            let mut and_clauses: Vec<String> = Vec::new();
-            for item in arr {
-                if let bson::Bson::Document(d) = item {
-                    let clause = build_where_from_filter_internal(d, true);
-                    if clause != "TRUE" {
-                        and_clauses.push(clause);
-                    }
                 }
-            }
-            if !and_clauses.is_empty() {
-                let joined = and_clauses.join(" AND ");
-                where_clauses.push(if and_clauses.len() > 1 {
-                    format!("({})", joined)
-                } else {
-                    joined
-                });
-            }
-        }
-    }
-
-    if let Some(not_val) = filter.get("$not") {
-        if let bson::Bson::Document(d) = not_val {
-            let clause = build_where_from_filter_internal(d, true);
-            if clause != "TRUE" {
-                where_clauses.push(format!("NOT ({})", clause));
-            }
-        }
-    }
-
-    if let Some(nor_val) = filter.get("$nor") {
-        if let bson::Bson::Array(arr) = nor_val {
-            let mut nor_clauses: Vec<String> = Vec::new();
-            for item in arr {
-                if let bson::Bson::Document(d) = item {
-                    let clause = build_where_from_filter_internal(d, true);
-                    if clause != "TRUE" {
-                        nor_clauses.push(clause);
-                    }
-                }
-            }
-            if !nor_clauses.is_empty() {
-                let joined = nor_clauses.join(" OR ");
-                where_clauses.push(format!(
-                    "NOT ({})",
-                    if nor_clauses.len() > 1 {
-                        format!("({})", joined)
-                    } else {
-                        joined
-                    }
-                ));
-            }
+            ));
         }
     }
 
@@ -105,14 +105,14 @@ pub fn build_where_from_filter_internal(filter: &bson::Document, is_nested: bool
                 for (op, val) in d.iter() {
                     match op.as_str() {
                         "$elemMatch" => {
-                            if let bson::Bson::Document(em) = val {
-                                if let Some(pred) = build_elem_match_pred(&path, em) {
-                                    where_clauses.push(format!(
-                                        "jsonb_path_exists(doc, '{}') ? ({} ))",
-                                        escape_single(&path),
-                                        pred
-                                    ));
-                                }
+                            if let bson::Bson::Document(em) = val
+                                && let Some(pred) = build_elem_match_pred(&path, em)
+                            {
+                                where_clauses.push(format!(
+                                    "jsonb_path_exists(doc, '{}') ? ({} ))",
+                                    escape_single(&path),
+                                    pred
+                                ));
                             }
                         }
                         "$exists" => {
@@ -281,15 +281,13 @@ pub fn build_where_from_filter_internal(filter: &bson::Document, is_nested: bool
                                 let field_key = k;
                                 if let Some(geom) = gw.get("$geometry") {
                                     // GeoJSON format
-                                    if let bson::Bson::Document(geom_doc) = geom {
-                                        if let Some(geom_type) = geom_doc.get_str("type").ok() {
-                                            if let Ok(coords) = geom_doc.get_array("coordinates") {
-                                                let clause = build_geo_within_clause(
-                                                    field_key, geom_type, coords,
-                                                );
-                                                where_clauses.push(clause);
-                                            }
-                                        }
+                                    if let bson::Bson::Document(geom_doc) = geom
+                                        && let Ok(geom_type) = geom_doc.get_str("type")
+                                        && let Ok(coords) = geom_doc.get_array("coordinates")
+                                    {
+                                        let clause =
+                                            build_geo_within_clause(field_key, geom_type, coords);
+                                        where_clauses.push(clause);
                                     }
                                 } else if let Some(bson::Bson::Array(box_coords)) = gw.get("$box") {
                                     // Legacy $box format
@@ -623,7 +621,7 @@ pub fn json_literal_from_bson(v: &bson::Bson) -> Option<String> {
         bson::Bson::Int32(n) => Some(n.to_string()),
         bson::Bson::Int64(n) => Some(n.to_string()),
         bson::Bson::Double(n) => Some(n.to_string()),
-        bson::Bson::String(s) => Some(format!("{}", serde_json::to_string(s).ok()?)),
+        bson::Bson::String(s) => Some((serde_json::to_string(s).ok()?).to_string()),
         _ => None,
     }
 }
@@ -815,10 +813,8 @@ fn translate_concat_arrays(val: &bson::Bson) -> Option<String> {
                     }
                     // Literal array like [4] - build as JSONB array and unnest it
                     bson::Bson::Array(lit_arr) => {
-                        let elems: Vec<String> = lit_arr
-                            .iter()
-                            .filter_map(|elem| translate_expression(elem))
-                            .collect();
+                        let elems: Vec<String> =
+                            lit_arr.iter().filter_map(translate_expression).collect();
                         if !elems.is_empty() {
                             let array_expr = format!("jsonb_build_array({})", elems.join(", "));
                             array_sources.push(format!(
@@ -961,37 +957,31 @@ fn build_geo_box_clause(field_key: &str, box_coords: &bson::Array) -> String {
         let bottom_left = box_coords[0].as_array();
         let top_right = box_coords[1].as_array();
 
-        if let (Some(bl), Some(tr)) = (bottom_left, top_right) {
-            if bl.len() >= 2 && tr.len() >= 2 {
-                let min_lon = bl[0]
-                    .as_f64()
-                    .or_else(|| bl[0].as_i64().map(|v| v as f64))
-                    .unwrap_or(0.0);
-                let min_lat = bl[1]
-                    .as_f64()
-                    .or_else(|| bl[1].as_i64().map(|v| v as f64))
-                    .unwrap_or(0.0);
-                let max_lon = tr[0]
-                    .as_f64()
-                    .or_else(|| tr[0].as_i64().map(|v| v as f64))
-                    .unwrap_or(0.0);
-                let max_lat = tr[1]
-                    .as_f64()
-                    .or_else(|| tr[1].as_i64().map(|v| v as f64))
-                    .unwrap_or(0.0);
+        if let (Some(bl), Some(tr)) = (bottom_left, top_right)
+            && bl.len() >= 2
+            && tr.len() >= 2
+        {
+            let min_lon = bl[0]
+                .as_f64()
+                .or_else(|| bl[0].as_i64().map(|v| v as f64))
+                .unwrap_or(0.0);
+            let min_lat = bl[1]
+                .as_f64()
+                .or_else(|| bl[1].as_i64().map(|v| v as f64))
+                .unwrap_or(0.0);
+            let max_lon = tr[0]
+                .as_f64()
+                .or_else(|| tr[0].as_i64().map(|v| v as f64))
+                .unwrap_or(0.0);
+            let max_lat = tr[1]
+                .as_f64()
+                .or_else(|| tr[1].as_i64().map(|v| v as f64))
+                .unwrap_or(0.0);
 
-                return format!(
-                    "({}->'coordinates'->>0)::float8 >= {} AND ({}->'coordinates'->>0)::float8 <= {} AND ({}->'coordinates'->>1)::float8 >= {} AND ({}->'coordinates'->>1)::float8 <= {}",
-                    jsonb_path,
-                    min_lon,
-                    jsonb_path,
-                    max_lon,
-                    jsonb_path,
-                    min_lat,
-                    jsonb_path,
-                    max_lat
-                );
-            }
+            return format!(
+                "({}->'coordinates'->>0)::float8 >= {} AND ({}->'coordinates'->>0)::float8 <= {} AND ({}->'coordinates'->>1)::float8 >= {} AND ({}->'coordinates'->>1)::float8 <= {}",
+                jsonb_path, min_lon, jsonb_path, max_lon, jsonb_path, min_lat, jsonb_path, max_lat
+            );
         }
     }
     "FALSE".to_string()

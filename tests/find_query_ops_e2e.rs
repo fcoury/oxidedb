@@ -3,7 +3,6 @@ use oxidedb::config::Config;
 use oxidedb::protocol::{MessageHeader, OP_MSG, decode_op_msg_section0, encode_op_msg};
 use oxidedb::server::spawn_with_shutdown;
 use rand::{Rng, distributions::Alphanumeric};
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -31,7 +30,13 @@ fn rand_suffix(n: usize) -> String {
 
 #[tokio::test]
 async fn e2e_find_with_ne_operator() {
-    let testdb = pg::TestDb::provision_from_env().await.unwrap();
+    let testdb = match pg::TestDb::provision_from_env().await {
+        Some(db) => db,
+        None => {
+            eprintln!("skipping: set OXIDEDB_TEST_POSTGRES_URL");
+            return;
+        }
+    };
     let mut cfg = Config::default();
     cfg.listen_addr = "127.0.0.1:0".into();
     cfg.postgres_url = Some(testdb.url.clone());
@@ -76,7 +81,13 @@ async fn e2e_find_with_ne_operator() {
 
 #[tokio::test]
 async fn e2e_find_with_nin_operator() {
-    let testdb = pg::TestDb::provision_from_env().await.unwrap();
+    let testdb = match pg::TestDb::provision_from_env().await {
+        Some(db) => db,
+        None => {
+            eprintln!("skipping: set OXIDEDB_TEST_POSTGRES_URL");
+            return;
+        }
+    };
     let mut cfg = Config::default();
     cfg.listen_addr = "127.0.0.1:0".into();
     cfg.postgres_url = Some(testdb.url.clone());
@@ -125,7 +136,13 @@ async fn e2e_find_with_nin_operator() {
 
 #[tokio::test]
 async fn e2e_find_with_or_operator() {
-    let testdb = pg::TestDb::provision_from_env().await.unwrap();
+    let testdb = match pg::TestDb::provision_from_env().await {
+        Some(db) => db,
+        None => {
+            eprintln!("skipping: set OXIDEDB_TEST_POSTGRES_URL");
+            return;
+        }
+    };
     let mut cfg = Config::default();
     cfg.listen_addr = "127.0.0.1:0".into();
     cfg.postgres_url = Some(testdb.url.clone());
@@ -174,7 +191,13 @@ async fn e2e_find_with_or_operator() {
 
 #[tokio::test]
 async fn e2e_find_with_and_operator() {
-    let testdb = pg::TestDb::provision_from_env().await.unwrap();
+    let testdb = match pg::TestDb::provision_from_env().await {
+        Some(db) => db,
+        None => {
+            eprintln!("skipping: set OXIDEDB_TEST_POSTGRES_URL");
+            return;
+        }
+    };
     let mut cfg = Config::default();
     cfg.listen_addr = "127.0.0.1:0".into();
     cfg.postgres_url = Some(testdb.url.clone());
@@ -227,7 +250,13 @@ async fn e2e_find_with_and_operator() {
 
 #[tokio::test]
 async fn e2e_find_with_regex() {
-    let testdb = pg::TestDb::provision_from_env().await.unwrap();
+    let testdb = match pg::TestDb::provision_from_env().await {
+        Some(db) => db,
+        None => {
+            eprintln!("skipping: set OXIDEDB_TEST_POSTGRES_URL");
+            return;
+        }
+    };
     let mut cfg = Config::default();
     cfg.listen_addr = "127.0.0.1:0".into();
     cfg.postgres_url = Some(testdb.url.clone());
@@ -280,7 +309,13 @@ async fn e2e_find_with_regex() {
 
 #[tokio::test]
 async fn e2e_find_with_all_operator() {
-    let testdb = pg::TestDb::provision_from_env().await.unwrap();
+    let testdb = match pg::TestDb::provision_from_env().await {
+        Some(db) => db,
+        None => {
+            eprintln!("skipping: set OXIDEDB_TEST_POSTGRES_URL");
+            return;
+        }
+    };
     let mut cfg = Config::default();
     cfg.listen_addr = "127.0.0.1:0".into();
     cfg.postgres_url = Some(testdb.url.clone());
@@ -333,7 +368,13 @@ async fn e2e_find_with_all_operator() {
 
 #[tokio::test]
 async fn e2e_find_with_size_operator() {
-    let testdb = pg::TestDb::provision_from_env().await.unwrap();
+    let testdb = match pg::TestDb::provision_from_env().await {
+        Some(db) => db,
+        None => {
+            eprintln!("skipping: set OXIDEDB_TEST_POSTGRES_URL");
+            return;
+        }
+    };
     let mut cfg = Config::default();
     cfg.listen_addr = "127.0.0.1:0".into();
     cfg.postgres_url = Some(testdb.url.clone());

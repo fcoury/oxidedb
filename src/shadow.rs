@@ -179,14 +179,13 @@ impl ShadowSession {
         }
         let body_len = (reply_hdr.message_length as usize).saturating_sub(16);
         let mut buf = vec![0u8; body_len];
-        if body_len > 0 {
-            if let Err(e) = timeout(dur, stream.read_exact(&mut buf))
+        if body_len > 0
+            && let Err(e) = timeout(dur, stream.read_exact(&mut buf))
                 .await
                 .context("shadow recv body timeout")?
-            {
-                *guard = None;
-                return Err(e.into());
-            }
+        {
+            *guard = None;
+            return Err(e.into());
         }
         Ok((reply_hdr.op_code, buf))
     }
@@ -393,7 +392,7 @@ fn diff_bson(
     path: &mut Vec<String>,
     out: &mut Vec<String>,
     opts: &ShadowCompareOptions,
-    depth: usize,
+    _depth: usize,
 ) {
     match (a, b) {
         (Bson::Document(da), Bson::Document(db)) => {
@@ -413,7 +412,7 @@ fn diff_bson(
                 match (av, bv) {
                     (None, Some(_)) => out.push(format!("{} missing in ours", path_str(path))),
                     (Some(_), None) => out.push(format!("{} extra in ours", path_str(path))),
-                    (Some(x), Some(y)) => diff_bson(x, y, path, out, opts, depth + 1),
+                    (Some(x), Some(y)) => diff_bson(x, y, path, out, opts, _depth + 1),
                     _ => {}
                 }
                 path.pop();
@@ -431,7 +430,7 @@ fn diff_bson(
             }
             for (i, (ea, eb)) in aa.iter().zip(ab.iter()).enumerate() {
                 path.push(i.to_string());
-                diff_bson(ea, eb, path, out, opts, depth + 1);
+                diff_bson(ea, eb, path, out, opts, _depth + 1);
                 path.pop();
             }
         }
@@ -448,7 +447,7 @@ fn diff_bson(
     }
 }
 
-fn path_str(path: &Vec<String>) -> String {
+fn path_str(path: &[String]) -> String {
     if path.is_empty() {
         "/".to_string()
     } else {
@@ -456,7 +455,7 @@ fn path_str(path: &Vec<String>) -> String {
     }
 }
 
-fn redact_and_summarize(v: &Bson, path: &Vec<String>) -> String {
+fn redact_and_summarize(v: &Bson, path: &[String]) -> String {
     if is_sensitive_path(path) {
         return "<redacted>".to_string();
     }
@@ -468,7 +467,7 @@ fn redact_and_summarize(v: &Bson, path: &Vec<String>) -> String {
     }
 }
 
-fn is_sensitive_path(path: &Vec<String>) -> bool {
+fn is_sensitive_path(path: &[String]) -> bool {
     // Basic heuristic: redact fields containing these substrings
     let lower: Vec<String> = path.iter().map(|s| s.to_lowercase()).collect();
     for seg in &lower {

@@ -14,9 +14,22 @@ pub enum AggregateStage {
     Facet(Document),
     Sample(i64),
     UnionWith(Document),
-    Out(String), // collection name for $out
+    Out(String),     // collection name for $out
     Merge(Document), // merge specification for $merge
-                 // Lookup, etc. will be added later
+    GeoNear(GeoNearSpec), // geospatial near stage
+                     // Lookup, etc. will be added later
+}
+
+/// Specification for $geoNear aggregation stage
+#[derive(Debug, Clone)]
+pub struct GeoNearSpec {
+    pub near_lon: f64,
+    pub near_lat: f64,
+    pub distance_field: String,
+    pub key: String, // field name containing location (e.g., "location")
+    pub max_distance: Option<f64>, // in meters for spherical
+    pub spherical: bool,
+    pub query: Option<Document>, // optional filter
 }
 
 impl AggregateStage {
@@ -168,6 +181,63 @@ impl AggregateStage {
                     }
                 }
                 Ok(AggregateStage::Merge(d.clone()))
+            }
+            "$geoNear" => {
+                let d = val
+                    .as_document()
+                    .ok_or_else(|| Error::Msg("$geoNear must be a document".into()))?;
+
+                // Parse "near" field (GeoJSON Point)
+                let near_doc = d
+                    .get_document("near")
+                    .map_err(|_| Error::Msg("$geoNear requires 'near' field".into()))?;
+                let geometry = near_doc
+                    .get_document("$geometry")
+                    .or_else(|_| near_doc.get_document("geometry"))
+                    .map_err(|_| {
+                        Error::Msg("$geoNear 'near' must have '$geometry' or 'geometry'".into())
+                    })?;
+                let coords = geometry
+                    .get_array("coordinates")
+                    .map_err(|_| Error::Msg("$geoNear geometry must have 'coordinates'".into()))?;
+                if coords.len() < 2 {
+                    return Err(Error::Msg(
+                        "$geoNear coordinates must have at least 2 elements".into(),
+                    ));
+                }
+                let near_lon = coords[0]
+                    .as_f64()
+                    .or_else(|| coords[0].as_i64().map(|v| v as f64))
+                    .ok_or_else(|| Error::Msg("$geoNear longitude must be a number".into()))?;
+                let near_lat = coords[1]
+                    .as_f64()
+                    .or_else(|| coords[1].as_i64().map(|v| v as f64))
+                    .ok_or_else(|| Error::Msg("$geoNear latitude must be a number".into()))?;
+
+                // Parse required fields
+                let distance_field = d
+                    .get_str("distanceField")
+                    .map_err(|_| Error::Msg("$geoNear requires 'distanceField'".into()))?
+                    .to_string();
+                let key = d.get_str("key").unwrap_or("location").to_string();
+
+                // Parse optional fields
+                let max_distance = d
+                    .get_f64("maxDistance")
+                    .ok()
+                    .or_else(|| d.get_i64("maxDistance").ok().map(|v| v as f64));
+                let spherical = d.get_bool("spherical").unwrap_or(true);
+                let query = d.get_document("query").ok().cloned();
+
+                Ok(AggregateStage::GeoNear(GeoNearSpec {
+                    near_lon,
+                    near_lat,
+                    distance_field,
+                    key,
+                    max_distance,
+                    spherical,
+                    query,
+                }))
             }
             _ => Err(Error::Msg(format!("Unknown or unsupported stage: {}", key))),
         }

@@ -72,7 +72,7 @@ impl ScramAuth {
         let payload = response
             .get_binary_generic("payload")
             .context("missing payload in saslStart response")?;
-        let server_first = String::from_utf8_lossy(&payload);
+        let server_first = String::from_utf8_lossy(payload);
 
         // Step 2: Parse server-first, build client-final
         self.parse_server_first(&server_first)?;
@@ -98,7 +98,7 @@ impl ScramAuth {
         let payload = response
             .get_binary_generic("payload")
             .context("missing payload in saslContinue response")?;
-        let server_final = String::from_utf8_lossy(&payload);
+        let server_final = String::from_utf8_lossy(payload);
 
         // Step 3: Verify server-final
         self.verify_server_final(&server_final)?;
@@ -118,13 +118,13 @@ impl ScramAuth {
         let parts: Vec<&str> = server_first.split(',').collect();
 
         for part in parts {
-            if part.starts_with("r=") {
-                self.server_nonce = Some(part[2..].to_string());
-            } else if part.starts_with("s=") {
-                let salt = BASE64.decode(&part[2..]).context("invalid base64 salt")?;
+            if let Some(stripped) = part.strip_prefix("r=") {
+                self.server_nonce = Some(stripped.to_string());
+            } else if let Some(stripped) = part.strip_prefix("s=") {
+                let salt = BASE64.decode(stripped).context("invalid base64 salt")?;
                 self.salt = Some(salt);
-            } else if part.starts_with("i=") {
-                self.iterations = Some(part[2..].parse().context("invalid iteration count")?);
+            } else if let Some(stripped) = part.strip_prefix("i=") {
+                self.iterations = Some(stripped.parse().context("invalid iteration count")?);
             }
         }
 
@@ -196,8 +196,8 @@ impl ScramAuth {
 
     /// Verify server-final-message
     fn verify_server_final(&self, server_final: &str) -> Result<()> {
-        if server_final.starts_with("e=") {
-            return Err(anyhow!("server returned error: {}", &server_final[2..]));
+        if let Some(stripped) = server_final.strip_prefix("e=") {
+            return Err(anyhow!("server returned error: {}", stripped));
         }
 
         if !server_final.starts_with("v=") {

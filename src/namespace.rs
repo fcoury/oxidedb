@@ -9,7 +9,7 @@ pub fn rewrite_command_doc(doc: &Document, prefix: &str) -> Document {
     let mut new_doc = doc.clone();
 
     // Rewrite $db field
-    if let Some(db) = doc.get_str("$db").ok() {
+    if let Ok(db) = doc.get_str("$db") {
         new_doc.insert("$db", format!("{}_{}", prefix, db));
     }
 
@@ -40,27 +40,27 @@ pub fn rewrite_command_doc(doc: &Document, prefix: &str) -> Document {
     }
 
     // Handle nested namespace fields in indexes
-    if doc.keys().next().map(|s| s.as_str()) == Some("createIndexes") {
-        if let Some(Bson::Array(indexes)) = doc.get("indexes") {
-            let new_indexes: Vec<Bson> = indexes
-                .iter()
-                .map(|idx| {
-                    if let Bson::Document(idx_doc) = idx {
-                        let mut new_idx = idx_doc.clone();
-                        // Some drivers include ns field: "db.collection"
-                        if let Ok(ns) = idx_doc.get_str("ns") {
-                            if let Some((db, coll)) = ns.split_once('.') {
-                                new_idx.insert("ns", format!("{}_{}.{}", prefix, db, coll));
-                            }
-                        }
-                        Bson::Document(new_idx)
-                    } else {
-                        idx.clone()
+    if doc.keys().next().map(|s| s.as_str()) == Some("createIndexes")
+        && let Some(Bson::Array(indexes)) = doc.get("indexes")
+    {
+        let new_indexes: Vec<Bson> = indexes
+            .iter()
+            .map(|idx| {
+                if let Bson::Document(idx_doc) = idx {
+                    let mut new_idx = idx_doc.clone();
+                    // Some drivers include ns field: "db.collection"
+                    if let Ok(ns) = idx_doc.get_str("ns")
+                        && let Some((db, coll)) = ns.split_once('.')
+                    {
+                        new_idx.insert("ns", format!("{}_{}.{}", prefix, db, coll));
                     }
-                })
-                .collect();
-            new_doc.insert("indexes", Bson::Array(new_indexes));
-        }
+                    Bson::Document(new_idx)
+                } else {
+                    idx.clone()
+                }
+            })
+            .collect();
+        new_doc.insert("indexes", Bson::Array(new_indexes));
     }
 
     new_doc
@@ -99,10 +99,10 @@ pub fn has_namespace_fields(doc: &Document) -> bool {
     // Check for nested ns fields in createIndexes
     if let Some(Bson::Array(indexes)) = doc.get("indexes") {
         for idx in indexes {
-            if let Bson::Document(idx_doc) = idx {
-                if idx_doc.get_str("ns").is_ok() {
-                    return true;
-                }
+            if let Bson::Document(idx_doc) = idx
+                && idx_doc.get_str("ns").is_ok()
+            {
+                return true;
             }
         }
     }

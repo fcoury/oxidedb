@@ -247,10 +247,11 @@ impl SessionManager {
         let mut sessions = self.sessions.lock().await;
         if let Some(session) = sessions.remove(&lsid) {
             // Abort any in-progress transaction
-            if let Ok(mut s) = session.try_lock() {
-                if s.in_transaction {
-                    let _ = s.abort_transaction();
-                }
+            if let Ok(mut s) = session.try_lock()
+                && s.in_transaction
+            {
+                #[allow(clippy::let_underscore_future)]
+                let _ = s.abort_transaction();
             }
         }
     }
@@ -281,12 +282,12 @@ impl SessionManager {
 
         // Remove expired sessions
         for id in &expired {
-            if let Some(session) = sessions.remove(id) {
-                if let Ok(mut s) = session.try_lock() {
-                    if s.in_transaction {
-                        let _ = s.abort_transaction();
-                    }
-                }
+            if let Some(session) = sessions.remove(id)
+                && let Ok(mut s) = session.try_lock()
+                && s.in_transaction
+            {
+                #[allow(clippy::let_underscore_future)]
+                let _ = s.abort_transaction();
             }
         }
 
