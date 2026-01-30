@@ -11,6 +11,15 @@ pub struct Config {
     pub cursor_sweep_interval_secs: Option<u64>,
     #[serde(default)]
     pub shadow: Option<ShadowConfig>,
+    // Server TLS configuration
+    #[serde(default)]
+    pub tls_cert_file: Option<String>,
+    #[serde(default)]
+    pub tls_key_file: Option<String>,
+    #[serde(default)]
+    pub tls_ca_file: Option<String>,
+    #[serde(default)]
+    pub tls_client_auth: bool,
 }
 
 impl Default for Config {
@@ -23,6 +32,10 @@ impl Default for Config {
             cursor_timeout_secs: Some(300),
             cursor_sweep_interval_secs: Some(30),
             shadow: None,
+            tls_cert_file: None,
+            tls_key_file: None,
+            tls_ca_file: None,
+            tls_client_auth: false,
         }
     }
 }
@@ -42,6 +55,7 @@ impl Config {
     }
 
     /// Apply CLI/env overrides (highest precedence) to an existing config.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_overrides(
         mut self,
         listen_addr: Option<String>,
@@ -68,7 +82,7 @@ impl Config {
             || shadow_timeout_ms.is_some()
             || shadow_sample_rate.is_some()
         {
-            let mut sh = self.shadow.unwrap_or_else(ShadowConfig::default);
+            let mut sh = self.shadow.unwrap_or_default();
             if let Some(v) = shadow_enabled {
                 sh.enabled = v;
             }
@@ -87,6 +101,125 @@ impl Config {
             self.shadow = Some(sh);
         }
         self
+    }
+
+    /// Validate the configuration
+    #[allow(clippy::collapsible_if)]
+    pub fn validate(&self) -> Result<()> {
+        // Validate listen_addr
+        if self.listen_addr.is_empty() {
+            return Err(Error::Msg("listen_addr cannot be empty".to_string()));
+        }
+        if !self.listen_addr.contains(':') {
+            return Err(Error::Msg(format!(
+                "listen_addr '{}' must be in host:port format",
+                self.listen_addr
+            )));
+        }
+
+        // Validate postgres_url if provided
+        if let Some(ref url) = self.postgres_url {
+            if !url.starts_with("postgres://") && !url.starts_with("postgresql://") {
+                return Err(Error::Msg(format!(
+                    "postgres_url '{}' must start with postgres:// or postgresql://",
+                    url
+                )));
+            }
+        }
+
+        // Validate shadow config if enabled
+        if let Some(ref shadow) = self.shadow {
+            if shadow.enabled {
+                if shadow.addr.is_empty() {
+                    return Err(Error::Msg(
+                        "shadow.addr cannot be empty when shadow is enabled".to_string(),
+                    ));
+                }
+                if !shadow.addr.contains(':') {
+                    return Err(Error::Msg(format!(
+                        "shadow.addr '{}' must be in host:port format",
+                        shadow.addr
+                    )));
+                }
+                if shadow.sample_rate < 0.0 || shadow.sample_rate > 1.0 {
+                    return Err(Error::Msg(format!(
+                        "shadow.sample_rate must be between 0.0 and 1.0, got {}",
+                        shadow.sample_rate
+                    )));
+                }
+
+                // Validate TLS config if enabled
+                if shadow.tls_enabled {
+                    if let Some(ref ca_file) = shadow.tls_ca_file {
+                        if !std::path::Path::new(ca_file).exists() {
+                            return Err(Error::Msg(format!(
+                                "shadow.tls_ca_file '{}' does not exist",
+                                ca_file
+                            )));
+                        }
+                    }
+                    if let Some(ref cert_file) = shadow.tls_client_cert {
+                        if !std::path::Path::new(cert_file).exists() {
+                            return Err(Error::Msg(format!(
+                                "shadow.tls_client_cert '{}' does not exist",
+                                cert_file
+                            )));
+                        }
+                    }
+                    if let Some(ref key_file) = shadow.tls_client_key {
+                        if !std::path::Path::new(key_file).exists() {
+                            return Err(Error::Msg(format!(
+                                "shadow.tls_client_key '{}' does not exist",
+                                key_file
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Validate server TLS configuration
+        if self.tls_cert_file.is_some() || self.tls_key_file.is_some() {
+            // If one is set, both must be set
+            if self.tls_cert_file.is_none() {
+                return Err(Error::Msg(
+                    "tls_cert_file must be set when tls_key_file is set".to_string(),
+                ));
+            }
+            if self.tls_key_file.is_none() {
+                return Err(Error::Msg(
+                    "tls_key_file must be set when tls_cert_file is set".to_string(),
+                ));
+            }
+
+            // Validate files exist
+            if let Some(ref cert_file) = self.tls_cert_file {
+                if !std::path::Path::new(cert_file).exists() {
+                    return Err(Error::Msg(format!(
+                        "tls_cert_file '{}' does not exist",
+                        cert_file
+                    )));
+                }
+            }
+            if let Some(ref key_file) = self.tls_key_file {
+                if !std::path::Path::new(key_file).exists() {
+                    return Err(Error::Msg(format!(
+                        "tls_key_file '{}' does not exist",
+                        key_file
+                    )));
+                }
+            }
+            if let Some(ref ca_file) = self.tls_ca_file {
+                if !std::path::Path::new(ca_file).exists() {
+                    return Err(Error::Msg(format!(
+                        "tls_ca_file '{}' does not exist",
+                        ca_file
+                    )));
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

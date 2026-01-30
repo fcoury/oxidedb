@@ -10,7 +10,7 @@ use crate::shadow::{ShadowSession, compare_docs};
 use crate::store::PgStore;
 use bson::{Document, doc};
 use rand::seq::SliceRandom;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -50,6 +50,75 @@ pub struct AppState {
     pub shadow_timeouts: std::sync::atomic::AtomicU64,
     // Session management
     pub session_manager: std::sync::Arc<SessionManager>,
+    // Production metrics
+    pub request_count: AtomicU64,
+    pub request_duration_ms: AtomicU64,
+    pub query_count: AtomicU64,
+    pub insert_count: AtomicU64,
+    pub update_count: AtomicU64,
+    pub delete_count: AtomicU64,
+    pub error_count: AtomicU64,
+    pub active_connections: AtomicU32,
+}
+
+impl AppState {
+    /// Record a request with its duration
+    pub fn record_request(&self, duration: Duration) {
+        self.request_count.fetch_add(1, Ordering::Relaxed);
+        self.request_duration_ms
+            .fetch_add(duration.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Record a query operation
+    pub fn record_query(&self) {
+        self.query_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an insert operation
+    pub fn record_insert(&self) {
+        self.insert_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an update operation
+    pub fn record_update(&self) {
+        self.update_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a delete operation
+    pub fn record_delete(&self) {
+        self.delete_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an error
+    pub fn record_error(&self) {
+        self.error_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment active connection count
+    pub fn increment_connections(&self) {
+        self.active_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Decrement active connection count
+    pub fn decrement_connections(&self) {
+        self.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Get uptime in seconds
+    pub fn uptime_seconds(&self) -> u64 {
+        self.started_at.elapsed().as_secs()
+    }
+
+    /// Get average request duration in milliseconds
+    pub fn avg_request_duration_ms(&self) -> f64 {
+        let count = self.request_count.load(Ordering::Relaxed);
+        let total_ms = self.request_duration_ms.load(Ordering::Relaxed);
+        if count == 0 {
+            0.0
+        } else {
+            total_ms as f64 / count as f64
+        }
+    }
 }
 
 pub async fn run(cfg: Config) -> Result<()> {
@@ -72,6 +141,14 @@ pub async fn run(cfg: Config) -> Result<()> {
                     shadow_mismatches: std::sync::atomic::AtomicU64::new(0),
                     shadow_timeouts: std::sync::atomic::AtomicU64::new(0),
                     session_manager: std::sync::Arc::new(SessionManager::new()),
+                    request_count: AtomicU64::new(0),
+                    request_duration_ms: AtomicU64::new(0),
+                    query_count: AtomicU64::new(0),
+                    insert_count: AtomicU64::new(0),
+                    update_count: AtomicU64::new(0),
+                    delete_count: AtomicU64::new(0),
+                    error_count: AtomicU64::new(0),
+                    active_connections: AtomicU32::new(0),
                 }
             }
             Err(e) => {
@@ -86,6 +163,14 @@ pub async fn run(cfg: Config) -> Result<()> {
                     shadow_mismatches: std::sync::atomic::AtomicU64::new(0),
                     shadow_timeouts: std::sync::atomic::AtomicU64::new(0),
                     session_manager: std::sync::Arc::new(SessionManager::new()),
+                    request_count: AtomicU64::new(0),
+                    request_duration_ms: AtomicU64::new(0),
+                    query_count: AtomicU64::new(0),
+                    insert_count: AtomicU64::new(0),
+                    update_count: AtomicU64::new(0),
+                    delete_count: AtomicU64::new(0),
+                    error_count: AtomicU64::new(0),
+                    active_connections: AtomicU32::new(0),
                 }
             }
         }
@@ -100,47 +185,131 @@ pub async fn run(cfg: Config) -> Result<()> {
             shadow_mismatches: std::sync::atomic::AtomicU64::new(0),
             shadow_timeouts: std::sync::atomic::AtomicU64::new(0),
             session_manager: std::sync::Arc::new(SessionManager::new()),
+            request_count: AtomicU64::new(0),
+            request_duration_ms: AtomicU64::new(0),
+            query_count: AtomicU64::new(0),
+            insert_count: AtomicU64::new(0),
+            update_count: AtomicU64::new(0),
+            delete_count: AtomicU64::new(0),
+            error_count: AtomicU64::new(0),
+            active_connections: AtomicU32::new(0),
         }
     };
     let state = Arc::new(state);
 
-    // Spawn cursor sweeper (no shutdown in run())
+    // Create shutdown channel
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
+    let shutdown_tx = Arc::new(shutdown_tx);
+
+    // Spawn signal handler for graceful shutdown
+    let shutdown_tx_signal = shutdown_tx.clone();
+    tokio::spawn(async move {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to create SIGTERM handler");
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .expect("failed to create SIGINT handler");
+
+        tokio::select! {
+            _ = sigterm.recv() => {
+                tracing::info!("received SIGTERM, initiating graceful shutdown");
+            }
+            _ = sigint.recv() => {
+                tracing::info!("received SIGINT, initiating graceful shutdown");
+            }
+        }
+
+        let _ = shutdown_tx_signal.send(());
+    });
+
+    // Spawn cursor sweeper with shutdown support
     let ttl = Duration::from_secs(cfg.cursor_timeout_secs.unwrap_or(300));
     let sweep_interval = Duration::from_secs(cfg.cursor_sweep_interval_secs.unwrap_or(30));
     let sweeper_state = state.clone();
+    let mut sweeper_shutdown = shutdown_tx.subscribe();
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(sweep_interval).await;
-            prune_cursors_once(&sweeper_state, ttl).await;
+            tokio::select! {
+                _ = tokio::time::sleep(sweep_interval) => {
+                    prune_cursors_once(&sweeper_state, ttl).await;
+                }
+                _ = sweeper_shutdown.recv() => {
+                    tracing::debug!("cursor sweeper shutting down");
+                    break;
+                }
+            }
         }
     });
 
-    // Spawn session cleanup task
+    // Spawn session cleanup task with shutdown support
     let session_cleanup_state = state.clone();
+    let mut session_cleanup_shutdown = shutdown_tx.subscribe();
     tokio::spawn(async move {
         let cleanup_interval = Duration::from_secs(60); // Check every minute
         loop {
-            tokio::time::sleep(cleanup_interval).await;
-            let removed = session_cleanup_state
-                .session_manager
-                .cleanup_expired_sessions()
-                .await;
-            if removed > 0 {
-                tracing::debug!(removed_sessions = removed, "cleaned up expired sessions");
+            tokio::select! {
+                _ = tokio::time::sleep(cleanup_interval) => {
+                    let removed = session_cleanup_state
+                        .session_manager
+                        .cleanup_expired_sessions()
+                        .await;
+                    if removed > 0 {
+                        tracing::debug!(removed_sessions = removed, "cleaned up expired sessions");
+                    }
+                }
+                _ = session_cleanup_shutdown.recv() => {
+                    tracing::debug!("session cleanup task shutting down");
+                    break;
+                }
             }
         }
     });
 
+    // Accept loop with shutdown support
+    let mut connection_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
     loop {
-        let (socket, addr) = listener.accept().await?;
-        tracing::debug!(%addr, "accepted connection");
-        let state = state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(state, socket).await {
-                tracing::debug!(error = %format!("{e:?}"), "connection closed with error");
+        tokio::select! {
+            res = listener.accept() => {
+                let (socket, addr) = match res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!(error = %format!("{e:?}"), "failed to accept connection");
+                        continue;
+                    }
+                };
+                tracing::debug!(%addr, "accepted connection");
+                state.increment_connections();
+                let state = state.clone();
+                let mut shutdown_rx_conn = shutdown_tx.subscribe();
+                let handle = tokio::spawn(async move {
+                    tokio::select! {
+                        res = handle_connection(state.clone(), socket) => {
+                            if let Err(e) = res {
+                                tracing::debug!(error = %format!("{e:?}"), "connection closed with error");
+                            }
+                        }
+                        _ = shutdown_rx_conn.recv() => {
+                            tracing::debug!("connection handler received shutdown signal");
+                        }
+                    }
+                    state.decrement_connections();
+                });
+                connection_handles.push(handle);
             }
-        });
+            _ = shutdown_rx.recv() => {
+                tracing::info!("shutting down server, waiting for connections to complete");
+                break;
+            }
+        }
     }
+
+    // Wait for all connection handlers to complete
+    for handle in connection_handles {
+        let _ = handle.await;
+    }
+
+    tracing::info!("server shutdown complete");
+    Ok(())
 }
 
 /// Spawn the server on the provided listen address and run until `shutdown` is signaled.
@@ -176,6 +345,14 @@ pub async fn spawn_with_shutdown(
                     shadow_mismatches: std::sync::atomic::AtomicU64::new(0),
                     shadow_timeouts: std::sync::atomic::AtomicU64::new(0),
                     session_manager: std::sync::Arc::new(SessionManager::new()),
+                    request_count: AtomicU64::new(0),
+                    request_duration_ms: AtomicU64::new(0),
+                    query_count: AtomicU64::new(0),
+                    insert_count: AtomicU64::new(0),
+                    update_count: AtomicU64::new(0),
+                    delete_count: AtomicU64::new(0),
+                    error_count: AtomicU64::new(0),
+                    active_connections: AtomicU32::new(0),
                 }
             }
             Err(e) => {
@@ -190,6 +367,14 @@ pub async fn spawn_with_shutdown(
                     shadow_mismatches: std::sync::atomic::AtomicU64::new(0),
                     shadow_timeouts: std::sync::atomic::AtomicU64::new(0),
                     session_manager: std::sync::Arc::new(SessionManager::new()),
+                    request_count: AtomicU64::new(0),
+                    request_duration_ms: AtomicU64::new(0),
+                    query_count: AtomicU64::new(0),
+                    insert_count: AtomicU64::new(0),
+                    update_count: AtomicU64::new(0),
+                    delete_count: AtomicU64::new(0),
+                    error_count: AtomicU64::new(0),
+                    active_connections: AtomicU32::new(0),
                 }
             }
         }
@@ -204,6 +389,14 @@ pub async fn spawn_with_shutdown(
             shadow_mismatches: std::sync::atomic::AtomicU64::new(0),
             shadow_timeouts: std::sync::atomic::AtomicU64::new(0),
             session_manager: std::sync::Arc::new(SessionManager::new()),
+            request_count: AtomicU64::new(0),
+            request_duration_ms: AtomicU64::new(0),
+            query_count: AtomicU64::new(0),
+            insert_count: AtomicU64::new(0),
+            update_count: AtomicU64::new(0),
+            delete_count: AtomicU64::new(0),
+            error_count: AtomicU64::new(0),
+            active_connections: AtomicU32::new(0),
         }
     };
     let state = std::sync::Arc::new(state);
@@ -529,6 +722,10 @@ async fn handle_command(state: &AppState, db: Option<&str>, mut cmd: Document) -
         "dropIndexes" => drop_indexes_reply(state, db, &cmd).await,
         "killCursors" => kill_cursors_reply(state, &cmd).await,
         "oxidedbShadowMetrics" => shadow_metrics_reply(state).await,
+        "oxidedbMetrics" => {
+            let metrics_text = metrics_reply(state).await;
+            doc! { "metrics": metrics_text, "ok": 1.0 }
+        }
         "startTransaction" => start_transaction_reply(state, db, &cmd).await,
         "commitTransaction" => commit_transaction_reply(state, db, &cmd).await,
         "abortTransaction" => abort_transaction_reply(state, db, &cmd).await,
@@ -686,6 +883,80 @@ async fn shadow_metrics_reply(state: &AppState) -> Document {
         },
         "ok": 1.0
     }
+}
+
+/// Generate Prometheus-formatted metrics
+async fn metrics_reply(state: &AppState) -> String {
+    let requests = state.request_count.load(Ordering::Relaxed);
+    let duration_ms = state.request_duration_ms.load(Ordering::Relaxed);
+    let queries = state.query_count.load(Ordering::Relaxed);
+    let inserts = state.insert_count.load(Ordering::Relaxed);
+    let updates = state.update_count.load(Ordering::Relaxed);
+    let deletes = state.delete_count.load(Ordering::Relaxed);
+    let errors = state.error_count.load(Ordering::Relaxed);
+    let active_conn = state.active_connections.load(Ordering::Relaxed);
+    let uptime = state.uptime_seconds();
+
+    // Shadow metrics
+    let shadow_attempts = state.shadow_attempts.load(Ordering::Relaxed);
+    let shadow_matches = state.shadow_matches.load(Ordering::Relaxed);
+    let shadow_mismatches = state.shadow_mismatches.load(Ordering::Relaxed);
+    let shadow_timeouts = state.shadow_timeouts.load(Ordering::Relaxed);
+
+    format!(
+        "# HELP oxidedb_requests_total Total number of requests\n\
+         # TYPE oxidedb_requests_total counter\n\
+         oxidedb_requests_total {}\n\n\
+         # HELP oxidedb_request_duration_seconds Total request duration in seconds\n\
+         # TYPE oxidedb_request_duration_seconds counter\n\
+         oxidedb_request_duration_seconds {}\n\n\
+         # HELP oxidedb_queries_total Total number of queries\n\
+         # TYPE oxidedb_queries_total counter\n\
+         oxidedb_queries_total {}\n\n\
+         # HELP oxidedb_inserts_total Total number of inserts\n\
+         # TYPE oxidedb_inserts_total counter\n\
+         oxidedb_inserts_total {}\n\n\
+         # HELP oxidedb_updates_total Total number of updates\n\
+         # TYPE oxidedb_updates_total counter\n\
+         oxidedb_updates_total {}\n\n\
+         # HELP oxidedb_deletes_total Total number of deletes\n\
+         # TYPE oxidedb_deletes_total counter\n\
+         oxidedb_deletes_total {}\n\n\
+         # HELP oxidedb_errors_total Total number of errors\n\
+         # TYPE oxidedb_errors_total counter\n\
+         oxidedb_errors_total {}\n\n\
+         # HELP oxidedb_active_connections Current number of active connections\n\
+         # TYPE oxidedb_active_connections gauge\n\
+         oxidedb_active_connections {}\n\n\
+         # HELP oxidedb_uptime_seconds Server uptime in seconds\n\
+         # TYPE oxidedb_uptime_seconds gauge\n\
+         oxidedb_uptime_seconds {}\n\n\
+         # HELP oxidedb_shadow_attempts_total Total shadow comparison attempts\n\
+         # TYPE oxidedb_shadow_attempts_total counter\n\
+         oxidedb_shadow_attempts_total {}\n\n\
+         # HELP oxidedb_shadow_matches_total Total shadow matches\n\
+         # TYPE oxidedb_shadow_matches_total counter\n\
+         oxidedb_shadow_matches_total {}\n\n\
+         # HELP oxidedb_shadow_mismatches_total Total shadow mismatches\n\
+         # TYPE oxidedb_shadow_mismatches_total counter\n\
+         oxidedb_shadow_mismatches_total {}\n\n\
+         # HELP oxidedb_shadow_timeouts_total Total shadow timeouts\n\
+         # TYPE oxidedb_shadow_timeouts_total counter\n\
+         oxidedb_shadow_timeouts_total {}\n",
+        requests,
+        duration_ms as f64 / 1000.0,
+        queries,
+        inserts,
+        updates,
+        deletes,
+        errors,
+        active_conn,
+        uptime,
+        shadow_attempts,
+        shadow_matches,
+        shadow_mismatches,
+        shadow_timeouts,
+    )
 }
 
 async fn create_collection_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Document {
@@ -4697,6 +4968,14 @@ mod tests {
             shadow_mismatches: std::sync::atomic::AtomicU64::new(0),
             shadow_timeouts: std::sync::atomic::AtomicU64::new(0),
             session_manager: std::sync::Arc::new(SessionManager::new()),
+            request_count: AtomicU64::new(0),
+            request_duration_ms: AtomicU64::new(0),
+            query_count: AtomicU64::new(0),
+            insert_count: AtomicU64::new(0),
+            update_count: AtomicU64::new(0),
+            delete_count: AtomicU64::new(0),
+            error_count: AtomicU64::new(0),
+            active_connections: AtomicU32::new(0),
         };
         {
             let mut map = state.cursors.lock().await;
