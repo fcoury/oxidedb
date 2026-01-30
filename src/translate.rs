@@ -91,6 +91,35 @@ pub fn build_where_from_filter_internal(filter: &bson::Document, is_nested: bool
         }
     }
 
+    // Handle $text operator for full-text search
+    if let Some(text_val) = filter.get("$text") {
+        if let bson::Bson::Document(text_doc) = text_val {
+            if let Some(bson::Bson::String(query)) = text_doc.get("$search") {
+                let language = text_doc
+                    .get("$language")
+                    .and_then(|l| l.as_str())
+                    .unwrap_or("english");
+                let _case_sensitive = text_doc
+                    .get("$caseSensitive")
+                    .and_then(|c| c.as_bool())
+                    .unwrap_or(false);
+                let _diacritic_sensitive = text_doc
+                    .get("$diacriticSensitive")
+                    .and_then(|d| d.as_bool())
+                    .unwrap_or(false);
+
+                // Build text search clause using to_tsvector and plainto_tsquery
+                // Search across the entire document text
+                let escaped_query = query.replace('"', "\"\"");
+                let text_clause = format!(
+                    "to_tsvector('{}', doc::text) @@ plainto_tsquery('{}', '{}')",
+                    language, language, escaped_query
+                );
+                where_clauses.push(text_clause);
+            }
+        }
+    }
+
     // Process field-level operators (skip keys starting with $)
     for (k, v) in filter.iter() {
         if k == "_id" || k.starts_with('$') {
@@ -272,6 +301,98 @@ pub fn build_where_from_filter_internal(filter: &bson::Document, is_nested: bool
                                 where_clauses.push(format!("({} OR {})", p1, p2));
                             }
                         }
+                        "$geoWithin" => {
+                            if let bson::Bson::Document(gw) = val {
+                                if let Some(geom) = gw.get("$geometry") {
+                                    // GeoJSON format
+                                    if let bson::Bson::Document(geom_doc) = geom {
+                                        if let Some(geom_type) = geom_doc.get_str("type").ok() {
+                                            if let Ok(coords) = geom_doc.get_array("coordinates") {
+                                                let clause = build_geo_within_clause(
+                                                    &path, geom_type, coords,
+                                                );
+                                                where_clauses.push(clause);
+                                            }
+                                        }
+                                    }
+                                } else if let Some(bson::Bson::Document(box_doc)) = gw.get("$box") {
+                                    // Legacy $box format
+                                    if let Ok(box_coords) = box_doc.get_array("$box") {
+                                        let clause = build_geo_box_clause(&path, box_coords);
+                                        where_clauses.push(clause);
+                                    }
+                                } else if let Some(bson::Bson::Document(poly_doc)) =
+                                    gw.get("$polygon")
+                                {
+                                    // Legacy $polygon format
+                                    if let Ok(poly_coords) = poly_doc.get_array("$polygon") {
+                                        let clause = build_geo_polygon_clause(&path, poly_coords);
+                                        where_clauses.push(clause);
+                                    }
+                                }
+                            }
+                        }
+                        "$near" | "$nearSphere" => {
+                            if let bson::Bson::Document(near_doc) = val {
+                                let spherical = op == "$nearSphere";
+
+                                // Get the near point (can be GeoJSON or legacy [lon, lat])
+                                let (near_lon, near_lat) = if let Some(bson::Bson::Document(geom)) =
+                                    near_doc.get("$geometry")
+                                {
+                                    // GeoJSON format
+                                    if let Ok(coords) = geom.get_array("coordinates") {
+                                        if coords.len() >= 2 {
+                                            let lon = coords[0]
+                                                .as_f64()
+                                                .or_else(|| coords[0].as_i64().map(|v| v as f64))
+                                                .unwrap_or(0.0);
+                                            let lat = coords[1]
+                                                .as_f64()
+                                                .or_else(|| coords[1].as_i64().map(|v| v as f64))
+                                                .unwrap_or(0.0);
+                                            (lon, lat)
+                                        } else {
+                                            (0.0, 0.0)
+                                        }
+                                    } else {
+                                        (0.0, 0.0)
+                                    }
+                                } else if let Ok(coords) = near_doc.get_array("$near") {
+                                    // Legacy format
+                                    if coords.len() >= 2 {
+                                        let lon = coords[0]
+                                            .as_f64()
+                                            .or_else(|| coords[0].as_i64().map(|v| v as f64))
+                                            .unwrap_or(0.0);
+                                        let lat = coords[1]
+                                            .as_f64()
+                                            .or_else(|| coords[1].as_i64().map(|v| v as f64))
+                                            .unwrap_or(0.0);
+                                        (lon, lat)
+                                    } else {
+                                        (0.0, 0.0)
+                                    }
+                                } else {
+                                    (0.0, 0.0)
+                                };
+
+                                // Get maxDistance
+                                let max_distance =
+                                    near_doc.get_f64("$maxDistance").ok().or_else(|| {
+                                        near_doc.get_i64("$maxDistance").ok().map(|v| v as f64)
+                                    });
+
+                                let clause = build_near_clause(
+                                    &path,
+                                    near_lon,
+                                    near_lat,
+                                    max_distance,
+                                    spherical,
+                                );
+                                where_clauses.push(clause);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -376,8 +497,17 @@ pub fn build_where_spec(filter: &bson::Document) -> WhereSpec {
 }
 
 pub fn build_order_by(sort: Option<&bson::Document>) -> String {
+    build_order_by_with_collation(sort, None)
+}
+
+pub fn build_order_by_with_collation(
+    sort: Option<&bson::Document>,
+    collation: Option<&crate::store::Collation>,
+) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut has_id = false;
+    let collate_clause = collation.map(|c| c.to_collate_clause()).unwrap_or_default();
+
     if let Some(spec) = sort {
         for (k, v) in spec.iter() {
             let dir = match v {
@@ -404,7 +534,12 @@ pub fn build_order_by(sort: Option<&bson::Document>) -> String {
                     "(CASE WHEN {} THEN (doc->>'{}')::double precision END) {}",
                     numeric_re, f, ord
                 );
-                let text_val = format!("(doc->>'{}') {}", f, ord);
+                // Add COLLATE clause for text sorting if collation is specified
+                let text_val = if collate_clause.is_empty() {
+                    format!("(doc->>'{}') {}", f, ord)
+                } else {
+                    format!("(doc->>'{}') {} {}", f, collate_clause, ord)
+                };
                 parts.push(num_first);
                 parts.push(num_val);
                 parts.push(text_val);
@@ -760,4 +895,167 @@ fn translate_substr(val: &bson::Bson) -> Option<String> {
         }
         _ => None,
     }
+}
+
+// --- Geospatial query helper functions ---
+
+/// Build SQL clause for $geoWithin with GeoJSON geometry
+fn build_geo_within_clause(path: &str, geom_type: &str, coords: &bson::Array) -> String {
+    let escaped_path = escape_single(path.trim_start_matches("$"));
+
+    match geom_type {
+        "Polygon" => {
+            // Extract bounding box from polygon coordinates
+            if let Some(outer_ring) = coords.first().and_then(|r| r.as_array()) {
+                let (min_lon, max_lon, min_lat, max_lat) = extract_bounding_box(outer_ring);
+                format!(
+                    "jsonb_path_exists(doc, '$.\"{}\".coordinates ? (@[0] >= {} && @[0] <= {} && @[1] >= {} && @[1] <= {})')",
+                    escaped_path, min_lon, max_lon, min_lat, max_lat
+                )
+            } else {
+                "FALSE".to_string()
+            }
+        }
+        "MultiPolygon" => {
+            // For MultiPolygon, check within any of the polygons
+            let mut clauses: Vec<String> = Vec::new();
+            for poly in coords.iter().filter_map(|p| p.as_array()) {
+                if let Some(outer_ring) = poly.first().and_then(|r| r.as_array()) {
+                    let (min_lon, max_lon, min_lat, max_lat) = extract_bounding_box(outer_ring);
+                    clauses.push(format!(
+                        "jsonb_path_exists(doc, '$.\"{}\".coordinates ? (@[0] >= {} && @[0] <= {} && @[1] >= {} && @[1] <= {})')",
+                        escaped_path, min_lon, max_lon, min_lat, max_lat
+                    ));
+                }
+            }
+            if clauses.is_empty() {
+                "FALSE".to_string()
+            } else {
+                format!("({})", clauses.join(" OR "))
+            }
+        }
+        _ => "FALSE".to_string(),
+    }
+}
+
+/// Build SQL clause for legacy $box operator
+fn build_geo_box_clause(path: &str, box_coords: &bson::Array) -> String {
+    let escaped_path = escape_single(path.trim_start_matches("$"));
+
+    if box_coords.len() >= 2 {
+        let bottom_left = box_coords[0].as_array();
+        let top_right = box_coords[1].as_array();
+
+        if let (Some(bl), Some(tr)) = (bottom_left, top_right) {
+            if bl.len() >= 2 && tr.len() >= 2 {
+                let min_lon = bl[0]
+                    .as_f64()
+                    .or_else(|| bl[0].as_i64().map(|v| v as f64))
+                    .unwrap_or(0.0);
+                let min_lat = bl[1]
+                    .as_f64()
+                    .or_else(|| bl[1].as_i64().map(|v| v as f64))
+                    .unwrap_or(0.0);
+                let max_lon = tr[0]
+                    .as_f64()
+                    .or_else(|| tr[0].as_i64().map(|v| v as f64))
+                    .unwrap_or(0.0);
+                let max_lat = tr[1]
+                    .as_f64()
+                    .or_else(|| tr[1].as_i64().map(|v| v as f64))
+                    .unwrap_or(0.0);
+
+                return format!(
+                    "jsonb_path_exists(doc, '$.\"{}\".coordinates ? (@[0] >= {} && @[0] <= {} && @[1] >= {} && @[1] <= {})')",
+                    escaped_path, min_lon, max_lon, min_lat, max_lat
+                );
+            }
+        }
+    }
+    "FALSE".to_string()
+}
+
+/// Build SQL clause for legacy $polygon operator
+fn build_geo_polygon_clause(path: &str, poly_coords: &bson::Array) -> String {
+    // For legacy polygon, use the same bounding box approach
+    build_geo_box_clause(path, poly_coords)
+}
+
+/// Build SQL clause for $near/$nearSphere operators
+fn build_near_clause(
+    path: &str,
+    near_lon: f64,
+    near_lat: f64,
+    max_distance: Option<f64>,
+    spherical: bool,
+) -> String {
+    let escaped_path = escape_single(path.trim_start_matches("$"));
+
+    // Build distance calculation expression
+    let distance_expr = if spherical {
+        // Haversine distance in meters
+        format!(
+            "6371000 * acos(
+                cos(radians({})) * cos(radians((doc->'{}'->'coordinates'->>1)::double precision)) *
+                cos(radians((doc->'{}'->'coordinates'->>0)::double precision) - radians({})) +
+                sin(radians({})) * sin(radians((doc->'{}'->'coordinates'->>1)::double precision))
+            )",
+            near_lat, escaped_path, escaped_path, near_lon, near_lat, escaped_path
+        )
+    } else {
+        // Simple Euclidean distance
+        format!(
+            "sqrt(
+                power((doc->'{}'->'coordinates'->>0)::double precision - {}, 2) +
+                power((doc->'{}'->'coordinates'->>1)::double precision - {}, 2)
+            )",
+            escaped_path, near_lon, escaped_path, near_lat
+        )
+    };
+
+    // Build the complete clause
+    let mut clauses = vec![
+        format!(
+            "jsonb_path_exists(doc, '$.\"{}\".type ? (@ == \"Point\")')",
+            escaped_path
+        ),
+        format!(
+            "jsonb_path_exists(doc, '$.\"{}\".coordinates')",
+            escaped_path
+        ),
+    ];
+
+    if let Some(max_dist) = max_distance {
+        clauses.push(format!("{} <= {}", distance_expr, max_dist));
+    }
+
+    clauses.join(" AND ")
+}
+
+/// Extract bounding box from a ring of coordinates
+fn extract_bounding_box(ring: &bson::Array) -> (f64, f64, f64, f64) {
+    let mut min_lon = f64::MAX;
+    let mut max_lon = f64::MIN;
+    let mut min_lat = f64::MAX;
+    let mut max_lat = f64::MIN;
+
+    for point in ring.iter().filter_map(|p| p.as_array()) {
+        if point.len() >= 2 {
+            let lon = point[0]
+                .as_f64()
+                .or_else(|| point[0].as_i64().map(|v| v as f64))
+                .unwrap_or(0.0);
+            let lat = point[1]
+                .as_f64()
+                .or_else(|| point[1].as_i64().map(|v| v as f64))
+                .unwrap_or(0.0);
+
+            min_lon = min_lon.min(lon);
+            max_lon = max_lon.max(lon);
+            min_lat = min_lat.min(lat);
+            max_lat = max_lat.max(lat);
+        }
+    }
+
+    (min_lon, max_lon, min_lat, max_lat)
 }

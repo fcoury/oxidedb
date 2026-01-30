@@ -880,6 +880,58 @@ impl PgStore {
         Ok(())
     }
 
+    /// Create a 2dsphere index for geospatial queries using PostgreSQL GIN index
+    pub async fn create_index_2dsphere(
+        &self,
+        db: &str,
+        coll: &str,
+        name: &str,
+        field: &str,
+        spec: &serde_json::Value,
+    ) -> Result<()> {
+        // Ensure collection (schema/table) exists
+        self.ensure_collection(db, coll).await?;
+        let schema = schema_name(db);
+        let q_schema = q_ident(&schema);
+        let q_table = q_ident(coll);
+        let q_idx = q_ident(name);
+        let field_escaped = field.replace('"', "\"\"");
+
+        let t = Instant::now();
+
+        // Create GIN index on the GeoJSON field
+        let ddl = format!(
+            "CREATE INDEX IF NOT EXISTS {} ON {}.{} USING GIN ((doc->'{}') jsonb_path_ops)",
+            q_idx, q_schema, q_table, field_escaped
+        );
+
+        let client = self.pool.get().await.map_err(err_msg)?;
+        client.batch_execute(&ddl).await.map_err(err_msg)?;
+
+        // Also create a functional index for geometry operations
+        let geo_idx_name = format!("{}_geo", name);
+        let q_geo_idx = q_ident(&geo_idx_name);
+        let functional_ddl = format!(
+            "CREATE INDEX IF NOT EXISTS {} ON {}.{} USING GIN ((doc->'{}'))",
+            q_geo_idx, q_schema, q_table, field_escaped
+        );
+        client
+            .batch_execute(&functional_ddl)
+            .await
+            .map_err(err_msg)?;
+
+        // Persist metadata
+        client
+            .execute(
+                "INSERT INTO mdb_meta.indexes(db, coll, name, spec, sql) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (db, coll, name) DO UPDATE SET spec = EXCLUDED.spec, sql = EXCLUDED.sql",
+                &[&db, &coll, &name, &spec, &ddl],
+            )
+            .await
+            .map_err(err_msg)?;
+        tracing::debug!(op="create_index_2dsphere", db=%db, coll=%coll, name=%name, field=%field, elapsed_ms=?t.elapsed().as_millis());
+        Ok(())
+    }
+
     pub async fn count_docs(
         &self,
         db: &str,
@@ -1349,6 +1401,93 @@ fn build_where_from_filter_internal(filter: &bson::Document, is_nested: bool) ->
                                     lit
                                 );
                                 where_clauses.push(format!("({} OR {})", p1, p2));
+                            }
+                        }
+                        "$geoWithin" => {
+                            if let bson::Bson::Document(gw) = val {
+                                if let Some(geom) = gw.get("$geometry") {
+                                    // GeoJSON format
+                                    if let bson::Bson::Document(geom_doc) = geom {
+                                        if let Some(geom_type) = geom_doc.get_str("type").ok() {
+                                            if let Ok(coords) = geom_doc.get_array("coordinates") {
+                                                let clause =
+                                                    build_geo_within_clause(&k, geom_type, &coords);
+                                                where_clauses.push(clause);
+                                            }
+                                        }
+                                    }
+                                } else if let Some(bson::Bson::Array(box_coords)) = gw.get("$box") {
+                                    // Legacy $box format
+                                    let clause = build_geo_box_clause(&k, box_coords);
+                                    where_clauses.push(clause);
+                                } else if let Some(bson::Bson::Array(poly_coords)) =
+                                    gw.get("$polygon")
+                                {
+                                    // Legacy $polygon format
+                                    let clause = build_geo_polygon_clause(&k, poly_coords);
+                                    where_clauses.push(clause);
+                                }
+                            }
+                        }
+                        "$near" | "$nearSphere" => {
+                            if let bson::Bson::Document(near_doc) = val {
+                                let spherical = op == "$nearSphere";
+
+                                // Get the near point (can be GeoJSON or legacy [lon, lat])
+                                let (near_lon, near_lat) = if let Some(bson::Bson::Document(geom)) =
+                                    near_doc.get("$geometry")
+                                {
+                                    // GeoJSON format
+                                    if let Ok(coords) = geom.get_array("coordinates") {
+                                        if coords.len() >= 2 {
+                                            let lon = coords[0]
+                                                .as_f64()
+                                                .or_else(|| coords[0].as_i64().map(|v| v as f64))
+                                                .unwrap_or(0.0);
+                                            let lat = coords[1]
+                                                .as_f64()
+                                                .or_else(|| coords[1].as_i64().map(|v| v as f64))
+                                                .unwrap_or(0.0);
+                                            (lon, lat)
+                                        } else {
+                                            (0.0, 0.0)
+                                        }
+                                    } else {
+                                        (0.0, 0.0)
+                                    }
+                                } else if let Ok(coords) = near_doc.get_array("$near") {
+                                    // Legacy format
+                                    if coords.len() >= 2 {
+                                        let lon = coords[0]
+                                            .as_f64()
+                                            .or_else(|| coords[0].as_i64().map(|v| v as f64))
+                                            .unwrap_or(0.0);
+                                        let lat = coords[1]
+                                            .as_f64()
+                                            .or_else(|| coords[1].as_i64().map(|v| v as f64))
+                                            .unwrap_or(0.0);
+                                        (lon, lat)
+                                    } else {
+                                        (0.0, 0.0)
+                                    }
+                                } else {
+                                    (0.0, 0.0)
+                                };
+
+                                // Get maxDistance
+                                let max_distance = near_doc
+                                    .get_f64("$maxDistance")
+                                    .or_else(|_| near_doc.get_i64("$maxDistance").map(|v| v as f64))
+                                    .ok();
+
+                                let clause = build_near_clause(
+                                    &k,
+                                    near_lon,
+                                    near_lat,
+                                    max_distance,
+                                    spherical,
+                                );
+                                where_clauses.push(clause);
                             }
                         }
                         _ => {}
@@ -2120,4 +2259,174 @@ impl PgStore {
         let mut g = self.collections_cache.write().await;
         g.insert((db.to_string(), coll.to_string()));
     }
+}
+
+/// Collation configuration for sorting
+pub struct Collation {
+    pub locale: String,
+    pub strength: Option<i32>,
+}
+
+impl Collation {
+    pub fn from_bson(doc: &bson::Document) -> Option<Self> {
+        let locale = doc.get_str("locale").ok()?;
+        let strength = doc.get_i32("strength").ok();
+        Some(Collation {
+            locale: locale.to_string(),
+            strength,
+        })
+    }
+
+    pub fn to_collate_clause(&self) -> String {
+        format!("COLLATE \"{}\"", self.locale)
+    }
+}
+
+// --- Geospatial query helper functions ---
+
+/// Build SQL clause for $geoWithin with GeoJSON geometry (using bson::Array)
+fn build_geo_within_clause(field: &str, geom_type: &str, coords: &bson::Array) -> String {
+    match geom_type {
+        "Polygon" => {
+            // Extract bounding box from polygon coordinates
+            if let Some(outer_ring) = coords.first().and_then(|r| r.as_array()) {
+                let (min_lon, max_lon, min_lat, max_lat) = extract_bounding_box_bson(outer_ring);
+                // Use direct JSONB extraction for better compatibility
+                format!(
+                    "(doc->'{}'->'coordinates'->>0)::float >= {} AND (doc->'{}'->'coordinates'->>0)::float <= {} AND (doc->'{}'->'coordinates'->>1)::float >= {} AND (doc->'{}'->'coordinates'->>1)::float <= {}",
+                    field, min_lon, field, max_lon, field, min_lat, field, max_lat
+                )
+            } else {
+                "FALSE".to_string()
+            }
+        }
+        "MultiPolygon" => {
+            // For MultiPolygon, check within any of the polygons
+            let mut clauses: Vec<String> = Vec::new();
+            for poly in coords.iter().filter_map(|p| p.as_array()) {
+                if let Some(outer_ring) = poly.first().and_then(|r| r.as_array()) {
+                    let (min_lon, max_lon, min_lat, max_lat) =
+                        extract_bounding_box_bson(outer_ring);
+                    clauses.push(format!(
+                        "((doc->'{}'->'coordinates'->>0)::float >= {} AND (doc->'{}'->'coordinates'->>0)::float <= {} AND (doc->'{}'->'coordinates'->>1)::float >= {} AND (doc->'{}'->'coordinates'->>1)::float <= {})",
+                        field, min_lon, field, max_lon, field, min_lat, field, max_lat
+                    ));
+                }
+            }
+            if clauses.is_empty() {
+                "FALSE".to_string()
+            } else {
+                format!("({})", clauses.join(" OR "))
+            }
+        }
+        _ => "FALSE".to_string(),
+    }
+}
+
+/// Build SQL clause for legacy $box operator (using bson::Array)
+fn build_geo_box_clause(field: &str, box_coords: &bson::Array) -> String {
+    if box_coords.len() >= 2 {
+        let bottom_left = box_coords[0].as_array();
+        let top_right = box_coords[1].as_array();
+
+        if let (Some(bl), Some(tr)) = (bottom_left, top_right) {
+            if bl.len() >= 2 && tr.len() >= 2 {
+                let min_lon = bl[0]
+                    .as_f64()
+                    .or_else(|| bl[0].as_i64().map(|v| v as f64))
+                    .unwrap_or(0.0);
+                let min_lat = bl[1]
+                    .as_f64()
+                    .or_else(|| bl[1].as_i64().map(|v| v as f64))
+                    .unwrap_or(0.0);
+                let max_lon = tr[0]
+                    .as_f64()
+                    .or_else(|| tr[0].as_i64().map(|v| v as f64))
+                    .unwrap_or(0.0);
+                let max_lat = tr[1]
+                    .as_f64()
+                    .or_else(|| tr[1].as_i64().map(|v| v as f64))
+                    .unwrap_or(0.0);
+
+                return format!(
+                    "(doc->'{}'->'coordinates'->>0)::float >= {} AND (doc->'{}'->'coordinates'->>0)::float <= {} AND (doc->'{}'->'coordinates'->>1)::float >= {} AND (doc->'{}'->'coordinates'->>1)::float <= {}",
+                    field, min_lon, field, max_lon, field, min_lat, field, max_lat
+                );
+            }
+        }
+    }
+    "FALSE".to_string()
+}
+
+/// Build SQL clause for legacy $polygon operator (using bson::Array)
+fn build_geo_polygon_clause(field: &str, poly_coords: &bson::Array) -> String {
+    // For legacy polygon, use the same bounding box approach
+    build_geo_box_clause(field, poly_coords)
+}
+
+/// Build SQL clause for $near/$nearSphere operators
+fn build_near_clause(
+    field: &str,
+    near_lon: f64,
+    near_lat: f64,
+    max_distance: Option<f64>,
+    _spherical: bool,
+) -> String {
+    // Build the clause using bounding box for efficiency
+    if let Some(max_dist) = max_distance {
+        // For spherical calculations, convert distance from meters to degrees approximately
+        // 1 degree of latitude is approximately 111km
+        let max_dist_degrees = max_dist / 111000.0;
+        format!(
+            "(doc->'{}'->'coordinates'->>0)::float >= {} AND (doc->'{}'->'coordinates'->>0)::float <= {} AND (doc->'{}'->'coordinates'->>1)::float >= {} AND (doc->'{}'->'coordinates'->>1)::float <= {}",
+            field,
+            near_lon - max_dist_degrees,
+            field,
+            near_lon + max_dist_degrees,
+            field,
+            near_lat - max_dist_degrees,
+            field,
+            near_lat + max_dist_degrees
+        )
+    } else {
+        format!(
+            "(doc->'{}'->'coordinates'->>0)::float >= {} AND (doc->'{}'->'coordinates'->>0)::float <= {} AND (doc->'{}'->'coordinates'->>1)::float >= {} AND (doc->'{}'->'coordinates'->>1)::float <= {}",
+            field,
+            near_lon - 1.0,
+            field,
+            near_lon + 1.0,
+            field,
+            near_lat - 1.0,
+            field,
+            near_lat + 1.0
+        )
+    }
+}
+
+/// Extract bounding box from a ring of coordinates (using bson::Array)
+fn extract_bounding_box_bson(ring: &bson::Array) -> (f64, f64, f64, f64) {
+    let mut min_lon = f64::MAX;
+    let mut max_lon = f64::MIN;
+    let mut min_lat = f64::MAX;
+    let mut max_lat = f64::MIN;
+
+    for point in ring.iter().filter_map(|p| p.as_array()) {
+        if point.len() >= 2 {
+            let lon = point[0]
+                .as_f64()
+                .or_else(|| point[0].as_i64().map(|v| v as f64))
+                .unwrap_or(0.0);
+            let lat = point[1]
+                .as_f64()
+                .or_else(|| point[1].as_i64().map(|v| v as f64))
+                .unwrap_or(0.0);
+
+            min_lon = min_lon.min(lon);
+            max_lon = max_lon.max(lon);
+            min_lat = min_lat.min(lat);
+            max_lat = max_lat.max(lat);
+        }
+    }
+
+    (min_lon, max_lon, min_lat, max_lat)
 }

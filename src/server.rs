@@ -5070,18 +5070,34 @@ async fn create_indexes_reply(state: &AppState, db: Option<&str>, cmd: &Document
         };
         if key.len() == 1 {
             let (field, order_b) = key.iter().next().unwrap();
-            let order = match order_b {
-                bson::Bson::Int32(n) => *n,
-                bson::Bson::Int64(n) => *n as i32,
-                _ => 1,
-            };
-            if let Err(e) = pg
-                .create_index_single_field(dbname, coll, name, field, order, &spec_json)
-                .await
-            {
-                tracing::warn!("create_index(single) failed: {}", e);
+            // Check if this is a 2dsphere index
+            if let bson::Bson::String(s) = order_b {
+                if s == "2dsphere" {
+                    if let Err(e) = pg
+                        .create_index_2dsphere(dbname, coll, name, field, &spec_json)
+                        .await
+                    {
+                        tracing::warn!("create_index(2dsphere) failed: {}", e);
+                    } else {
+                        created += 1;
+                    }
+                } else {
+                    tracing::warn!("Unknown index type: {}", s);
+                }
             } else {
-                created += 1;
+                let order = match order_b {
+                    bson::Bson::Int32(n) => *n,
+                    bson::Bson::Int64(n) => *n as i32,
+                    _ => 1,
+                };
+                if let Err(e) = pg
+                    .create_index_single_field(dbname, coll, name, field, order, &spec_json)
+                    .await
+                {
+                    tracing::warn!("create_index(single) failed: {}", e);
+                } else {
+                    created += 1;
+                }
             }
         } else {
             let mut fields: Vec<(String, i32)> = Vec::with_capacity(key.len());
