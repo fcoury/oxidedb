@@ -771,6 +771,55 @@ fn error_doc(code: i32, msg: impl Into<String>) -> Document {
     doc! { "ok": 0.0, "errmsg": msg.into(), "code": code }
 }
 
+/// Extract $text search parameters from a filter document.
+/// Returns Some((search, language, case_sensitive, diacritic_sensitive)) if $text is present.
+/// Returns None if no $text operator.
+/// Returns error document if $text is malformed or combined with disallowed operators.
+fn extract_text_search_params(
+    filter: &Document,
+) -> std::result::Result<Option<(String, String, bool, bool)>, Document> {
+    if let Some(text_val) = filter.get("$text") {
+        if let bson::Bson::Document(text_doc) = text_val {
+            // Extract $search (required)
+            let search = match text_doc.get("$search").and_then(|s| s.as_str()) {
+                Some(s) => s.to_string(),
+                None => return Err(error_doc(9, "$text requires $search")),
+            };
+
+            // Extract optional parameters
+            let language = text_doc
+                .get("$language")
+                .and_then(|l| l.as_str())
+                .unwrap_or("english")
+                .to_string();
+            let case_sensitive = text_doc
+                .get("$caseSensitive")
+                .and_then(|c| c.as_bool())
+                .unwrap_or(false);
+            let diacritic_sensitive = text_doc
+                .get("$diacriticSensitive")
+                .and_then(|d| d.as_bool())
+                .unwrap_or(false);
+
+            // Check for disallowed combinations
+            // $text cannot be combined with $near or $nearSphere
+            if filter.contains_key("$near") || filter.contains_key("$nearSphere") {
+                return Err(error_doc(2, "text query cannot be combined with $near"));
+            }
+
+            return Ok(Some((
+                search,
+                language,
+                case_sensitive,
+                diacritic_sensitive,
+            )));
+        } else {
+            return Err(error_doc(9, "$text must be a document"));
+        }
+    }
+    Ok(None)
+}
+
 fn build_info_reply() -> Document {
     doc! {
         "version": env!("CARGO_PKG_VERSION"),
@@ -4493,6 +4542,101 @@ async fn find_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Docum
     let projection = cmd.get_document("projection").ok();
 
     if let Some(ref pg) = state.store {
+        // Check for $text query and handle it specially
+        let text_query_result = if let Some(ref f) = filter {
+            match extract_text_search_params(f) {
+                Ok(Some((search, language, case_sensitive, diacritic_sensitive))) => {
+                    // Get text index fields
+                    match pg.get_text_index_fields(dbname, coll).await {
+                        Ok(fields) if !fields.is_empty() => {
+                            // Route to find_with_text_search
+                            let limit_val = if limit > 0 {
+                                limit
+                            } else if batch_size > 0 {
+                                batch_size
+                            } else {
+                                101
+                            };
+                            match pg
+                                .find_with_text_search(
+                                    dbname,
+                                    coll,
+                                    &search,
+                                    &language,
+                                    case_sensitive,
+                                    diacritic_sensitive,
+                                    limit_val * 10,
+                                    &fields,
+                                )
+                                .await
+                            {
+                                Ok(docs) => {
+                                    // Apply remaining filters (non-$text) if any
+                                    let mut remaining_doc = (*f).clone();
+                                    remaining_doc.remove("$text");
+                                    let remaining_filter = if remaining_doc.is_empty() {
+                                        None
+                                    } else {
+                                        Some(remaining_doc)
+                                    };
+                                    let filtered_docs = if let Some(ref rf) = remaining_filter {
+                                        docs.into_iter()
+                                            .filter(|d| document_matches_filter(d, rf))
+                                            .collect()
+                                    } else {
+                                        docs
+                                    };
+                                    Some(filtered_docs)
+                                }
+                                Err(e) => {
+                                    tracing::warn!("find_with_text_search failed: {}", e);
+                                    return error_doc(2, format!("text search failed: {}", e));
+                                }
+                            }
+                        }
+                        Ok(_) => {
+                            return error_doc(2, "text index required for $text query");
+                        }
+                        Err(e) => {
+                            return error_doc(2, format!("failed to get text index: {}", e));
+                        }
+                    }
+                }
+                Ok(None) => None,
+                Err(err_doc) => return err_doc,
+            }
+        } else {
+            None
+        };
+
+        if let Some(docs) = text_query_result {
+            // Process results for $text query (same as normal path)
+            let mut first_batch: Vec<Document> = Vec::new();
+            let mut remainder: Vec<Document> = Vec::new();
+            for (idx, mut d) in docs.into_iter().enumerate() {
+                // Apply projection if specified
+                if let Some(ref proj) = projection {
+                    d = apply_project_with_expr(&d, proj);
+                }
+                if (idx as i64) < first_batch_limit {
+                    first_batch.push(d);
+                } else {
+                    remainder.push(d);
+                }
+            }
+            let ns = format!("{}.{}", dbname, coll);
+            let mut cursor_doc = doc! { "ns": ns.clone(), "firstBatch": first_batch };
+            let cursor_id = if !remainder.is_empty() {
+                new_cursor(state, ns, remainder).await
+            } else {
+                0i64
+            };
+            if cursor_id != 0 {
+                cursor_doc.insert("id", cursor_id);
+            }
+            return doc! { "ok": 1.0, "cursor": cursor_doc };
+        }
+
         // Check if we're in a transaction
         let in_transaction = if let Some(lsid) = extract_lsid(cmd) {
             if let Some(autocommit) = extract_autocommit(cmd) {

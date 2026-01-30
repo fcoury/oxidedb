@@ -91,59 +91,8 @@ pub fn build_where_from_filter_internal(filter: &bson::Document, is_nested: bool
         }
     }
 
-    // Handle $text operator for full-text search
-    if let Some(text_val) = filter.get("$text") {
-        if let bson::Bson::Document(text_doc) = text_val {
-            if let Some(bson::Bson::String(query)) = text_doc.get("$search") {
-                let language = text_doc
-                    .get("$language")
-                    .and_then(|l| l.as_str())
-                    .unwrap_or("english");
-                let _case_sensitive = text_doc
-                    .get("$caseSensitive")
-                    .and_then(|c| c.as_bool())
-                    .unwrap_or(false);
-                let _diacritic_sensitive = text_doc
-                    .get("$diacriticSensitive")
-                    .and_then(|d| d.as_bool())
-                    .unwrap_or(false);
-
-                // Build text search clause using to_tsvector and plainto_tsquery
-                // Search across the entire document text
-                // Escape single quotes to prevent SQL injection
-                let escaped_query = query.replace('"', "\"\"").replace('\'', "''");
-                // Validate language against known PostgreSQL text search configurations
-                let valid_languages = [
-                    "danish",
-                    "dutch",
-                    "english",
-                    "finnish",
-                    "french",
-                    "german",
-                    "hungarian",
-                    "italian",
-                    "norwegian",
-                    "portuguese",
-                    "romanian",
-                    "russian",
-                    "simple",
-                    "spanish",
-                    "swedish",
-                    "turkish",
-                ];
-                let safe_language = if valid_languages.contains(&language) {
-                    language
-                } else {
-                    "english"
-                };
-                let text_clause = format!(
-                    "to_tsvector('{}', doc::text) @@ plainto_tsquery('{}', '{}')",
-                    safe_language, safe_language, escaped_query
-                );
-                where_clauses.push(text_clause);
-            }
-        }
-    }
+    // Note: $text operator is handled at the server layer (server.rs) to ensure
+    // it uses the correct text index fields. Do not handle $text here.
 
     // Process field-level operators (skip keys starting with $)
     for (k, v) in filter.iter() {

@@ -840,6 +840,50 @@ impl PgStore {
         Ok(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
+    /// Get the fields from the text index for a collection.
+    /// Returns empty Vec if no text index exists.
+    /// Returns error if multiple text indexes exist (shouldn't happen with uniqueness enforcement).
+    pub async fn get_text_index_fields(&self, db: &str, coll: &str) -> Result<Vec<String>> {
+        let client = self.pool.get().await.map_err(err_msg)?;
+        let rows = client
+            .query(
+                "SELECT spec FROM mdb_meta.indexes WHERE db=$1 AND coll=$2",
+                &[&db, &coll],
+            )
+            .await
+            .map_err(err_msg)?;
+
+        let mut text_indexes_found = 0;
+        let mut text_fields = Vec::new();
+
+        for row in rows {
+            let spec_json: serde_json::Value = row.get(0);
+            if let Some(key) = spec_json.get("key").and_then(|k| k.as_object()) {
+                // Check if this is a text index
+                let has_text_field = key
+                    .values()
+                    .any(|v| v.as_str().map(|s| s == "text").unwrap_or(false));
+
+                if has_text_field {
+                    text_indexes_found += 1;
+                    if text_indexes_found > 1 {
+                        return Err(Error::Msg(
+                            "too many text indexes for collection".to_string(),
+                        ));
+                    }
+                    // Extract field names with "text" value
+                    for (field_name, field_type) in key.iter() {
+                        if field_type.as_str().map(|s| s == "text").unwrap_or(false) {
+                            text_fields.push(field_name.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(text_fields)
+    }
+
     pub async fn create_index_compound(
         &self,
         db: &str,
@@ -944,6 +988,15 @@ impl PgStore {
     ) -> Result<()> {
         // Ensure collection (schema/table) exists
         self.ensure_collection(db, coll).await?;
+
+        // Check for existing text index - MongoDB allows only one text index per collection
+        let existing_text_indexes = self.get_text_index_fields(db, coll).await?;
+        if !existing_text_indexes.is_empty() {
+            return Err(Error::Msg(
+                "cannot have more than one text index per collection".to_string(),
+            ));
+        }
+
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
