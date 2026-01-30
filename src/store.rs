@@ -527,6 +527,15 @@ impl PgStore {
         projection: Option<&bson::Document>,
         limit: i64,
     ) -> Result<Vec<bson::Document>> {
+        // Check for $text operator - should be handled by server layer
+        if let Some(f) = filter {
+            if f.contains_key("$text") {
+                return Err(Error::Msg(
+                    "$text must be handled by the server layer, not find_docs".into(),
+                ));
+            }
+        }
+
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
@@ -1160,6 +1169,15 @@ impl PgStore {
         coll: &str,
         filter: Option<&bson::Document>,
     ) -> Result<i64> {
+        // Check for $text operator - not supported in count operations
+        if let Some(f) = filter {
+            if f.contains_key("$text") {
+                return Err(Error::Msg(
+                    "$text is not supported in count operations".into(),
+                ));
+            }
+        }
+
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
@@ -1199,6 +1217,13 @@ impl PgStore {
         coll: &str,
         filter: &bson::Document,
     ) -> Result<Option<(Vec<u8>, bson::Document)>> {
+        // Check for $text operator - not supported in update operations
+        if filter.contains_key("$text") {
+            return Err(Error::Msg(
+                "$text is not supported in update operations".into(),
+            ));
+        }
+
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
@@ -1291,6 +1316,13 @@ impl PgStore {
         coll: &str,
         filter: &bson::Document,
     ) -> Result<u64> {
+        // Check for $text operator - not supported in delete operations
+        if filter.contains_key("$text") {
+            return Err(Error::Msg(
+                "$text is not supported in delete operations".into(),
+            ));
+        }
+
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
@@ -1326,6 +1358,13 @@ impl PgStore {
         coll: &str,
         filter: &bson::Document,
     ) -> Result<u64> {
+        // Check for $text operator - not supported in delete operations
+        if filter.contains_key("$text") {
+            return Err(Error::Msg(
+                "$text is not supported in delete operations".into(),
+            ));
+        }
+
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
@@ -2176,6 +2215,13 @@ impl PgStore {
         filter: &bson::Document,
         sort: Option<&bson::Document>,
     ) -> Result<Option<(Vec<u8>, bson::Document)>> {
+        // Check for $text operator - not supported in update operations
+        if filter.contains_key("$text") {
+            return Err(Error::Msg(
+                "$text is not supported in update operations".into(),
+            ));
+        }
+
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);

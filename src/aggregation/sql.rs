@@ -105,6 +105,12 @@ impl SqlBuilder {
         for stage in stages {
             match stage {
                 AggregateStage::Match(doc) => {
+                    // Check for $text operator - not supported in aggregation $match via SQL translation
+                    if doc.contains_key("$text") {
+                        return Err(Error::Msg(
+                            "$text is not supported in aggregation $match stages".into(),
+                        ));
+                    }
                     // If we have grouping/limit/offset/project, we must flush first
                     if self.state.group_by.is_some()
                         || self.state.limit.is_some()
