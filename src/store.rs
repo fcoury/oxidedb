@@ -977,9 +977,13 @@ impl PgStore {
         };
 
         // Build the to_tsvector expression for multiple fields
+        // Escape both single and double quotes in field names to prevent SQL injection
         let tsvector_parts: Vec<String> = fields
             .iter()
-            .map(|f| format!("COALESCE(doc->>'{}', '')", f.replace('"', "\"\"")))
+            .map(|f| {
+                let escaped = f.replace('"', "\"\"").replace('\'', "''");
+                format!("COALESCE(doc->>'{}', '')", escaped)
+            })
             .collect();
         let tsvector_expr = tsvector_parts.join(" || ' ' || ");
 
@@ -1052,13 +1056,17 @@ impl PgStore {
         };
 
         // Build the tsvector expression from the provided fields (must match index definition)
+        // Escape both single and double quotes in field names to prevent SQL injection
         let tsvector_parts: Vec<String> = if fields.is_empty() {
             // Default to searching all text fields if no fields specified
             vec!["doc::text".to_string()]
         } else {
             fields
                 .iter()
-                .map(|f| format!("COALESCE(doc->>'{}', '')", f.replace('"', "\"\"")))
+                .map(|f| {
+                    let escaped = f.replace('"', "\"\"").replace('\'', "''");
+                    format!("COALESCE(doc->>'{}', '')", escaped)
+                })
                 .collect()
         };
         let tsvector_expr = tsvector_parts.join(" || ' ' || ");
