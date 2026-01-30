@@ -758,55 +758,145 @@ async fn insert_reply(state: &AppState, db: Option<&str>, cmd: &mut Document) ->
         }
     };
     if let Some(ref pg) = state.store {
-        let mut inserted = 0u32;
-        let mut write_errors: Vec<Document> = Vec::new();
-        for (i, b) in docs_bson.iter().enumerate() {
-            if let bson::Bson::Document(d0) = b {
-                let mut d = d0.clone();
-                ensure_id(&mut d);
-                match id_bytes(d.get("_id")) {
-                    Some(idb) => {
-                        let json = match serde_json::to_value(&d) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                write_errors.push(
-                                    doc! {"index": i as i32, "code": 2, "errmsg": e.to_string()},
-                                );
-                                continue;
-                            }
-                        };
-                        let bson_bytes = match bson::to_vec(&d) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                write_errors.push(
-                                    doc! {"index": i as i32, "code": 2, "errmsg": e.to_string()},
-                                );
-                                continue;
-                            }
-                        };
-                        match pg.insert_one(dbname, &coll, &idb, &bson_bytes, &json).await {
-                            Ok(n) => {
-                                if n == 1 {
-                                    inserted += 1;
-                                } else {
-                                    write_errors.push(doc!{"index": i as i32, "code": 11000i32, "errmsg": "duplicate key"});
-                                }
-                            }
-                            Err(e) => write_errors.push(
-                                doc! {"index": i as i32, "code": 59i32, "errmsg": e.to_string()},
-                            ),
-                        }
+        // Check if we're in a transaction
+        let in_transaction = if let Some(lsid) = extract_lsid(cmd) {
+            if let Some(autocommit) = extract_autocommit(cmd) {
+                if !autocommit {
+                    if let Some(session_arc) = state.session_manager.get_session(lsid).await {
+                        let session = session_arc.lock().await;
+                        session.in_transaction
+                    } else {
+                        false
                     }
-                    None => write_errors.push(
-                        doc! {"index": i as i32, "code": 2i32, "errmsg": "unsupported _id type"},
-                    ),
+                } else {
+                    false
                 }
             } else {
-                write_errors.push(
-                    doc! {"index": i as i32, "code": 2i32, "errmsg": "document must be object"},
-                );
+                false
+            }
+        } else {
+            false
+        };
+
+        let mut inserted = 0u32;
+        let mut write_errors: Vec<Document> = Vec::new();
+
+        if in_transaction {
+            // In transaction - get session and perform all inserts with transaction client
+            if let Some(lsid) = extract_lsid(cmd) {
+                if let Some(session_arc) = state.session_manager.get_session(lsid).await {
+                    let session = session_arc.lock().await;
+                    if let Some(ref client) = session.postgres_client {
+                        for (i, b) in docs_bson.iter().enumerate() {
+                            if let bson::Bson::Document(d0) = b {
+                                let mut d = d0.clone();
+                                ensure_id(&mut d);
+                                match id_bytes(d.get("_id")) {
+                                    Some(idb) => {
+                                        let json = match serde_json::to_value(&d) {
+                                            Ok(v) => v,
+                                            Err(e) => {
+                                                write_errors.push(
+                                                    doc! {"index": i as i32, "code": 2, "errmsg": e.to_string()},
+                                                );
+                                                continue;
+                                            }
+                                        };
+                                        let bson_bytes = match bson::to_vec(&d) {
+                                            Ok(v) => v,
+                                            Err(e) => {
+                                                write_errors.push(
+                                                    doc! {"index": i as i32, "code": 2, "errmsg": e.to_string()},
+                                                );
+                                                continue;
+                                            }
+                                        };
+
+                                        match pg.insert_one_with_client(
+                                            client,
+                                            dbname,
+                                            &coll,
+                                            &idb,
+                                            &bson_bytes,
+                                            &json,
+                                        ).await {
+                                            Ok(n) => {
+                                                if n == 1 {
+                                                    inserted += 1;
+                                                } else {
+                                                    write_errors.push(doc!{"index": i as i32, "code": 11000i32, "errmsg": "duplicate key"});
+                                                }
+                                            }
+                                            Err(e) => write_errors.push(
+                                                doc! {"index": i as i32, "code": 59i32, "errmsg": e.to_string()},
+                                            ),
+                                        }
+                                    }
+                                    None => write_errors.push(
+                                        doc! {"index": i as i32, "code": 2i32, "errmsg": "unsupported _id type"},
+                                    ),
+                                }
+                            } else {
+                                write_errors.push(
+                                    doc! {"index": i as i32, "code": 2i32, "errmsg": "document must be object"},
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // Not in transaction - use pool
+            for (i, b) in docs_bson.iter().enumerate() {
+                if let bson::Bson::Document(d0) = b {
+                    let mut d = d0.clone();
+                    ensure_id(&mut d);
+                    match id_bytes(d.get("_id")) {
+                        Some(idb) => {
+                            let json = match serde_json::to_value(&d) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    write_errors.push(
+                                        doc! {"index": i as i32, "code": 2, "errmsg": e.to_string()},
+                                    );
+                                    continue;
+                                }
+                            };
+                            let bson_bytes = match bson::to_vec(&d) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    write_errors.push(
+                                        doc! {"index": i as i32, "code": 2, "errmsg": e.to_string()},
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            match pg.insert_one(dbname, &coll, &idb, &bson_bytes, &json).await {
+                                Ok(n) => {
+                                    if n == 1 {
+                                        inserted += 1;
+                                    } else {
+                                        write_errors.push(doc!{"index": i as i32, "code": 11000i32, "errmsg": "duplicate key"});
+                                    }
+                                }
+                                Err(e) => write_errors.push(
+                                    doc! {"index": i as i32, "code": 59i32, "errmsg": e.to_string()},
+                                ),
+                            }
+                        }
+                        None => write_errors.push(
+                            doc! {"index": i as i32, "code": 2i32, "errmsg": "unsupported _id type"},
+                        ),
+                    }
+                } else {
+                    write_errors.push(
+                        doc! {"index": i as i32, "code": 2i32, "errmsg": "document must be object"},
+                    );
+                }
             }
         }
+
         let mut reply = doc! { "n": inserted as i32, "ok": 1.0 };
         if !write_errors.is_empty() {
             reply.insert("writeErrors", write_errors);
@@ -4128,21 +4218,156 @@ async fn find_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Docum
         .get_document("filter")
         .ok()
         .or(cmd.get_document("query").ok());
+    let sort = cmd.get_document("sort").ok();
+    let projection = cmd.get_document("projection").ok();
 
     if let Some(ref pg) = state.store {
-        let sort = cmd.get_document("sort").ok();
-        let projection = cmd.get_document("projection").ok();
-        let docs: Vec<Document> = if let Some(f) = filter {
-            if let Some(idv) = f.get("_id") {
-                if let Some(idb) = id_bytes_bson(idv) {
-                    match pg
-                        .find_by_id_docs(dbname, coll, &idb, first_batch_limit * 10)
-                        .await
-                    {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::warn!("find_by_id failed: {}", e);
-                            Vec::new()
+        // Check if we're in a transaction
+        let in_transaction = if let Some(lsid) = extract_lsid(cmd) {
+            if let Some(autocommit) = extract_autocommit(cmd) {
+                if !autocommit {
+                    if let Some(session_arc) = state.session_manager.get_session(lsid).await {
+                        let session = session_arc.lock().await;
+                        session.in_transaction
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let docs: Vec<Document> = if in_transaction {
+            // In transaction - get session and perform find with transaction client
+            if let Some(lsid) = extract_lsid(cmd) {
+                if let Some(session_arc) = state.session_manager.get_session(lsid).await {
+                    let session = session_arc.lock().await;
+                    if let Some(ref client) = session.postgres_client {
+                        if let Some(f) = filter {
+                            if let Some(idv) = f.get("_id") {
+                                if let Some(idb) = id_bytes_bson(idv) {
+                                    match pg
+                                        .find_by_id_docs_with_client(
+                                            client,
+                                            dbname,
+                                            coll,
+                                            &idb,
+                                            first_batch_limit * 10,
+                                        )
+                                        .await
+                                    {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            tracing::warn!("find_by_id_with_client failed: {}", e);
+                                            Vec::new()
+                                        }
+                                    }
+                                } else {
+                                    match pg
+                                        .find_docs_with_client(
+                                            client,
+                                            dbname,
+                                            coll,
+                                            Some(f),
+                                            sort,
+                                            projection,
+                                            first_batch_limit * 10,
+                                        )
+                                        .await
+                                    {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            tracing::warn!("find_docs_with_client failed: {}", e);
+                                            Vec::new()
+                                        }
+                                    }
+                                }
+                            } else {
+                                match pg
+                                    .find_docs_with_client(
+                                        client,
+                                        dbname,
+                                        coll,
+                                        Some(f),
+                                        sort,
+                                        projection,
+                                        first_batch_limit * 10,
+                                    )
+                                    .await
+                                {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        tracing::warn!("find_docs_with_client failed: {}", e);
+                                        Vec::new()
+                                    }
+                                }
+                            }
+                        } else {
+                            match pg
+                                .find_docs_with_client(
+                                    client,
+                                    dbname,
+                                    coll,
+                                    None,
+                                    sort,
+                                    projection,
+                                    first_batch_limit * 10,
+                                )
+                                .await
+                            {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    tracing::warn!("find_docs_with_client failed: {}", e);
+                                    Vec::new()
+                                }
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        } else {
+            // Not in transaction - use pool
+            if let Some(f) = filter {
+                if let Some(idv) = f.get("_id") {
+                    if let Some(idb) = id_bytes_bson(idv) {
+                        match pg
+                            .find_by_id_docs(dbname, coll, &idb, first_batch_limit * 10)
+                            .await
+                        {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!("find_by_id failed: {}", e);
+                                Vec::new()
+                            }
+                        }
+                    } else {
+                        match pg
+                            .find_docs(
+                                dbname,
+                                coll,
+                                Some(f),
+                                sort,
+                                projection,
+                                first_batch_limit * 10,
+                            )
+                            .await
+                        {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!("find_docs failed: {}", e);
+                                Vec::new()
+                            }
                         }
                     }
                 } else {
@@ -4166,14 +4391,7 @@ async fn find_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Docum
                 }
             } else {
                 match pg
-                    .find_docs(
-                        dbname,
-                        coll,
-                        Some(f),
-                        sort,
-                        projection,
-                        first_batch_limit * 10,
-                    )
+                    .find_docs(dbname, coll, None, sort, projection, first_batch_limit * 10)
                     .await
                 {
                     Ok(v) => v,
@@ -4181,17 +4399,6 @@ async fn find_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Docum
                         tracing::warn!("find_docs failed: {}", e);
                         Vec::new()
                     }
-                }
-            }
-        } else {
-            match pg
-                .find_docs(dbname, coll, None, sort, projection, first_batch_limit * 10)
-                .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!("find_docs failed: {}", e);
-                    Vec::new()
                 }
             }
         };
@@ -4375,7 +4582,6 @@ async fn start_transaction_reply(state: &AppState, _db: Option<&str>, cmd: &Docu
     }
 
     // Update session state
-    session.txn_number = txn_number;
     session.autocommit = extract_autocommit(cmd).unwrap_or(true);
 
     doc! { "ok": 1.0 }
@@ -4422,9 +4628,6 @@ async fn commit_transaction_reply(state: &AppState, _db: Option<&str>, cmd: &Doc
     if let Err(e) = session.commit_transaction().await {
         return error_doc(ERROR_NO_SUCH_TRANSACTION, e);
     }
-
-    // Update session state
-    session.txn_number = txn_number;
 
     doc! { "ok": 1.0 }
 }

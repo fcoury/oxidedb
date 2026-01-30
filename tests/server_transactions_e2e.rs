@@ -512,10 +512,12 @@ async fn e2e_transaction_end_sessions() {
     assert_eq!(doc.get_f64("ok").unwrap_or(0.0), 1.0);
 
     // Verify session was removed
-    let has_session = state
-        .session_manager
-        .has_session(Uuid::from_slice(&lsid.get_binary_generic("id").unwrap()).unwrap())
-        .await;
+    let uuid = if let Some(bson::Bson::Binary(binary)) = lsid.get("id") {
+        Uuid::from_slice(&binary.bytes).unwrap()
+    } else {
+        panic!("lsid.id is not a Binary");
+    };
+    let has_session = state.session_manager.has_session(uuid).await;
     assert!(!has_session, "Session should be removed after endSessions");
 
     let _ = shutdown.send(true);

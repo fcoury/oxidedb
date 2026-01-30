@@ -96,19 +96,21 @@ impl Session {
     }
 
     /// Validate that txn_number is monotonically increasing
-    pub fn validate_txn_number(&self, txn_number: i64) -> Result<(), i32> {
+    pub fn validate_txn_number(&mut self, txn_number: i64) -> Result<(), i32> {
         if txn_number < self.txn_number {
-            // Duplicate txnNumber - this is a retry
-            return Ok(());
-        }
-        if txn_number == self.txn_number && !self.retryable_writes.contains_key(&txn_number) {
-            // Same txnNumber but no cached result - error
+            // Went backwards - this is an error
             return Err(ERROR_ILLEGAL_OPERATION);
+        }
+        if txn_number == self.txn_number {
+            // Same txnNumber - this is a retry, ok if we have a cached result
+            return Ok(());
         }
         if txn_number > self.txn_number + 1 {
             // Gap in txnNumber sequence - error
             return Err(ERROR_ILLEGAL_OPERATION);
         }
+        // txn_number == self.txn_number + 1, advance the txn_number
+        self.txn_number = txn_number;
         Ok(())
     }
 
@@ -123,6 +125,13 @@ impl Session {
 
         // Get a client from the pool for this transaction
         let client = pool.get().await.map_err(|e| e.to_string())?;
+
+        // Begin a PostgreSQL transaction on this client
+        client
+            .batch_execute("BEGIN")
+            .await
+            .map_err(|e| e.to_string())?;
+
         self.postgres_client = Some(client);
         self.in_transaction = true;
         self.transaction_start_time = Some(Instant::now());
@@ -136,10 +145,12 @@ impl Session {
             return Err("No transaction in progress".to_string());
         }
 
+        // Commit the PostgreSQL transaction
         if let Some(ref mut client) = self.postgres_client {
-            // Build a transaction and commit it
-            let tx = client.transaction().await.map_err(|e| e.to_string())?;
-            tx.commit().await.map_err(|e| e.to_string())?;
+            client
+                .batch_execute("COMMIT")
+                .await
+                .map_err(|e| e.to_string())?;
         }
 
         self.in_transaction = false;
@@ -155,7 +166,17 @@ impl Session {
             return Err("No transaction in progress".to_string());
         }
 
-        // Just drop the client - PostgreSQL will rollback on disconnect
+        // Explicitly rollback the transaction before dropping the client
+        // This is necessary because the client is from a connection pool,
+        // and simply dropping it would return the connection to the pool
+        // with the transaction still open
+        if let Some(ref mut client) = self.postgres_client {
+            client
+                .batch_execute("ROLLBACK")
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+
         self.in_transaction = false;
         self.postgres_client = None;
         self.transaction_start_time = None;
@@ -333,12 +354,19 @@ mod tests {
     #[test]
     fn test_validate_txn_number() {
         let lsid = Uuid::new_v4();
-        let session = Session::new(lsid);
+        let mut session = Session::new(lsid);
 
         // First operation should be txn_number 1
         assert!(session.validate_txn_number(1).is_ok());
         // Same txn_number is ok (retry)
-        assert!(session.validate_txn_number(0).is_ok());
+        assert!(session.validate_txn_number(1).is_ok());
+        // Increment is ok
+        assert!(session.validate_txn_number(2).is_ok());
+        // Previous txn_number is not ok (must be monotonic)
+        assert_eq!(
+            session.validate_txn_number(1).unwrap_err(),
+            ERROR_ILLEGAL_OPERATION
+        );
         // Gap is not ok
         assert_eq!(
             session.validate_txn_number(5).unwrap_err(),
