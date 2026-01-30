@@ -6,11 +6,20 @@ use crate::protocol::{
 use crate::shadow::{ShadowSession, compare_docs};
 use crate::store::PgStore;
 use bson::{Document, doc};
+use rand::seq::SliceRandom;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-// use rand::Rng; // not used directly
+
+/// Specification for $bucket aggregation stage
+#[derive(Clone, Debug)]
+struct BucketSpec {
+    group_by: String,
+    boundaries: Vec<bson::Bson>,
+    default: Option<bson::Bson>,
+    output: Option<Document>,
+}
 
 static REQ_ID: AtomicI32 = AtomicI32::new(1);
 
@@ -2136,6 +2145,313 @@ fn apply_group(docs: &Vec<Document>, spec: &Document) -> Vec<Document> {
     out
 }
 
+/// Apply $bucket aggregation stage
+fn apply_bucket(docs: &Vec<Document>, spec: &BucketSpec) -> Vec<Document> {
+    use std::collections::HashMap;
+
+    // Validate boundaries are sorted and same type
+    if spec.boundaries.len() < 2 {
+        return Vec::new();
+    }
+
+    // Check boundaries are sorted
+    for i in 1..spec.boundaries.len() {
+        if cmp_bson(&spec.boundaries[i], &spec.boundaries[i - 1]) != std::cmp::Ordering::Greater {
+            return Vec::new();
+        }
+    }
+
+    // Parse output accumulators
+    #[derive(Clone)]
+    enum Acc {
+        SumF64(f64),
+        SumI64(i64),
+        Avg(f64, i64),
+        Min(Option<bson::Bson>),
+        Max(Option<bson::Bson>),
+        Count(i64),
+    }
+
+    #[derive(Clone)]
+    enum AccSpec {
+        Sum(bson::Bson),
+        Avg(bson::Bson),
+        Min(bson::Bson),
+        Max(bson::Bson),
+        Count,
+    }
+
+    let mut acc_specs: Vec<(String, AccSpec)> = Vec::new();
+    if let Some(output) = &spec.output {
+        for (k, v) in output.iter() {
+            if let bson::Bson::Document(d) = v {
+                if let Some(x) = d.get("$sum") {
+                    acc_specs.push((k.clone(), AccSpec::Sum(x.clone())));
+                    continue;
+                }
+                if let Some(x) = d.get("$avg") {
+                    acc_specs.push((k.clone(), AccSpec::Avg(x.clone())));
+                    continue;
+                }
+                if let Some(x) = d.get("$min") {
+                    acc_specs.push((k.clone(), AccSpec::Min(x.clone())));
+                    continue;
+                }
+                if let Some(x) = d.get("$max") {
+                    acc_specs.push((k.clone(), AccSpec::Max(x.clone())));
+                    continue;
+                }
+                if d.contains_key("$count") {
+                    acc_specs.push((k.clone(), AccSpec::Count));
+                    continue;
+                }
+            }
+        }
+    }
+
+    // Group documents into buckets
+    let mut buckets: HashMap<usize, (Option<bson::Bson>, HashMap<String, Acc>, i64)> =
+        HashMap::new();
+    let mut default_bucket: Option<(Option<bson::Bson>, HashMap<String, Acc>, i64)> = None;
+
+    for d in docs.iter() {
+        let value = eval_expr(d, &bson::Bson::String(spec.group_by.clone()));
+
+        // Find which bucket this document belongs to
+        let mut bucket_idx: Option<usize> = None;
+        if let Some(ref val) = value {
+            for i in 0..spec.boundaries.len() - 1 {
+                let lower = &spec.boundaries[i];
+                let upper = &spec.boundaries[i + 1];
+                // Check if value >= lower and value < upper
+                if cmp_bson(val, lower) != std::cmp::Ordering::Less
+                    && cmp_bson(val, upper) == std::cmp::Ordering::Less
+                {
+                    bucket_idx = Some(i);
+                    break;
+                }
+            }
+        }
+
+        // Initialize accumulator state if needed
+        let init_acc = || {
+            let mut hm = HashMap::new();
+            for (name, acc_spec) in acc_specs.iter() {
+                let st = match acc_spec {
+                    AccSpec::Sum(expr) => match expr {
+                        bson::Bson::Int32(_) | bson::Bson::Int64(_) => Acc::SumI64(0),
+                        _ => Acc::SumF64(0.0),
+                    },
+                    AccSpec::Avg(_) => Acc::Avg(0.0, 0),
+                    AccSpec::Min(_) => Acc::Min(None),
+                    AccSpec::Max(_) => Acc::Max(None),
+                    AccSpec::Count => Acc::Count(0),
+                };
+                hm.insert(name.clone(), st);
+            }
+            hm
+        };
+
+        // Get or create bucket entry
+        let (accs, doc_count) = if let Some(idx) = bucket_idx {
+            let entry = buckets.entry(idx).or_insert_with(|| {
+                let lower_boundary = spec.boundaries[idx].clone();
+                (Some(lower_boundary), init_acc(), 0i64)
+            });
+            (&mut entry.1, &mut entry.2)
+        } else if let Some(ref default_val) = spec.default {
+            if default_bucket.is_none() {
+                default_bucket = Some((Some(default_val.clone()), init_acc(), 0i64));
+            }
+            let bucket = default_bucket.as_mut().unwrap();
+            (&mut bucket.1, &mut bucket.2)
+        } else {
+            // No default bucket and value outside boundaries - skip document
+            continue;
+        };
+
+        // Increment document count for this bucket
+        *doc_count += 1;
+
+        // Accumulate values
+        for (name, acc_spec) in acc_specs.iter() {
+            let st = accs.get_mut(name).unwrap();
+            match (st, acc_spec) {
+                (Acc::SumF64(s), AccSpec::Sum(expr)) => {
+                    let v = eval_expr(d, expr).unwrap_or(bson::Bson::Null);
+                    let n = number_as_f64(&v).unwrap_or(0.0);
+                    *s += n;
+                }
+                (Acc::SumI64(total), AccSpec::Sum(expr)) => {
+                    let v = eval_expr(d, expr).unwrap_or(bson::Bson::Null);
+                    match v {
+                        bson::Bson::Int32(n) => {
+                            *total += n as i64;
+                        }
+                        bson::Bson::Int64(n) => {
+                            *total += n;
+                        }
+                        bson::Bson::Double(f) => {
+                            *total += f.trunc() as i64;
+                        }
+                        _ => {}
+                    }
+                }
+                (Acc::Avg(s, c), AccSpec::Avg(expr)) => {
+                    let v = eval_expr(d, expr).unwrap_or(bson::Bson::Null);
+                    if let Some(n) = number_as_f64(&v) {
+                        *s += n;
+                        *c += 1;
+                    }
+                }
+                (Acc::Min(cur), AccSpec::Min(expr)) => {
+                    let v = eval_expr(d, expr).unwrap_or(bson::Bson::Null);
+                    *cur = match cur.take() {
+                        None => Some(v),
+                        Some(old) => Some(if cmp_bson(&v, &old) == std::cmp::Ordering::Less {
+                            v
+                        } else {
+                            old
+                        }),
+                    };
+                }
+                (Acc::Max(cur), AccSpec::Max(expr)) => {
+                    let v = eval_expr(d, expr).unwrap_or(bson::Bson::Null);
+                    *cur = match cur.take() {
+                        None => Some(v),
+                        Some(old) => Some(if cmp_bson(&v, &old) == std::cmp::Ordering::Greater {
+                            v
+                        } else {
+                            old
+                        }),
+                    };
+                }
+                (Acc::Count(c), AccSpec::Count) => {
+                    *c += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Build result documents
+    let mut out: Vec<Document> = Vec::new();
+
+    // Add regular buckets
+    for i in 0..spec.boundaries.len() - 1 {
+        if let Some((id_val, accs, doc_count)) = buckets.remove(&i) {
+            let mut doc = Document::new();
+            doc.insert("_id", id_val.unwrap_or(bson::Bson::Null));
+
+            // Process accumulators
+            for (name, st) in accs.iter() {
+                match st {
+                    Acc::SumF64(s) => {
+                        // If the sum is a whole number and fits in i32, return as Int32
+                        let epsilon = 1e-10;
+                        if (*s - s.round()).abs() < epsilon
+                            && *s <= i32::MAX as f64
+                            && *s >= i32::MIN as f64
+                        {
+                            doc.insert(name.clone(), bson::Bson::Int32(*s as i32));
+                        } else {
+                            doc.insert(name.clone(), bson::Bson::Double(*s));
+                        }
+                    }
+                    Acc::SumI64(n) => {
+                        if *n <= i32::MAX as i64 && *n >= i32::MIN as i64 {
+                            doc.insert(name.clone(), bson::Bson::Int32(*n as i32));
+                        } else {
+                            doc.insert(name.clone(), bson::Bson::Int64(*n));
+                        }
+                    }
+                    Acc::Avg(s, c) => {
+                        let v = if *c > 0 { *s / (*c as f64) } else { 0.0 };
+                        doc.insert(name.clone(), bson::Bson::Double(v));
+                    }
+                    Acc::Min(v) => {
+                        doc.insert(name.clone(), v.clone().unwrap_or(bson::Bson::Null));
+                    }
+                    Acc::Max(v) => {
+                        doc.insert(name.clone(), v.clone().unwrap_or(bson::Bson::Null));
+                    }
+                    Acc::Count(c) => {
+                        doc.insert(name.clone(), bson::Bson::Int64(*c));
+                    }
+                    _ => {}
+                }
+            }
+
+            // Always add count field (use actual document count)
+            if !doc.contains_key("count") {
+                if doc_count <= i32::MAX as i64 && doc_count >= i32::MIN as i64 {
+                    doc.insert("count", bson::Bson::Int32(doc_count as i32));
+                } else {
+                    doc.insert("count", bson::Bson::Int64(doc_count));
+                }
+            }
+
+            out.push(doc);
+        }
+    }
+
+    // Add default bucket if present
+    if let Some((id_val, accs, doc_count)) = default_bucket {
+        let mut doc = Document::new();
+        doc.insert("_id", id_val.unwrap_or(bson::Bson::Null));
+
+        for (name, st) in accs.iter() {
+            match st {
+                Acc::SumF64(s) => {
+                    // If the sum is a whole number and fits in i32, return as Int32
+                    let epsilon = 1e-10;
+                    if (*s - s.round()).abs() < epsilon
+                        && *s <= i32::MAX as f64
+                        && *s >= i32::MIN as f64
+                    {
+                        doc.insert(name.clone(), bson::Bson::Int32(*s as i32));
+                    } else {
+                        doc.insert(name.clone(), bson::Bson::Double(*s));
+                    }
+                }
+                Acc::SumI64(n) => {
+                    if *n <= i32::MAX as i64 && *n >= i32::MIN as i64 {
+                        doc.insert(name.clone(), bson::Bson::Int32(*n as i32));
+                    } else {
+                        doc.insert(name.clone(), bson::Bson::Int64(*n));
+                    }
+                }
+                Acc::Avg(s, c) => {
+                    let v = if *c > 0 { *s / (*c as f64) } else { 0.0 };
+                    doc.insert(name.clone(), bson::Bson::Double(v));
+                }
+                Acc::Min(v) => {
+                    doc.insert(name.clone(), v.clone().unwrap_or(bson::Bson::Null));
+                }
+                Acc::Max(v) => {
+                    doc.insert(name.clone(), v.clone().unwrap_or(bson::Bson::Null));
+                }
+                Acc::Count(c) => {
+                    doc.insert(name.clone(), bson::Bson::Int64(*c));
+                }
+                _ => {}
+            }
+        }
+
+        if !doc.contains_key("count") {
+            if doc_count <= i32::MAX as i64 && doc_count >= i32::MIN as i64 {
+                doc.insert("count", bson::Bson::Int32(doc_count as i32));
+            } else {
+                doc.insert("count", bson::Bson::Int64(doc_count));
+            }
+        }
+
+        out.push(doc);
+    }
+
+    out
+}
+
 use crate::error::Error;
 async fn apply_lookup(
     db: &str,
@@ -2180,6 +2496,286 @@ async fn apply_lookup(
         );
     }
     Ok(docs)
+}
+
+/// Execute a sub-pipeline for $facet stage
+/// Supports: $match, $sort, $limit, $skip, $project, $addFields/$set, $unwind, $group
+fn execute_sub_pipeline(
+    docs: Vec<Document>,
+    pipeline: &[bson::Bson],
+) -> std::result::Result<Vec<Document>, String> {
+    let mut result = docs;
+
+    for stage in pipeline {
+        if let bson::Bson::Document(stage_doc) = stage {
+            // $match
+            if let Ok(filter) = stage_doc.get_document("$match") {
+                result.retain(|d| document_matches_filter(d, filter));
+                continue;
+            }
+
+            // $sort
+            if let Ok(sort_spec) = stage_doc.get_document("$sort") {
+                result.sort_by(|a, b| cmp_multi(a, b, sort_spec));
+                continue;
+            }
+
+            // $limit
+            if let Some(limit) = stage_doc
+                .get_i64("$limit")
+                .ok()
+                .or(stage_doc.get_i32("$limit").ok().map(|v| v as i64))
+            {
+                if limit >= 0 && (limit as usize) < result.len() {
+                    result.truncate(limit as usize);
+                }
+                continue;
+            }
+
+            // $skip
+            if let Some(skip) = stage_doc
+                .get_i64("$skip")
+                .ok()
+                .or(stage_doc.get_i32("$skip").ok().map(|v| v as i64))
+            {
+                if skip > 0 {
+                    let skip_count = (skip as usize).min(result.len());
+                    result.drain(0..skip_count);
+                }
+                continue;
+            }
+
+            // $project
+            if let Ok(proj) = stage_doc.get_document("$project") {
+                result = result
+                    .into_iter()
+                    .map(|d| apply_project_with_expr(&d, proj))
+                    .collect();
+                continue;
+            }
+
+            // $addFields / $set
+            if let Ok(af) = stage_doc
+                .get_document("$addFields")
+                .or(stage_doc.get_document("$set"))
+            {
+                for d in result.iter_mut() {
+                    for (k, v) in af.iter() {
+                        let val = eval_expr(d, v).unwrap_or(bson::Bson::Null);
+                        set_path_nested(d, k, val);
+                    }
+                }
+                continue;
+            }
+
+            // $unwind
+            if let Ok(u) = stage_doc.get_str("$unwind") {
+                let path = u.trim_start_matches('$').to_string();
+                let mut out: Vec<Document> = Vec::new();
+                for d in result.into_iter() {
+                    match get_path_bson_value(&d, &path) {
+                        Some(bson::Bson::Array(arr)) => {
+                            for item in arr {
+                                let mut nd = d.clone();
+                                set_path_nested(&mut nd, &path, item);
+                                out.push(nd);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                result = out;
+                continue;
+            }
+
+            if let Ok(ud) = stage_doc.get_document("$unwind") {
+                if let Ok(pth) = ud.get_str("path") {
+                    let path = pth.trim_start_matches('$').to_string();
+                    let preserve = ud.get_bool("preserveNullAndEmptyArrays").unwrap_or(false);
+                    let include = ud.get_str("includeArrayIndex").ok().map(|s| s.to_string());
+                    let mut out: Vec<Document> = Vec::new();
+                    for d in result.into_iter() {
+                        match get_path_bson_value(&d, &path) {
+                            Some(bson::Bson::Array(arr)) => {
+                                if arr.is_empty() {
+                                    if preserve {
+                                        let mut nd = d.clone();
+                                        set_path_nested(&mut nd, &path, bson::Bson::Null);
+                                        if let Some(ref fpath) = include {
+                                            set_path_nested(&mut nd, fpath, bson::Bson::Null);
+                                        }
+                                        out.push(nd);
+                                    }
+                                    continue;
+                                }
+                                for (i, item) in arr.into_iter().enumerate() {
+                                    let mut nd = d.clone();
+                                    set_path_nested(&mut nd, &path, item);
+                                    if let Some(ref fpath) = include {
+                                        set_path_nested(
+                                            &mut nd,
+                                            fpath,
+                                            bson::Bson::Int32(i as i32),
+                                        );
+                                    }
+                                    out.push(nd);
+                                }
+                            }
+                            None | Some(bson::Bson::Null) => {
+                                if preserve {
+                                    let mut nd = d.clone();
+                                    set_path_nested(&mut nd, &path, bson::Bson::Null);
+                                    if let Some(ref fpath) = include {
+                                        set_path_nested(&mut nd, fpath, bson::Bson::Null);
+                                    }
+                                    out.push(nd);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    result = out;
+                    continue;
+                }
+            }
+
+            // $group
+            if let Ok(group_spec) = stage_doc.get_document("$group") {
+                result = apply_group(&result, group_spec);
+                continue;
+            }
+
+            // Unknown stage in sub-pipeline
+            if stage_doc.keys().any(|k| k.starts_with('$')) {
+                let stage_name = stage_doc.keys().next().unwrap().clone();
+                return Err(format!("Unsupported sub-pipeline stage: {}", stage_name));
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// Check if a document matches a filter (for $match in sub-pipelines)
+fn document_matches_filter(doc: &Document, filter: &Document) -> bool {
+    for (key, value) in filter.iter() {
+        if !field_matches(doc, key, value) {
+            return false;
+        }
+    }
+    true
+}
+
+fn field_matches(doc: &Document, field: &str, expected: &bson::Bson) -> bool {
+    let actual = get_path_bson_value(doc, field);
+
+    match expected {
+        bson::Bson::Document(op_doc) => {
+            // Handle operators like $eq, $gt, $gte, $lt, $lte, $ne, $in, $nin, etc.
+            for (op, op_val) in op_doc.iter() {
+                match op.as_str() {
+                    "$eq" => {
+                        if actual.as_ref() != Some(op_val) {
+                            return false;
+                        }
+                    }
+                    "$ne" => {
+                        if actual.as_ref() == Some(op_val) {
+                            return false;
+                        }
+                    }
+                    "$gt" => {
+                        if let (Some(a), Some(b)) = (
+                            actual.as_ref().and_then(number_as_f64),
+                            number_as_f64(op_val),
+                        ) {
+                            if a <= b {
+                                return false;
+                            }
+                        } else {
+                            return false;
+                        }
+                    }
+                    "$gte" => {
+                        if let (Some(a), Some(b)) = (
+                            actual.as_ref().and_then(number_as_f64),
+                            number_as_f64(op_val),
+                        ) {
+                            if a < b {
+                                return false;
+                            }
+                        } else {
+                            return false;
+                        }
+                    }
+                    "$lt" => {
+                        if let (Some(a), Some(b)) = (
+                            actual.as_ref().and_then(number_as_f64),
+                            number_as_f64(op_val),
+                        ) {
+                            if a >= b {
+                                return false;
+                            }
+                        } else {
+                            return false;
+                        }
+                    }
+                    "$lte" => {
+                        if let (Some(a), Some(b)) = (
+                            actual.as_ref().and_then(number_as_f64),
+                            number_as_f64(op_val),
+                        ) {
+                            if a > b {
+                                return false;
+                            }
+                        } else {
+                            return false;
+                        }
+                    }
+                    "$in" => {
+                        if let bson::Bson::Array(arr) = op_val {
+                            if let Some(ref a) = actual {
+                                if !arr.contains(a) {
+                                    return false;
+                                }
+                            } else {
+                                return false;
+                            }
+                        } else {
+                            return false;
+                        }
+                    }
+                    "$nin" => {
+                        if let bson::Bson::Array(arr) = op_val {
+                            if let Some(ref a) = actual {
+                                if arr.contains(a) {
+                                    return false;
+                                }
+                            }
+                        } else {
+                            return false;
+                        }
+                    }
+                    "$exists" => {
+                        let exists = actual.is_some();
+                        let want_exists = op_val.as_bool().unwrap_or(true);
+                        if exists != want_exists {
+                            return false;
+                        }
+                    }
+                    _ => {
+                        // Unknown operator - treat as not matching
+                        return false;
+                    }
+                }
+            }
+            true
+        }
+        _ => {
+            // Direct equality comparison
+            actual.as_ref() == Some(expected)
+        }
+    }
 }
 
 fn eval_expr(doc: &Document, v: &bson::Bson) -> Option<bson::Bson> {
@@ -2533,86 +3129,50 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
     };
     let cursor_spec = cmd.get_document("cursor").unwrap_or(&doc! {}).clone();
     let batch_size = cursor_spec.get_i32("batchSize").unwrap_or(101) as i64;
-    // Minimal pipeline support: $match, $sort, $project, $limit, $skip, $addFields/$set, $unwind, $group, $lookup, $out, $merge
-    let mut filter: Option<bson::Document> = None;
-    let mut sort: Option<bson::Document> = None;
-    let mut project: Option<bson::Document> = None;
-    let mut limit: Option<i64> = None;
-    let mut skip: Option<i64> = None;
-    let mut add_fields: Option<bson::Document> = None;
+
+    if state.store.is_none() {
+        return error_doc(13, "No storage configured");
+    }
+    let pg = state.store.as_ref().unwrap();
+
+    // First pass: scan for special stages that affect execution ($count, $facet, $out, $merge)
+    // These need to be handled specially and may short-circuit normal execution
     let mut count_field: Option<String> = None;
-    let mut computed_project = false;
-    let mut unwind_path: Option<(String, bool, Option<String>)> = None; // (path, preserveNullAndEmptyArrays, includeArrayIndex)
-    let mut group_spec: Option<Document> = None;
-    let mut lookup_spec: Option<Document> = None;
+    let mut facet_pipelines: Option<Vec<(String, Vec<bson::Bson>)>> = None;
     let mut out_coll: Option<String> = None;
     let mut merge_spec: Option<Document> = None;
     let mut stage_count = 0;
     for st in pipeline {
         stage_count += 1;
         if let bson::Bson::Document(stage) = st {
-            if let Ok(m) = stage.get_document("$match") {
-                filter = Some(m.clone());
-                continue;
-            }
-            if let Ok(s) = stage.get_document("$sort") {
-                sort = Some(s.clone());
-                continue;
-            }
-            if let Ok(p) = stage.get_document("$project") {
-                computed_project = p.iter().any(|(_k, v)| {
-                    !matches!(v, bson::Bson::Int32(n) if *n == 0 || *n == 1)
-                        && !matches!(v, bson::Bson::Boolean(b) if *b || !*b)
-                });
-                project = Some(p.clone());
-                continue;
-            }
-            if let Some(l) = stage
-                .get_i64("$limit")
-                .ok()
-                .or(stage.get_i32("$limit").ok().map(|v| v as i64))
-            {
-                limit = Some(l);
-                continue;
-            }
-            if let Some(sk) = stage
-                .get_i64("$skip")
-                .ok()
-                .or(stage.get_i32("$skip").ok().map(|v| v as i64))
-            {
-                skip = Some(sk);
-                continue;
-            }
-            if let Ok(af) = stage
-                .get_document("$addFields")
-                .or(stage.get_document("$set"))
-            {
-                add_fields = Some(af.clone());
-                continue;
-            }
             if let Ok(cf) = stage.get_str("$count") {
                 count_field = Some(cf.to_string());
                 continue;
             }
-            if let Ok(u) = stage.get_str("$unwind") {
-                unwind_path = Some((u.trim_start_matches('$').to_string(), false, None));
-                continue;
-            }
-            if let Ok(ud) = stage.get_document("$unwind") {
-                if let Ok(pth) = ud.get_str("path") {
-                    let preserve = ud.get_bool("preserveNullAndEmptyArrays").unwrap_or(false);
-                    let include = ud.get_str("includeArrayIndex").ok().map(|s| s.to_string());
-                    unwind_path =
-                        Some((pth.trim_start_matches('$').to_string(), preserve, include));
-                    continue;
+            // $facet: document with sub-pipelines (must be last stage)
+            if let Ok(facet_doc) = stage.get_document("$facet") {
+                if stage_count < pipeline.len() {
+                    return error_doc(9, "$facet must be the last stage in the pipeline");
                 }
-            }
-            if let Ok(g) = stage.get_document("$group") {
-                group_spec = Some(g.clone());
-                continue;
-            }
-            if let Ok(lu) = stage.get_document("$lookup") {
-                lookup_spec = Some(lu.clone());
+                // Parse facet sub-pipelines
+                let mut parsed_facets: Vec<(String, Vec<bson::Bson>)> = Vec::new();
+                for (facet_name, facet_pipeline_bson) in facet_doc.iter() {
+                    if let bson::Bson::Array(arr) = facet_pipeline_bson {
+                        parsed_facets.push((facet_name.clone(), arr.clone()));
+                    } else {
+                        return error_doc(
+                            9,
+                            format!(
+                                "$facet field '{}' must be an array of pipeline stages",
+                                facet_name
+                            ),
+                        );
+                    }
+                }
+                if parsed_facets.is_empty() {
+                    return error_doc(9, "$facet must have at least one sub-pipeline");
+                }
+                facet_pipelines = Some(parsed_facets);
                 continue;
             }
             // $out: can be string or document with "coll" field
@@ -2641,24 +3201,37 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
                 merge_spec = Some(merge_doc.clone());
                 continue;
             }
-            // Unknown $stage: error
-            if stage.keys().any(|k| k.starts_with('$')) {
-                return error_doc(
-                    9,
-                    format!(
-                        "Unsupported pipeline stage: {}",
-                        stage.keys().next().unwrap()
-                    ),
-                );
-            }
         }
     }
-    if state.store.is_none() {
-        return error_doc(13, "No storage configured");
-    }
-    let pg = state.store.as_ref().unwrap();
+
     // Handle $count early: compute count from filter and adjust with skip/limit
+    // Note: $count is a terminal stage that returns a single document with the count
     if let Some(field) = count_field {
+        // Parse the pipeline to extract filter, skip, and limit for count calculation
+        let mut filter: Option<bson::Document> = None;
+        let mut skip: Option<i64> = None;
+        let mut limit: Option<i64> = None;
+        for st in pipeline {
+            if let bson::Bson::Document(stage) = st {
+                if let Ok(m) = stage.get_document("$match") {
+                    filter = Some(m.clone());
+                }
+                if let Some(sk) = stage
+                    .get_i64("$skip")
+                    .ok()
+                    .or(stage.get_i32("$skip").ok().map(|v| v as i64))
+                {
+                    skip = Some(sk);
+                }
+                if let Some(l) = stage
+                    .get_i64("$limit")
+                    .ok()
+                    .or(stage.get_i32("$limit").ok().map(|v| v as i64))
+                {
+                    limit = Some(l);
+                }
+            }
+        }
         let total = match pg.count_docs(dbname, coll, filter.as_ref()).await {
             Ok(n) => n,
             Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
@@ -2679,150 +3252,522 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
         return doc! { "cursor": {"id": 0i64, "ns": format!("{}.{}", dbname, coll), "firstBatch": [d] }, "ok": 1.0 };
     }
 
-    // Disable pushdowns when later stages transform shape (addFields/set/unwind/group/lookup)
-    // or when project has computed fields.
-    let has_transform = computed_project
-        || add_fields.is_some()
-        || unwind_path.is_some()
-        || group_spec.is_some()
-        || lookup_spec.is_some();
-    // Determine how many docs to fetch before applying in-memory transforms.
-    // When transforms are present, avoid under-fetching (e.g., sorting on computed fields)
-    // by fetching at least a generous base window.
-    let base_fetch = batch_size * 10;
-    let lim = limit.unwrap_or(base_fetch);
-    let fetch_limit = skip.unwrap_or(0)
-        + if has_transform {
-            std::cmp::max(lim, base_fetch)
-        } else {
-            lim
-        };
-    let pushdown_project = if has_transform {
-        None
-    } else {
-        project.as_ref()
-    };
-    let pushdown_sort = if has_transform { None } else { sort.as_ref() };
-    let mut docs = match pg
-        .find_docs(
-            dbname,
-            coll,
-            filter.as_ref(),
-            pushdown_sort,
-            pushdown_project,
-            fetch_limit,
-        )
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
-    };
-    // Apply addFields/$set
-    if let Some(af) = add_fields.as_ref() {
-        for d in docs.iter_mut() {
-            for (k, v) in af.iter() {
-                let val = eval_expr(d, v).unwrap_or(bson::Bson::Null);
-                set_path_nested(d, k, val);
-            }
-        }
-    }
+    // Execute pipeline stages in order, handling $unionWith correctly
+    // $unionWith concatenates union collection docs, and subsequent stages apply to the combined set
+    let mut docs: Vec<Document> = Vec::new();
+    let mut main_coll_fetched = false;
 
-    // Early project only when computed and no later transforms depend on fields
-    if let Some(ref proj) = project.as_ref() {
-        if computed_project && !has_transform {
-            for d in docs.iter_mut() {
-                let out = apply_project_with_expr(d, proj);
-                *d = out;
+    for st in pipeline {
+        if let bson::Bson::Document(stage) = st {
+            // $match: filter current docs (or fetch main collection if not yet fetched)
+            if let Ok(filter) = stage.get_document("$match") {
+                if !main_coll_fetched {
+                    // First $match before any $unionWith: fetch from main collection with filter
+                    docs = match pg
+                        .find_docs(dbname, coll, Some(filter), None, None, batch_size * 10)
+                        .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
+                    };
+                    main_coll_fetched = true;
+                } else {
+                    // $match after $unionWith: filter the combined docs
+                    docs.retain(|d| document_matches_filter(d, filter));
+                }
+                continue;
             }
-        }
-    }
 
-    // Apply unwind (drop docs with missing/non-array path)
-    if let Some((ref upath, preserve, ref include_idx)) = unwind_path {
-        let mut out: Vec<Document> = Vec::new();
-        for d in docs.into_iter() {
-            match get_path_bson_value(&d, upath) {
-                Some(bson::Bson::Array(arr)) => {
-                    if arr.is_empty() {
-                        if preserve {
-                            let mut nd = d.clone();
-                            set_path_nested(&mut nd, upath, bson::Bson::Null);
-                            if let Some(fpath) = include_idx {
-                                set_path_nested(&mut nd, fpath, bson::Bson::Null);
+            // $unionWith: fetch from union collection and concatenate
+            if stage.contains_key("$unionWith") {
+                // Fetch main collection if not yet fetched (no filter)
+                if !main_coll_fetched {
+                    docs = match pg
+                        .find_docs(dbname, coll, None, None, None, batch_size * 10)
+                        .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
+                    };
+                    main_coll_fetched = true;
+                }
+
+                // Parse $unionWith specification
+                let (union_coll, union_pipeline): (String, Vec<bson::Bson>) = if let Ok(union_doc) =
+                    stage.get_document("$unionWith")
+                {
+                    // Document format: { $unionWith: { coll: "name", pipeline: [...] } }
+                    let coll_name = match union_doc.get_str("coll") {
+                        Ok(c) => c.to_string(),
+                        Err(_) => {
+                            return error_doc(9, "$unionWith document must have a 'coll' field");
+                        }
+                    };
+                    let pipeline = union_doc
+                        .get_array("pipeline")
+                        .ok()
+                        .cloned()
+                        .unwrap_or_default();
+                    (coll_name, pipeline)
+                } else if let Ok(coll_name) = stage.get_str("$unionWith") {
+                    // String format: { $unionWith: "collName" }
+                    (coll_name.to_string(), Vec::new())
+                } else {
+                    return error_doc(9, "$unionWith must be a string or document");
+                };
+
+                // Fetch all documents from the union collection (no filter)
+                let union_docs = match pg
+                    .find_docs(dbname, &union_coll, None, None, None, 100_000)
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // MongoDB returns empty results if collection doesn't exist
+                        tracing::debug!(error = %e, collection=%union_coll, "unionWith collection not found, returning empty");
+                        Vec::new()
+                    }
+                };
+
+                // If a pipeline is specified, execute it on the union collection documents
+                let union_docs = if !union_pipeline.is_empty() {
+                    match execute_sub_pipeline(union_docs, &union_pipeline) {
+                        Ok(v) => v,
+                        Err(err_msg) => {
+                            return error_doc(9, format!("$unionWith pipeline error: {}", err_msg));
+                        }
+                    }
+                } else {
+                    union_docs
+                };
+
+                // Concatenate union results to current docs (current docs first, then union docs)
+                docs.extend(union_docs);
+                continue;
+            }
+
+            // $sort: sort current docs
+            if let Ok(sort_spec) = stage.get_document("$sort") {
+                // Fetch main collection if not yet fetched
+                if !main_coll_fetched {
+                    docs = match pg
+                        .find_docs(dbname, coll, None, Some(sort_spec), None, batch_size * 10)
+                        .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
+                    };
+                    main_coll_fetched = true;
+                } else {
+                    // Sort the current docs in memory
+                    docs.sort_by(|a, b| cmp_multi(a, b, sort_spec));
+                }
+                continue;
+            }
+
+            // $limit: limit current docs
+            if let Some(limit_val) = stage
+                .get_i64("$limit")
+                .ok()
+                .or(stage.get_i32("$limit").ok().map(|v| v as i64))
+            {
+                // Fetch main collection if not yet fetched
+                if !main_coll_fetched {
+                    docs = match pg
+                        .find_docs(dbname, coll, None, None, None, limit_val)
+                        .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
+                    };
+                    main_coll_fetched = true;
+                } else if limit_val >= 0 && (limit_val as usize) < docs.len() {
+                    docs.truncate(limit_val as usize);
+                }
+                continue;
+            }
+
+            // $skip: skip current docs
+            if let Some(skip_val) = stage
+                .get_i64("$skip")
+                .ok()
+                .or(stage.get_i32("$skip").ok().map(|v| v as i64))
+            {
+                // Fetch main collection if not yet fetched
+                if !main_coll_fetched {
+                    docs = match pg
+                        .find_docs(dbname, coll, None, None, None, skip_val + batch_size * 10)
+                        .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
+                    };
+                    main_coll_fetched = true;
+                }
+                if skip_val > 0 {
+                    let skip_count = (skip_val as usize).min(docs.len());
+                    docs.drain(0..skip_count);
+                }
+                continue;
+            }
+
+            // $project: project current docs
+            if let Ok(proj) = stage.get_document("$project") {
+                // Check if this is a computed projection (has field refs like "$v" or exprs like {"$add": [...]})
+                let has_computed = proj.iter().any(|(_k, v)| {
+                    !matches!(v, bson::Bson::Int32(n) if *n == 0 || *n == 1)
+                        && !matches!(v, bson::Bson::Boolean(b) if *b || !*b)
+                });
+                // Fetch main collection if not yet fetched
+                if !main_coll_fetched {
+                    if has_computed {
+                        // Can't push down computed projections - fetch full docs and apply in memory
+                        docs = match pg
+                            .find_docs(dbname, coll, None, None, None, batch_size * 10)
+                            .await
+                        {
+                            Ok(v) => v,
+                            Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
+                        };
+                        main_coll_fetched = true;
+                        // Apply computed projection in memory
+                        for d in docs.iter_mut() {
+                            *d = apply_project_with_expr(d, proj);
+                        }
+                    } else {
+                        // Simple projection - can try SQL pushdown
+                        docs = match pg
+                            .find_docs(dbname, coll, None, None, Some(proj), batch_size * 10)
+                            .await
+                        {
+                            Ok(v) => v,
+                            Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
+                        };
+                        main_coll_fetched = true;
+                    }
+                } else {
+                    // Apply projection in memory to existing docs
+                    for d in docs.iter_mut() {
+                        *d = apply_project_with_expr(d, proj);
+                    }
+                }
+                continue;
+            }
+
+            // $addFields / $set: add fields to current docs
+            if let Ok(af) = stage
+                .get_document("$addFields")
+                .or(stage.get_document("$set"))
+            {
+                // Fetch main collection if not yet fetched
+                if !main_coll_fetched {
+                    docs = match pg
+                        .find_docs(dbname, coll, None, None, None, batch_size * 10)
+                        .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
+                    };
+                    main_coll_fetched = true;
+                }
+                for d in docs.iter_mut() {
+                    for (k, v) in af.iter() {
+                        let val = eval_expr(d, v).unwrap_or(bson::Bson::Null);
+                        set_path_nested(d, k, val);
+                    }
+                }
+                continue;
+            }
+
+            // $unwind: unwind arrays in current docs
+            if let Ok(u) = stage.get_str("$unwind") {
+                let path = u.trim_start_matches('$').to_string();
+                // Fetch main collection if not yet fetched
+                if !main_coll_fetched {
+                    docs = match pg
+                        .find_docs(dbname, coll, None, None, None, batch_size * 10)
+                        .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
+                    };
+                    main_coll_fetched = true;
+                }
+                let mut out: Vec<Document> = Vec::new();
+                for d in docs.into_iter() {
+                    match get_path_bson_value(&d, &path) {
+                        Some(bson::Bson::Array(arr)) => {
+                            for item in arr {
+                                let mut nd = d.clone();
+                                set_path_nested(&mut nd, &path, item);
+                                out.push(nd);
                             }
-                            out.push(nd);
                         }
-                        continue;
-                    }
-                    for (i, item) in arr.into_iter().enumerate() {
-                        let mut nd = d.clone();
-                        set_path_nested(&mut nd, upath, item);
-                        if let Some(fpath) = include_idx {
-                            set_path_nested(&mut nd, fpath, bson::Bson::Int32(i as i32));
-                        }
-                        out.push(nd);
+                        _ => {}
                     }
                 }
-                None | Some(bson::Bson::Null) => {
-                    if preserve {
-                        let mut nd = d.clone();
-                        set_path_nested(&mut nd, upath, bson::Bson::Null);
-                        if let Some(fpath) = include_idx {
-                            set_path_nested(&mut nd, fpath, bson::Bson::Null);
+                docs = out;
+                continue;
+            }
+            if let Ok(ud) = stage.get_document("$unwind") {
+                if let Ok(pth) = ud.get_str("path") {
+                    let path = pth.trim_start_matches('$').to_string();
+                    let preserve = ud.get_bool("preserveNullAndEmptyArrays").unwrap_or(false);
+                    let include = ud.get_str("includeArrayIndex").ok().map(|s| s.to_string());
+                    // Fetch main collection if not yet fetched
+                    if !main_coll_fetched {
+                        docs = match pg
+                            .find_docs(dbname, coll, None, None, None, batch_size * 10)
+                            .await
+                        {
+                            Ok(v) => v,
+                            Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
+                        };
+                        main_coll_fetched = true;
+                    }
+                    let mut out: Vec<Document> = Vec::new();
+                    for d in docs.into_iter() {
+                        match get_path_bson_value(&d, &path) {
+                            Some(bson::Bson::Array(arr)) => {
+                                if arr.is_empty() {
+                                    if preserve {
+                                        let mut nd = d.clone();
+                                        set_path_nested(&mut nd, &path, bson::Bson::Null);
+                                        if let Some(ref fpath) = include {
+                                            set_path_nested(&mut nd, fpath, bson::Bson::Null);
+                                        }
+                                        out.push(nd);
+                                    }
+                                    continue;
+                                }
+                                for (i, item) in arr.into_iter().enumerate() {
+                                    let mut nd = d.clone();
+                                    set_path_nested(&mut nd, &path, item);
+                                    if let Some(ref fpath) = include {
+                                        set_path_nested(
+                                            &mut nd,
+                                            fpath,
+                                            bson::Bson::Int32(i as i32),
+                                        );
+                                    }
+                                    out.push(nd);
+                                }
+                            }
+                            None | Some(bson::Bson::Null) => {
+                                if preserve {
+                                    let mut nd = d.clone();
+                                    set_path_nested(&mut nd, &path, bson::Bson::Null);
+                                    if let Some(ref fpath) = include {
+                                        set_path_nested(&mut nd, fpath, bson::Bson::Null);
+                                    }
+                                    out.push(nd);
+                                }
+                            }
+                            _ => {}
                         }
-                        out.push(nd);
+                    }
+                    docs = out;
+                    continue;
+                }
+            }
+
+            // $group: group current docs
+            if let Ok(gspec) = stage.get_document("$group") {
+                // Fetch main collection if not yet fetched
+                if !main_coll_fetched {
+                    docs = match pg
+                        .find_docs(dbname, coll, None, None, None, batch_size * 10)
+                        .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
+                    };
+                    main_coll_fetched = true;
+                }
+                docs = apply_group(&docs, gspec);
+                continue;
+            }
+
+            // $bucket: bucket current docs
+            if let Ok(b) = stage.get_document("$bucket") {
+                // Parse $bucket specification
+                let group_by = match b.get("groupBy") {
+                    Some(bson::Bson::String(s)) => s.clone(),
+                    _ => {
+                        return error_doc(9, "$bucket requires groupBy expression");
+                    }
+                };
+
+                let boundaries = match b.get_array("boundaries") {
+                    Ok(arr) => arr.clone(),
+                    Err(_) => {
+                        return error_doc(9, "$bucket requires boundaries array");
+                    }
+                };
+
+                if boundaries.len() < 2 {
+                    return error_doc(9, "$bucket boundaries must have at least 2 elements");
+                }
+
+                // Check boundaries are sorted
+                for i in 1..boundaries.len() {
+                    if cmp_bson(&boundaries[i], &boundaries[i - 1]) != std::cmp::Ordering::Greater {
+                        return error_doc(
+                            9,
+                            "$bucket boundaries must be sorted in ascending order",
+                        );
                     }
                 }
-                _ => {}
+
+                let default = b.get("default").cloned();
+                let output = b.get_document("output").ok().cloned();
+
+                let bspec = BucketSpec {
+                    group_by,
+                    boundaries,
+                    default,
+                    output,
+                };
+
+                // Fetch main collection if not yet fetched
+                if !main_coll_fetched {
+                    docs = match pg
+                        .find_docs(dbname, coll, None, None, None, batch_size * 10)
+                        .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
+                    };
+                    main_coll_fetched = true;
+                }
+                docs = apply_bucket(&docs, &bspec);
+                continue;
+            }
+
+            // $lookup: lookup from another collection
+            if let Ok(lspec) = stage.get_document("$lookup") {
+                // Fetch main collection if not yet fetched
+                if !main_coll_fetched {
+                    docs = match pg
+                        .find_docs(dbname, coll, None, None, None, batch_size * 10)
+                        .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
+                    };
+                    main_coll_fetched = true;
+                }
+                docs = apply_lookup(dbname, pg, docs, lspec)
+                    .await
+                    .unwrap_or_else(|_| Vec::new());
+                continue;
+            }
+
+            // $sample: random sample of current docs
+            if let Ok(sample_doc) = stage.get_document("$sample") {
+                let sample_size = if let Ok(size) = sample_doc.get_i64("size") {
+                    size
+                } else if let Ok(size) = sample_doc.get_i32("size") {
+                    size as i64
+                } else {
+                    return error_doc(9, "$sample must have a numeric 'size' field");
+                };
+
+                // Fetch main collection if not yet fetched
+                if !main_coll_fetched {
+                    docs = match pg
+                        .find_docs(dbname, coll, None, None, None, batch_size * 10)
+                        .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
+                    };
+                    main_coll_fetched = true;
+                }
+
+                if sample_size <= 0 {
+                    docs.clear();
+                } else {
+                    let n = sample_size as usize;
+                    docs.shuffle(&mut rand::thread_rng());
+                    if n < docs.len() {
+                        docs.truncate(n);
+                    }
+                }
+                continue;
+            }
+
+            // $facet: handled separately after the main loop
+            if stage.contains_key("$facet") {
+                // Fetch main collection if not yet fetched (needed for facet sub-pipelines)
+                if !main_coll_fetched {
+                    docs = match pg
+                        .find_docs(dbname, coll, None, None, None, batch_size * 10)
+                        .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
+                    };
+                    main_coll_fetched = true;
+                }
+                // $facet is processed after the main loop, so just continue here
+                continue;
+            }
+
+            // Unknown $stage: error
+            if stage.keys().any(|k| k.starts_with('$')) {
+                return error_doc(
+                    9,
+                    format!(
+                        "Unsupported pipeline stage: {}",
+                        stage.keys().next().unwrap()
+                    ),
+                );
             }
         }
-        docs = out;
     }
 
-    // Apply $group (in-memory)
-    if let Some(ref gspec) = group_spec {
-        docs = apply_group(&docs, gspec);
+    // If no stages were processed that fetched the main collection, fetch it now
+    if !main_coll_fetched {
+        docs = match pg
+            .find_docs(dbname, coll, None, None, None, batch_size * 10)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
+        };
     }
 
-    // Apply $lookup (in-memory)
-    if let Some(ref lspec) = lookup_spec {
-        if let Some(ref pg) = state.store {
-            docs = apply_lookup(dbname, pg, docs, lspec)
-                .await
-                .unwrap_or_else(|_| Vec::new());
-        }
-    }
+    // Handle $facet: execute sub-pipelines and return single document with results
+    if let Some(facets) = facet_pipelines {
+        let mut facet_result = Document::new();
 
-    // In-memory sort if transforms present and client requested sort
-    if (has_transform) && sort.is_some() {
-        if let Some(ref s) = sort {
-            docs.sort_by(|a, b| cmp_multi(a, b, s));
-        }
-    }
-
-    // Apply project late when we deferred due to transforms or computed fields
-    if let Some(ref proj) = project.as_ref() {
-        if has_transform {
-            for d in docs.iter_mut() {
-                let out = apply_project_with_expr(d, proj);
-                *d = out;
+        for (facet_name, sub_pipeline) in facets {
+            match execute_sub_pipeline(docs.clone(), &sub_pipeline) {
+                Ok(facet_docs) => {
+                    let facet_array: Vec<bson::Bson> = facet_docs
+                        .into_iter()
+                        .map(|d| bson::Bson::Document(d))
+                        .collect();
+                    facet_result.insert(facet_name, bson::Bson::Array(facet_array));
+                }
+                Err(err_msg) => {
+                    return error_doc(9, format!("$facet sub-pipeline error: {}", err_msg));
+                }
             }
         }
+
+        // $facet always returns a single document with all facet results
+        return doc! {
+            "cursor": {
+                "id": 0i64,
+                "ns": format!("{}.{}", dbname, coll),
+                "firstBatch": [facet_result]
+            },
+            "ok": 1.0
+        };
     }
 
-    // Apply skip/limit after transformations
-    if let Some(sk) = skip {
-        if sk as usize <= docs.len() {
-            docs.drain(0..(sk as usize));
-        } else {
-            docs.clear();
-        }
-    }
-    if let Some(l) = limit {
-        if (l as usize) < docs.len() {
-            docs.truncate(l as usize);
-        }
-    }
     // Handle $out: write results to a new collection
     if let Some(target_coll) = out_coll {
         return handle_out_stage(state, dbname, &target_coll, docs).await;

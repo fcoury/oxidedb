@@ -597,6 +597,7 @@ pub fn translate_expression(expr: &bson::Bson) -> Option<String> {
                 "$toDouble" => translate_type_cast(val, "double precision"),
                 "$toBool" => translate_type_cast(val, "boolean"),
                 "$concat" => translate_concat(val),
+                "$concatArrays" => translate_concat_arrays(val),
                 "$substr" => translate_substr(val),
                 "$substrCP" => translate_substr(val),
                 _ => None,
@@ -605,8 +606,18 @@ pub fn translate_expression(expr: &bson::Bson) -> Option<String> {
         bson::Bson::String(s) if s.starts_with('$') => {
             let path = &s[1..];
             let segs: Vec<String> = path.split('.').map(escape_single).collect();
-            let path_str = segs.join("','");
-            Some(format!("doc #> '{{\"{}\"}}'", path_str))
+            if segs.len() == 1 {
+                // Simple field access - use text extraction operator
+                Some(format!("doc->>'{}'", segs[0]))
+            } else {
+                // Nested field access - use text extraction with path
+                let path_str = segs.join("','");
+                Some(format!("doc #>> '{{\"{}\"}}'", path_str))
+            }
+        }
+        bson::Bson::String(s) => {
+            // String literal - escape and quote for SQL
+            Some(format!("'{}'", escape_single(s)))
         }
         bson::Bson::Int32(n) => Some(n.to_string()),
         bson::Bson::Int64(n) => Some(n.to_string()),
@@ -665,6 +676,71 @@ fn translate_concat(val: &bson::Bson) -> Option<String> {
                 None
             } else {
                 Some(format!("CONCAT({})", exprs.join(", ")))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn translate_concat_arrays(val: &bson::Bson) -> Option<String> {
+    match val {
+        bson::Bson::Array(arr) => {
+            // Build a subquery that concatenates arrays using jsonb_agg and jsonb_array_elements
+            let mut array_sources: Vec<String> = Vec::new();
+
+            for item in arr {
+                match item {
+                    // Field reference like "$a" - extract as JSONB array
+                    bson::Bson::String(s) if s.starts_with('$') => {
+                        let path = &s[1..];
+                        let segs: Vec<String> = path.split('.').map(escape_single).collect();
+                        let jsonb_path = if segs.len() == 1 {
+                            format!("doc->'{}'", segs[0])
+                        } else {
+                            let path_str = segs.join("','");
+                            format!("doc #> '{{\"{}\"}}'", path_str)
+                        };
+                        array_sources.push(format!(
+                            "SELECT jsonb_array_elements({}) AS elem",
+                            jsonb_path
+                        ));
+                    }
+                    // Literal array like [4] - build as JSONB array and unnest it
+                    bson::Bson::Array(lit_arr) => {
+                        let elems: Vec<String> = lit_arr
+                            .iter()
+                            .filter_map(|elem| translate_expression(elem))
+                            .collect();
+                        if !elems.is_empty() {
+                            let array_expr = format!("jsonb_build_array({})", elems.join(", "));
+                            array_sources.push(format!(
+                                "SELECT jsonb_array_elements({}) AS elem",
+                                array_expr
+                            ));
+                        }
+                    }
+                    // Other literal values - wrap in array and unnest
+                    _ => {
+                        if let Some(expr) = translate_expression(item) {
+                            let array_expr = format!("jsonb_build_array({})", expr);
+                            array_sources.push(format!(
+                                "SELECT jsonb_array_elements({}) AS elem",
+                                array_expr
+                            ));
+                        }
+                    }
+                }
+            }
+
+            if array_sources.is_empty() {
+                Some("'[]'::jsonb".to_string())
+            } else {
+                // Build a subquery that unions all array elements and aggregates them
+                let union_sql = array_sources.join(" UNION ALL ");
+                Some(format!(
+                    "(SELECT jsonb_agg(elem) FROM ({} UNION ALL SELECT NULL::jsonb WHERE FALSE) sub WHERE elem IS NOT NULL)",
+                    union_sql
+                ))
             }
         }
         _ => None,

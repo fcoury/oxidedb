@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::translate::translate_expression;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -1290,8 +1291,8 @@ fn projection_pushdown_sql(projection: Option<&bson::Document>) -> Option<String
     if proj.is_empty() {
         return None;
     }
-    // only allow inclusive projections with possible _id exclusion
-    let mut include_fields: Vec<String> = Vec::new();
+    // Allow inclusive projections with possible _id exclusion and computed fields
+    let mut include_fields: Vec<(String, String)> = Vec::new();
     let mut include_id = true;
     for (k, v) in proj.iter() {
         if k == "_id" {
@@ -1302,19 +1303,36 @@ fn projection_pushdown_sql(projection: Option<&bson::Document>) -> Option<String
             }
             continue;
         }
-        let on = match v {
-            bson::Bson::Int32(n) => *n != 0,
-            bson::Bson::Boolean(b) => *b,
-            _ => false,
-        };
-        if on {
-            // Only top-level fields qualify for pushdown; dotted paths require server-side projection
-            if k.contains('.') {
+        // Only top-level fields qualify for pushdown; dotted paths require server-side projection
+        if k.contains('.') {
+            return None;
+        }
+        match v {
+            bson::Bson::Int32(n) => {
+                if *n != 0 {
+                    include_fields.push((k.clone(), format!("doc->'{}'", escape_single(k))));
+                } else {
+                    return None;
+                }
+            }
+            bson::Bson::Boolean(b) => {
+                if *b {
+                    include_fields.push((k.clone(), format!("doc->'{}'", escape_single(k))));
+                } else {
+                    return None;
+                }
+            }
+            bson::Bson::Document(_) => {
+                // Computed field - try to translate to SQL expression
+                if let Some(sql_expr) = translate_expression(v) {
+                    include_fields.push((k.clone(), sql_expr));
+                } else {
+                    return None;
+                }
+            }
+            _ => {
                 return None;
             }
-            include_fields.push(k.clone());
-        } else {
-            return None;
         }
     }
     if include_fields.is_empty() && include_id {
@@ -1324,12 +1342,8 @@ fn projection_pushdown_sql(projection: Option<&bson::Document>) -> Option<String
     if include_id {
         elems.push("'_id', doc->'_id'".to_string());
     }
-    for f in include_fields {
-        elems.push(format!(
-            "'{}', doc->'{}'",
-            escape_single(&f),
-            escape_single(&f)
-        ));
+    for (field_name, sql_expr) in include_fields {
+        elems.push(format!("'{}', {}", escape_single(&field_name), sql_expr));
     }
     if elems.is_empty() {
         return None;

@@ -86,14 +86,13 @@ async fn e2e_error_codes() {
     assert_eq!(doc.get_f64("ok").unwrap_or(1.0), 0.0);
     assert_eq!(doc.get_i32("code").unwrap_or(0), 2);
 
-    // aggregate with unsupported stage $sample -> code 9
+    // aggregate with $sample stage -> now supported, should succeed
     let pipeline = vec![bson::Bson::Document(doc! {"$sample": {"size": 1i32}})];
     let agg = doc! {"aggregate": "u", "pipeline": pipeline, "cursor": {}, "$db": &dbname};
     let msg = encode_op_msg(&agg, 0, 6);
     stream.write_all(&msg).await.unwrap();
     let doc = read_one_op_msg(&mut stream).await;
-    assert_eq!(doc.get_f64("ok").unwrap_or(1.0), 0.0);
-    assert_eq!(doc.get_i32("code").unwrap_or(0), 9);
+    assert_eq!(doc.get_f64("ok").unwrap_or(0.0), 1.0);
 
     let _ = shutdown.send(true);
     let _ = handle.await.unwrap();
