@@ -64,10 +64,10 @@ fn document_matches_filter(doc: &Document, filter: &Document) -> bool {
                 "$and" => {
                     if let Bson::Array(arr) = value {
                         for cond in arr {
-                            if let Bson::Document(cond_doc) = cond {
-                                if !document_matches_filter(doc, cond_doc) {
-                                    return false;
-                                }
+                            if let Bson::Document(cond_doc) = cond
+                                && !document_matches_filter(doc, cond_doc)
+                            {
+                                return false;
                             }
                         }
                     }
@@ -76,11 +76,11 @@ fn document_matches_filter(doc: &Document, filter: &Document) -> bool {
                     if let Bson::Array(arr) = value {
                         let mut any_match = false;
                         for cond in arr {
-                            if let Bson::Document(cond_doc) = cond {
-                                if document_matches_filter(doc, cond_doc) {
-                                    any_match = true;
-                                    break;
-                                }
+                            if let Bson::Document(cond_doc) = cond
+                                && document_matches_filter(doc, cond_doc)
+                            {
+                                any_match = true;
+                                break;
                             }
                         }
                         if !any_match {

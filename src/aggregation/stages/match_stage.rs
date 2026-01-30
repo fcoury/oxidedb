@@ -17,10 +17,10 @@ fn document_matches_filter(doc: &Document, filter: &Document) -> bool {
                 "$and" => {
                     if let Bson::Array(arr) = value {
                         for cond in arr {
-                            if let Bson::Document(cond_doc) = cond {
-                                if !document_matches_filter(doc, cond_doc) {
-                                    return false;
-                                }
+                            if let Bson::Document(cond_doc) = cond
+                                && !document_matches_filter(doc, cond_doc)
+                            {
+                                return false;
                             }
                         }
                     }
@@ -29,11 +29,11 @@ fn document_matches_filter(doc: &Document, filter: &Document) -> bool {
                     if let Bson::Array(arr) = value {
                         let mut any_match = false;
                         for cond in arr {
-                            if let Bson::Document(cond_doc) = cond {
-                                if document_matches_filter(doc, cond_doc) {
-                                    any_match = true;
-                                    break;
-                                }
+                            if let Bson::Document(cond_doc) = cond
+                                && document_matches_filter(doc, cond_doc)
+                            {
+                                any_match = true;
+                                break;
                             }
                         }
                         if !any_match {
@@ -42,10 +42,10 @@ fn document_matches_filter(doc: &Document, filter: &Document) -> bool {
                     }
                 }
                 "$not" => {
-                    if let Bson::Document(cond_doc) = value {
-                        if document_matches_filter(doc, cond_doc) {
-                            return false;
-                        }
+                    if let Bson::Document(cond_doc) = value
+                        && document_matches_filter(doc, cond_doc)
+                    {
+                        return false;
                     }
                 }
                 _ => {}
@@ -129,12 +129,11 @@ fn value_matches(doc_val: Option<&Bson>, filter_val: &Bson) -> bool {
                         }
                     }
                     "$nin" => {
-                        if let Bson::Array(arr) = op_val {
-                            if let Some(dv) = doc_val {
-                                if arr.contains(dv) {
-                                    return false;
-                                }
-                            }
+                        if let Bson::Array(arr) = op_val
+                            && let Some(dv) = doc_val
+                            && arr.contains(dv)
+                        {
+                            return false;
                         }
                     }
                     "$exists" => {

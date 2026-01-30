@@ -11,8 +11,7 @@ pub fn execute(docs: Vec<Document>, expr: &Bson) -> anyhow::Result<Vec<Document>
     for doc in &docs {
         let ctx = ExprEvalContext::new(doc.clone(), doc.clone());
         let expr_val = if let Bson::String(s) = expr {
-            if s.starts_with('$') {
-                let field_name = &s[1..];
+            if let Some(field_name) = s.strip_prefix('$') {
                 doc.get(field_name).cloned().unwrap_or(Bson::Null)
             } else {
                 Bson::String(s.clone())

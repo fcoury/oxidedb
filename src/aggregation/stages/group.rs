@@ -17,8 +17,7 @@ pub fn execute(
         // Compute the _id (group key)
         let group_id = if let Bson::String(s) = id {
             // Field reference like "$field"
-            if s.starts_with('$') {
-                let field_name = &s[1..];
+            if let Some(field_name) = s.strip_prefix('$') {
                 doc.get(field_name).cloned().unwrap_or(Bson::Null)
             } else {
                 // Literal string
@@ -48,31 +47,31 @@ pub fn execute(
                 });
 
             // Parse accumulator specification
-            if let Bson::Document(acc_doc) = acc_spec {
-                if let Some((acc_op, acc_val)) = acc_doc.iter().next() {
-                    state.acc_type = parse_accumulator_type(acc_op)?;
+            if let Bson::Document(acc_doc) = acc_spec
+                && let Some((acc_op, acc_val)) = acc_doc.iter().next()
+            {
+                state.acc_type = parse_accumulator_type(acc_op)?;
 
-                    // Evaluate the accumulator expression
-                    let expr = parse_expr(acc_val)?;
-                    let value = eval_expr(&expr, &ctx)?;
+                // Evaluate the accumulator expression
+                let expr = parse_expr(acc_val)?;
+                let value = eval_expr(&expr, &ctx)?;
 
-                    // Update accumulator state
-                    match state.acc_type {
-                        AccumulatorType::First => {
-                            if state.first_value.is_none() {
-                                state.first_value = Some(value);
-                            }
+                // Update accumulator state
+                match state.acc_type {
+                    AccumulatorType::First => {
+                        if state.first_value.is_none() {
+                            state.first_value = Some(value);
                         }
-                        AccumulatorType::Last => {
-                            state.last_value = Some(value);
-                        }
-                        AccumulatorType::Sum
-                        | AccumulatorType::Avg
-                        | AccumulatorType::Min
-                        | AccumulatorType::Max
-                        | AccumulatorType::Push => {
-                            state.values.push(value);
-                        }
+                    }
+                    AccumulatorType::Last => {
+                        state.last_value = Some(value);
+                    }
+                    AccumulatorType::Sum
+                    | AccumulatorType::Avg
+                    | AccumulatorType::Min
+                    | AccumulatorType::Max
+                    | AccumulatorType::Push => {
+                        state.values.push(value);
                     }
                 }
             }

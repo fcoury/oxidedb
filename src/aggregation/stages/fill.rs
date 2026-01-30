@@ -42,11 +42,8 @@ pub fn execute(docs: Vec<Document>, spec: &FillSpec) -> anyhow::Result<Vec<Docum
                 if !matches!(value, Bson::Null) {
                     last_value = Some(value.clone());
                 }
-            } else {
-                // Field is missing - fill it
-                if let Some(ref last) = last_value {
-                    doc.insert(field.clone(), last.clone());
-                }
+            } else if let Some(ref last) = last_value {
+                doc.insert(field.clone(), last.clone());
             }
         }
 
@@ -57,10 +54,8 @@ pub fn execute(docs: Vec<Document>, spec: &FillSpec) -> anyhow::Result<Vec<Docum
                 if !matches!(value, Bson::Null) {
                     last_value = Some(value.clone());
                 }
-            } else {
-                if let Some(ref last) = last_value {
-                    doc.insert(field.clone(), last.clone());
-                }
+            } else if let Some(ref last) = last_value {
+                doc.insert(field.clone(), last.clone());
             }
         }
     }

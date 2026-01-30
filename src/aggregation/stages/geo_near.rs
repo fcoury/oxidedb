@@ -129,15 +129,15 @@ pub async fn execute(
         };
 
         // Apply min/max distance filters
-        if let Some(min) = spec.min_distance {
-            if distance < min {
-                continue;
-            }
+        if let Some(min) = spec.min_distance
+            && distance < min
+        {
+            continue;
         }
-        if let Some(max) = spec.max_distance {
-            if distance > max {
-                continue;
-            }
+        if let Some(max) = spec.max_distance
+            && distance > max
+        {
+            continue;
         }
 
         docs_with_distance.push((doc, distance));
@@ -161,12 +161,11 @@ pub async fn execute(
         doc.insert(&spec.distance_field, Bson::Double(final_distance));
 
         // Add location field if requested
-        if let Some(ref include_locs) = spec.include_locs {
-            if let Some(ref key) = spec.key {
-                if let Some(loc) = doc.get(key) {
-                    doc.insert(include_locs, loc.clone());
-                }
-            }
+        if let Some(ref include_locs) = spec.include_locs
+            && let Some(ref key) = spec.key
+            && let Some(loc) = doc.get(key)
+        {
+            doc.insert(include_locs, loc.clone());
         }
 
         result.push(doc);

@@ -96,10 +96,10 @@ pub fn execute(docs: Vec<Document>, spec: &Document) -> anyhow::Result<Vec<Docum
             }
 
             // If _id not specified, include it by default
-            if id_spec.is_none() {
-                if let Some(id) = doc.get("_id") {
-                    projected.insert("_id", id.clone());
-                }
+            if id_spec.is_none()
+                && let Some(id) = doc.get("_id")
+            {
+                projected.insert("_id", id.clone());
             }
         }
 

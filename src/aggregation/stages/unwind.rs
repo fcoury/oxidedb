@@ -9,8 +9,8 @@ pub fn execute(
     let mut result = Vec::new();
 
     // Remove leading $ from path if present
-    let field_path = if path.starts_with('$') {
-        &path[1..]
+    let field_path = if let Some(stripped) = path.strip_prefix('$') {
+        stripped
     } else {
         path
     };

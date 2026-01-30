@@ -75,8 +75,8 @@ pub fn execute(docs: Vec<Document>, spec: &SetWindowFieldsSpec) -> anyhow::Resul
         if let Bson::Document(window_doc) = &window_spec {
             // Parse window function
             if let Some((func_name, func_expr)) = window_doc.iter().next() {
-                let window_field = if func_name.starts_with('$') {
-                    &func_name[1..]
+                let window_field = if let Some(stripped) = func_name.strip_prefix('$') {
+                    stripped
                 } else {
                     func_name.as_str()
                 };

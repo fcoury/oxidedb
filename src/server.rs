@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 /// Specification for $bucket aggregation stage
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct BucketSpec {
     group_by: String,
     boundaries: Vec<bson::Bson>,
@@ -2348,6 +2349,7 @@ fn cmp<F: Fn(f64, f64) -> bool>(a: &bson::Bson, b: &bson::Bson, f: F) -> bool {
     }
 }
 
+#[allow(dead_code)]
 fn cmp_multi(a: &Document, b: &Document, spec: &Document) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     for (k, v) in spec.iter() {
@@ -2373,6 +2375,7 @@ fn cmp_multi(a: &Document, b: &Document, spec: &Document) -> std::cmp::Ordering 
     Ordering::Equal
 }
 
+#[allow(dead_code)]
 fn cmp_bson_opt(a: &Option<bson::Bson>, b: &Option<bson::Bson>) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (a, b) {
@@ -2383,6 +2386,7 @@ fn cmp_bson_opt(a: &Option<bson::Bson>, b: &Option<bson::Bson>) -> std::cmp::Ord
     }
 }
 
+#[allow(dead_code)]
 fn cmp_bson(a: &bson::Bson, b: &bson::Bson) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     // Numeric compare if both numeric
@@ -2405,10 +2409,12 @@ fn cmp_bson(a: &bson::Bson, b: &bson::Bson) -> std::cmp::Ordering {
     }
 }
 
+#[allow(dead_code)]
 fn key_repr(v: &bson::Bson) -> String {
     format!("{:?}", v)
 }
 
+#[allow(dead_code)]
 fn apply_group(docs: &[Document], spec: &Document) -> Vec<Document> {
     use std::collections::HashMap;
     #[derive(Clone)]
@@ -2605,6 +2611,7 @@ fn apply_group(docs: &[Document], spec: &Document) -> Vec<Document> {
 }
 
 /// Apply $bucket aggregation stage
+#[allow(dead_code)]
 fn apply_bucket(docs: &[Document], spec: &BucketSpec) -> Vec<Document> {
     use std::collections::HashMap;
 
@@ -2912,6 +2919,7 @@ fn apply_bucket(docs: &[Document], spec: &BucketSpec) -> Vec<Document> {
 }
 
 use crate::error::Error;
+#[allow(dead_code)]
 async fn apply_lookup(
     db: &str,
     pg: &crate::store::PgStore,
@@ -2959,6 +2967,7 @@ async fn apply_lookup(
 
 /// Execute a sub-pipeline for $facet stage
 /// Supports: $match, $sort, $limit, $skip, $project, $addFields/$set, $unwind, $group
+#[allow(dead_code)]
 fn execute_sub_pipeline(
     docs: Vec<Document>,
     pipeline: &[bson::Bson],
@@ -3660,6 +3669,7 @@ async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> 
     }
 }
 
+#[allow(dead_code)]
 async fn handle_out_stage(
     state: &AppState,
     dbname: &str,
@@ -3724,6 +3734,7 @@ async fn handle_out_stage(
     doc! { "ok": 1.0, "nInserted": inserted_count }
 }
 
+#[allow(dead_code)]
 async fn handle_merge_stage(
     state: &AppState,
     dbname: &str,

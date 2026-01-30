@@ -22,17 +22,17 @@ pub fn execute(docs: Vec<Document>, spec: &DensifySpec) -> anyhow::Result<Vec<Do
         // Fill in missing values (simplified - just forward fill)
         let mut last_value: Option<Bson> = None;
         for doc in &mut result {
-            if let Some(value) = doc.get(field) {
-                if !matches!(value, Bson::Null) {
-                    last_value = Some(value.clone());
-                }
+            if let Some(value) = doc.get(field)
+                && !matches!(value, Bson::Null)
+            {
+                last_value = Some(value.clone());
             }
 
             // If field is missing or null, fill it
-            if !doc.contains_key(field) || matches!(doc.get(field), Some(Bson::Null)) {
-                if let Some(ref last) = last_value {
-                    doc.insert(field.clone(), last.clone());
-                }
+            if (!doc.contains_key(field) || matches!(doc.get(field), Some(Bson::Null)))
+                && let Some(ref last) = last_value
+            {
+                doc.insert(field.clone(), last.clone());
             }
         }
     }

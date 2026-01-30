@@ -72,13 +72,14 @@ pub async fn execute_pipeline(
 
     for stage in pipeline.stages {
         // Fetch collection if not yet fetched and this is not a $match stage
-        if !main_coll_fetched && !matches!(stage, Stage::Match(_)) {
-            if let Some(pg) = ctx.pg {
-                docs = pg
-                    .find_docs(&ctx.db, &ctx.coll, None, None, None, 100_000)
-                    .await?;
-                main_coll_fetched = true;
-            }
+        if !main_coll_fetched
+            && !matches!(stage, Stage::Match(_))
+            && let Some(pg) = ctx.pg
+        {
+            docs = pg
+                .find_docs(&ctx.db, &ctx.coll, None, None, None, 100_000)
+                .await?;
+            main_coll_fetched = true;
         }
 
         match stage {
