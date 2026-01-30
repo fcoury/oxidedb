@@ -1,0 +1,31 @@
+[book]
+authors = ["OxideDB Contributors"]
+language = "en"
+src = "src"
+title = "OxideDB Documentation"
+description = "A MongoDB-compatible database powered by PostgreSQL"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[preprocessor.links]
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/fcoury/oxidedb"
+
+edit-url-template = "https://github.com/fcoury/oxidedb/edit/master/docs/book/{path}"
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true
+limit-results = 30
+teaser-word-count = 30
+
+[output.linkcheck]
+optional = true

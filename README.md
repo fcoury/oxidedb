@@ -2,17 +2,53 @@
 
 A minimal MongoDB wire-protocol server that executes a subset of MongoDB commands and stores data on PostgreSQL (jsonb). It also includes a shadowing mode that forwards each incoming MongoDB request to a real MongoDB (e.g., 7.0) to compare responses for protocol/semantic compatibility.
 
+**📚 Full documentation is available in the [mdBook](https://opencode.ai/oxidedb/docs/).**
+
 Status: early, evolving. Useful for experimentation, compatibility exploration, and growing test coverage.
+
+## Documentation
+
+For comprehensive documentation including architecture, API reference, configuration, and examples, visit the **[OxideDB mdBook](https://opencode.ai/oxidedb/docs/)**.
+
+The mdBook covers:
+- Getting started guide
+- Complete feature reference
+- Configuration options
+- Query operators and aggregation pipeline
+- Transactions and authentication
+- Shadowing mode details
+- Troubleshooting and FAQ
 
 ## Features
 
-- MongoDB wire protocol
+- **MongoDB Wire Protocol**
   - OP_MSG and legacy OP_QUERY request handling
+  - OP_COMPRESSED support (decompression)
   - Basic commands: `hello`/`ismaster`, `ping`, `buildInfo`, `listDatabases`, `listCollections`, `serverStatus`, `create`, `drop`, `dropDatabase`, `insert`, `find`, `getMore`, `createIndexes`, `dropIndexes`, `killCursors`
-- Storage (optional)
+
+- **Query Operators**
+  - Comparison: `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`
+  - Logical: `$and`, `$or`, `$not`, `$nor`
+  - Element: `$exists`, `$type`
+  - Evaluation: `$regex`, `$mod`, `$where`
+  - Array: `$all`, `$size`, `$elemMatch`
+  - Bitwise: `$bitsAllSet`, `$bitsAnySet`, `$bitsAllClear`, `$bitsAnyClear`
+
+- **Aggregation Pipeline**
+  - Stages: `$match`, `$project`, `$group`, `$sort`, `$limit`, `$skip`, `$unwind`, `$sample`, `$lookup`, `$facet`, `$bucket`, `$bucketAuto`, `$unionWith`, `$replaceRoot`, `$replaceWith`
+  - Accumulators: `$sum`, `$avg`, `$min`, `$max`, `$push`, `$addToSet`, `$first`, `$last`, `$stdDevPop`, `$stdDevSamp`
+  - Expression operators: arithmetic, string, date, array, conditional, comparison
+
+- **Storage**
   - PostgreSQL jsonb backend (indexes persisted in metadata tables)
   - Cursor TTL with periodic sweeper
-- Shadowing (optional)
+  - Multi-document ACID transactions
+
+- **Security**
+  - TLS/SSL support for encrypted connections
+  - SCRAM-SHA-256 authentication
+
+- **Shadowing (optional)**
   - Forwards original wire bytes to a real MongoDB (default: 7.0) and compares replies
   - Wire-compatible forwarding (OP_MSG stays OP_MSG; OP_QUERY stays OP_QUERY)
   - Safe by default: logs mismatches only; does not affect client responses
