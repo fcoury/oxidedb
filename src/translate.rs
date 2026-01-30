@@ -277,32 +277,30 @@ pub fn build_where_from_filter_internal(filter: &bson::Document, is_nested: bool
                         }
                         "$geoWithin" => {
                             if let bson::Bson::Document(gw) = val {
+                                // Use raw field key (k) instead of JSONPath for geo functions
+                                let field_key = k;
                                 if let Some(geom) = gw.get("$geometry") {
                                     // GeoJSON format
                                     if let bson::Bson::Document(geom_doc) = geom {
                                         if let Some(geom_type) = geom_doc.get_str("type").ok() {
                                             if let Ok(coords) = geom_doc.get_array("coordinates") {
                                                 let clause = build_geo_within_clause(
-                                                    &path, geom_type, coords,
+                                                    field_key, geom_type, coords,
                                                 );
                                                 where_clauses.push(clause);
                                             }
                                         }
                                     }
-                                } else if let Some(bson::Bson::Document(box_doc)) = gw.get("$box") {
+                                } else if let Some(bson::Bson::Array(box_coords)) = gw.get("$box") {
                                     // Legacy $box format
-                                    if let Ok(box_coords) = box_doc.get_array("$box") {
-                                        let clause = build_geo_box_clause(&path, box_coords);
-                                        where_clauses.push(clause);
-                                    }
-                                } else if let Some(bson::Bson::Document(poly_doc)) =
+                                    let clause = build_geo_box_clause(field_key, box_coords);
+                                    where_clauses.push(clause);
+                                } else if let Some(bson::Bson::Array(poly_coords)) =
                                     gw.get("$polygon")
                                 {
                                     // Legacy $polygon format
-                                    if let Ok(poly_coords) = poly_doc.get_array("$polygon") {
-                                        let clause = build_geo_polygon_clause(&path, poly_coords);
-                                        where_clauses.push(clause);
-                                    }
+                                    let clause = build_geo_polygon_clause(field_key, poly_coords);
+                                    where_clauses.push(clause);
                                 }
                             }
                         }
@@ -357,8 +355,9 @@ pub fn build_where_from_filter_internal(filter: &bson::Document, is_nested: bool
                                         near_doc.get_i64("$maxDistance").ok().map(|v| v as f64)
                                     });
 
+                                // Use raw field key (k) instead of JSONPath
                                 let clause = build_near_clause(
-                                    &path,
+                                    k,
                                     near_lon,
                                     near_lat,
                                     max_distance,
@@ -873,18 +872,60 @@ fn translate_substr(val: &bson::Bson) -> Option<String> {
 
 // --- Geospatial query helper functions ---
 
+/// Build SQL JSONB field access path from a field key (supports dotted notation)
+/// Input: "location" or "location.coordinates"
+/// Output: "doc->'location'" or "doc->'location'->'coordinates'"
+fn build_jsonb_field_path(field_key: &str) -> String {
+    let parts: Vec<&str> = field_key.split('.').collect();
+    if parts.is_empty() {
+        return "doc".to_string();
+    }
+
+    let mut path = String::from("doc");
+    for part in parts {
+        let escaped = part.replace('\'', "''");
+        path.push_str(&format!("->'{}'", escaped));
+    }
+    path
+}
+
+/// Build SQL JSONB path for jsonb_path_exists (for nested field access)
+/// Input: "location" or "location.coordinates"
+/// Output: "$.location" or "$.location.coordinates"
+fn build_jsonpath(field_key: &str) -> String {
+    let parts: Vec<&str> = field_key.split('.').collect();
+    if parts.is_empty() {
+        return "$".to_string();
+    }
+
+    let mut path = String::from("$");
+    for part in parts {
+        let escaped = part.replace('"', "\\\"");
+        path.push_str(&format!(".\"{}\"", escaped));
+    }
+    path
+}
+
 /// Build SQL clause for $geoWithin with GeoJSON geometry
-fn build_geo_within_clause(path: &str, geom_type: &str, coords: &bson::Array) -> String {
-    let escaped_path = escape_single(path.trim_start_matches("$"));
+fn build_geo_within_clause(field_key: &str, geom_type: &str, coords: &bson::Array) -> String {
+    let jsonb_path = build_jsonb_field_path(field_key);
 
     match geom_type {
         "Polygon" => {
             // Extract bounding box from polygon coordinates
             if let Some(outer_ring) = coords.first().and_then(|r| r.as_array()) {
                 let (min_lon, max_lon, min_lat, max_lat) = extract_bounding_box(outer_ring);
+                // Use correct JSONB array syntax: ->>index extracts array element as text
                 format!(
-                    "jsonb_path_exists(doc, '$.\"{}\".coordinates ? (@[0] >= {} && @[0] <= {} && @[1] >= {} && @[1] <= {})')",
-                    escaped_path, min_lon, max_lon, min_lat, max_lat
+                    "({}->'coordinates'->>0)::float8 >= {} AND ({}->'coordinates'->>0)::float8 <= {} AND ({}->'coordinates'->>1)::float8 >= {} AND ({}->'coordinates'->>1)::float8 <= {}",
+                    jsonb_path,
+                    min_lon,
+                    jsonb_path,
+                    max_lon,
+                    jsonb_path,
+                    min_lat,
+                    jsonb_path,
+                    max_lat
                 )
             } else {
                 "FALSE".to_string()
@@ -897,8 +938,8 @@ fn build_geo_within_clause(path: &str, geom_type: &str, coords: &bson::Array) ->
                 if let Some(outer_ring) = poly.first().and_then(|r| r.as_array()) {
                     let (min_lon, max_lon, min_lat, max_lat) = extract_bounding_box(outer_ring);
                     clauses.push(format!(
-                        "jsonb_path_exists(doc, '$.\"{}\".coordinates ? (@[0] >= {} && @[0] <= {} && @[1] >= {} && @[1] <= {})')",
-                        escaped_path, min_lon, max_lon, min_lat, max_lat
+                        "(({}->'coordinates'->>0)::float8 >= {} AND ({}->'coordinates'->>0)::float8 <= {} AND ({}->'coordinates'->>1)::float8 >= {} AND ({}->'coordinates'->>1)::float8 <= {})",
+                        jsonb_path, min_lon, jsonb_path, max_lon, jsonb_path, min_lat, jsonb_path, max_lat
                     ));
                 }
             }
@@ -913,8 +954,8 @@ fn build_geo_within_clause(path: &str, geom_type: &str, coords: &bson::Array) ->
 }
 
 /// Build SQL clause for legacy $box operator
-fn build_geo_box_clause(path: &str, box_coords: &bson::Array) -> String {
-    let escaped_path = escape_single(path.trim_start_matches("$"));
+fn build_geo_box_clause(field_key: &str, box_coords: &bson::Array) -> String {
+    let jsonb_path = build_jsonb_field_path(field_key);
 
     if box_coords.len() >= 2 {
         let bottom_left = box_coords[0].as_array();
@@ -940,8 +981,15 @@ fn build_geo_box_clause(path: &str, box_coords: &bson::Array) -> String {
                     .unwrap_or(0.0);
 
                 return format!(
-                    "jsonb_path_exists(doc, '$.\"{}\".coordinates ? (@[0] >= {} && @[0] <= {} && @[1] >= {} && @[1] <= {})')",
-                    escaped_path, min_lon, max_lon, min_lat, max_lat
+                    "({}->'coordinates'->>0)::float8 >= {} AND ({}->'coordinates'->>0)::float8 <= {} AND ({}->'coordinates'->>1)::float8 >= {} AND ({}->'coordinates'->>1)::float8 <= {}",
+                    jsonb_path,
+                    min_lon,
+                    jsonb_path,
+                    max_lon,
+                    jsonb_path,
+                    min_lat,
+                    jsonb_path,
+                    max_lat
                 );
             }
         }
@@ -950,23 +998,16 @@ fn build_geo_box_clause(path: &str, box_coords: &bson::Array) -> String {
 }
 
 /// Build SQL clause for legacy $polygon operator
-fn build_geo_polygon_clause(path: &str, poly_coords: &bson::Array) -> String {
+fn build_geo_polygon_clause(field_key: &str, poly_coords: &bson::Array) -> String {
     // Compute bounding box from all polygon vertices
-    let escaped_path = escape_single(path.trim_start_matches("$"));
+    let jsonb_path = build_jsonb_field_path(field_key);
     let (min_lon, max_lon, min_lat, max_lat) = extract_bounding_box(poly_coords);
 
     // Check if we got valid bounds
     if min_lon <= max_lon && min_lat <= max_lat {
         return format!(
-            "(doc->'{}'->'coordinates'->>0)::float >= {} AND (doc->'{}'->'coordinates'->>0)::float <= {} AND (doc->'{}'->'coordinates'->>1)::float >= {} AND (doc->'{}'->'coordinates'->>1)::float <= {}",
-            escaped_path,
-            min_lon,
-            escaped_path,
-            max_lon,
-            escaped_path,
-            min_lat,
-            escaped_path,
-            max_lat
+            "({}->'coordinates'->>0)::float8 >= {} AND ({}->'coordinates'->>0)::float8 <= {} AND ({}->'coordinates'->>1)::float8 >= {} AND ({}->'coordinates'->>1)::float8 <= {}",
+            jsonb_path, min_lon, jsonb_path, max_lon, jsonb_path, min_lat, jsonb_path, max_lat
         );
     }
     "FALSE".to_string()
@@ -974,46 +1015,44 @@ fn build_geo_polygon_clause(path: &str, poly_coords: &bson::Array) -> String {
 
 /// Build SQL clause for $near/$nearSphere operators
 fn build_near_clause(
-    path: &str,
+    field_key: &str,
     near_lon: f64,
     near_lat: f64,
     max_distance: Option<f64>,
     spherical: bool,
 ) -> String {
-    let escaped_path = escape_single(path.trim_start_matches("$"));
+    let jsonb_path = build_jsonb_field_path(field_key);
+    let jsonpath = build_jsonpath(field_key);
 
     // Build distance calculation expression
     let distance_expr = if spherical {
         // Haversine distance in meters
         format!(
             "6371000 * acos(
-                cos(radians({})) * cos(radians((doc->'{}'->'coordinates'->>1)::double precision)) *
-                cos(radians((doc->'{}'->'coordinates'->>0)::double precision) - radians({})) +
-                sin(radians({})) * sin(radians((doc->'{}'->'coordinates'->>1)::double precision))
+                cos(radians({})) * cos(radians(({}->'coordinates'->>1)::double precision)) *
+                cos(radians(({}->'coordinates'->>0)::double precision) - radians({})) +
+                sin(radians({})) * sin(radians(({}->'coordinates'->>1)::double precision))
             )",
-            near_lat, escaped_path, escaped_path, near_lon, near_lat, escaped_path
+            near_lat, jsonb_path, jsonb_path, near_lon, near_lat, jsonb_path
         )
     } else {
         // Simple Euclidean distance
         format!(
             "sqrt(
-                power((doc->'{}'->'coordinates'->>0)::double precision - {}, 2) +
-                power((doc->'{}'->'coordinates'->>1)::double precision - {}, 2)
+                power(({}->'coordinates'->>0)::double precision - {}, 2) +
+                power(({}->'coordinates'->>1)::double precision - {}, 2)
             )",
-            escaped_path, near_lon, escaped_path, near_lat
+            jsonb_path, near_lon, jsonb_path, near_lat
         )
     };
 
     // Build the complete clause
     let mut clauses = vec![
         format!(
-            "jsonb_path_exists(doc, '$.\"{}\".type ? (@ == \"Point\")')",
-            escaped_path
+            "jsonb_path_exists(doc, '{}.type ? (@ == \"Point\")')",
+            jsonpath
         ),
-        format!(
-            "jsonb_path_exists(doc, '$.\"{}\".coordinates')",
-            escaped_path
-        ),
+        format!("jsonb_path_exists(doc, '{}.coordinates')", jsonpath),
     ];
 
     if let Some(max_dist) = max_distance {

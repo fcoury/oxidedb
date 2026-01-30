@@ -2561,7 +2561,7 @@ fn build_geo_within_clause(field: &str, geom_type: &str, coords: &bson::Array) -
                 let (min_lon, max_lon, min_lat, max_lat) = extract_bounding_box_bson(outer_ring);
                 // Use direct JSONB extraction for better compatibility
                 format!(
-                    "(doc->'{}'->'coordinates'->>0)::float >= {} AND (doc->'{}'->'coordinates'->>0)::float <= {} AND (doc->'{}'->'coordinates'->>1)::float >= {} AND (doc->'{}'->'coordinates'->>1)::float <= {}",
+                    "(doc->'{}'->'coordinates'->>0)::float8 >= {} AND (doc->'{}'->'coordinates'->>0)::float8 <= {} AND (doc->'{}'->'coordinates'->>1)::float8 >= {} AND (doc->'{}'->'coordinates'->>1)::float8 <= {}",
                     field, min_lon, field, max_lon, field, min_lat, field, max_lat
                 )
             } else {
@@ -2576,7 +2576,7 @@ fn build_geo_within_clause(field: &str, geom_type: &str, coords: &bson::Array) -
                     let (min_lon, max_lon, min_lat, max_lat) =
                         extract_bounding_box_bson(outer_ring);
                     clauses.push(format!(
-                        "((doc->'{}'->'coordinates'->>0)::float >= {} AND (doc->'{}'->'coordinates'->>0)::float <= {} AND (doc->'{}'->'coordinates'->>1)::float >= {} AND (doc->'{}'->'coordinates'->>1)::float <= {})",
+                        "((doc->'{}'->'coordinates'->>0)::float8 >= {} AND (doc->'{}'->'coordinates'->>0)::float8 <= {} AND (doc->'{}'->'coordinates'->>1)::float8 >= {} AND (doc->'{}'->'coordinates'->>1)::float8 <= {})",
                         field, min_lon, field, max_lon, field, min_lat, field, max_lat
                     ));
                 }
@@ -2617,7 +2617,7 @@ fn build_geo_box_clause(field: &str, box_coords: &bson::Array) -> String {
                     .unwrap_or(0.0);
 
                 return format!(
-                    "(doc->'{}'->'coordinates'->>0)::float >= {} AND (doc->'{}'->'coordinates'->>0)::float <= {} AND (doc->'{}'->'coordinates'->>1)::float >= {} AND (doc->'{}'->'coordinates'->>1)::float <= {}",
+                    "(doc->'{}'->'coordinates'->>0)::float8 >= {} AND (doc->'{}'->'coordinates'->>0)::float8 <= {} AND (doc->'{}'->'coordinates'->>1)::float8 >= {} AND (doc->'{}'->'coordinates'->>1)::float8 <= {}",
                     field, min_lon, field, max_lon, field, min_lat, field, max_lat
                 );
             }
@@ -2634,7 +2634,7 @@ fn build_geo_polygon_clause(field: &str, poly_coords: &bson::Array) -> String {
     // Check if we got valid bounds (not the initial MAX/MIN values)
     if min_lon <= max_lon && min_lat <= max_lat {
         return format!(
-            "(doc->'{}'->'coordinates'->>0)::float >= {} AND (doc->'{}'->'coordinates'->>0)::float <= {} AND (doc->'{}'->'coordinates'->>1)::float >= {} AND (doc->'{}'->'coordinates'->>1)::float <= {}",
+            "(doc->'{}'->'coordinates'->>0)::float8 >= {} AND (doc->'{}'->'coordinates'->>0)::float8 <= {} AND (doc->'{}'->'coordinates'->>1)::float8 >= {} AND (doc->'{}'->'coordinates'->>1)::float8 <= {}",
             field, min_lon, field, max_lon, field, min_lat, field, max_lat
         );
     }
@@ -2655,7 +2655,7 @@ fn build_near_clause(
         // 1 degree of latitude is approximately 111km
         let max_dist_degrees = max_dist / 111000.0;
         format!(
-            "(doc->'{}'->'coordinates'->>0)::float >= {} AND (doc->'{}'->'coordinates'->>0)::float <= {} AND (doc->'{}'->'coordinates'->>1)::float >= {} AND (doc->'{}'->'coordinates'->>1)::float <= {}",
+            "(doc->'{}'->'coordinates'->>0)::float8 >= {} AND (doc->'{}'->'coordinates'->>0)::float8 <= {} AND (doc->'{}'->'coordinates'->>1)::float8 >= {} AND (doc->'{}'->'coordinates'->>1)::float8 <= {}",
             field,
             near_lon - max_dist_degrees,
             field,
@@ -2667,7 +2667,7 @@ fn build_near_clause(
         )
     } else {
         format!(
-            "(doc->'{}'->'coordinates'->>0)::float >= {} AND (doc->'{}'->'coordinates'->>0)::float <= {} AND (doc->'{}'->'coordinates'->>1)::float >= {} AND (doc->'{}'->'coordinates'->>1)::float <= {}",
+            "(doc->'{}'->'coordinates'->>0)::float8 >= {} AND (doc->'{}'->'coordinates'->>0)::float8 <= {} AND (doc->'{}'->'coordinates'->>1)::float8 >= {} AND (doc->'{}'->'coordinates'->>1)::float8 <= {}",
             field,
             near_lon - 1.0,
             field,

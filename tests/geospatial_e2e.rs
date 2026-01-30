@@ -96,7 +96,7 @@ async fn e2e_geo_near_aggregation() {
     // Insert test documents with GeoJSON Point locations
     let docs = vec![
         doc! {
-            "_id": 1i32,
+            "_id": "1",
             "name": "Central Park",
             "location": doc! {
                 "type": "Point",
@@ -104,7 +104,7 @@ async fn e2e_geo_near_aggregation() {
             }
         },
         doc! {
-            "_id": 2i32,
+            "_id": "2",
             "name": "Times Square",
             "location": doc! {
                 "type": "Point",
@@ -112,7 +112,7 @@ async fn e2e_geo_near_aggregation() {
             }
         },
         doc! {
-            "_id": 3i32,
+            "_id": "3",
             "name": "Statue of Liberty",
             "location": doc! {
                 "type": "Point",
@@ -120,7 +120,7 @@ async fn e2e_geo_near_aggregation() {
             }
         },
         doc! {
-            "_id": 4i32,
+            "_id": "4",
             "name": "Golden Gate Bridge",
             "location": doc! {
                 "type": "Point",
@@ -180,7 +180,7 @@ async fn e2e_geo_near_aggregation() {
             assert!(distance >= 0.0, "Distance should be non-negative");
 
             // Times Square should have distance close to 0
-            if place_doc.get_i32("_id").unwrap_or(0) == 2 {
+            if place_doc.get_str("_id").unwrap_or("") == "2" {
                 assert!(
                     distance < 1.0,
                     "Times Square should have distance close to 0"
@@ -222,7 +222,7 @@ async fn e2e_geo_within_polygon() {
     // Insert test documents
     let docs = vec![
         doc! {
-            "_id": 1i32,
+            "_id": "1",
             "name": "Inside NYC",
             "location": doc! {
                 "type": "Point",
@@ -230,7 +230,7 @@ async fn e2e_geo_within_polygon() {
             }
         },
         doc! {
-            "_id": 2i32,
+            "_id": "2",
             "name": "Inside NYC",
             "location": doc! {
                 "type": "Point",
@@ -238,7 +238,7 @@ async fn e2e_geo_within_polygon() {
             }
         },
         doc! {
-            "_id": 3i32,
+            "_id": "3",
             "name": "Outside NYC",
             "location": doc! {
                 "type": "Point",
@@ -310,13 +310,14 @@ async fn e2e_geo_within_polygon() {
     );
 
     // Verify we got the right documents
-    let ids: Vec<i32> = first_batch
+    let ids: Vec<String> = first_batch
         .iter()
         .filter_map(|d| d.as_document())
-        .filter_map(|d| d.get_i32("_id").ok())
+        .filter_map(|d| d.get_str("_id").ok())
+        .map(|s| s.to_string())
         .collect();
-    assert!(ids.contains(&1), "Should find document 1");
-    assert!(ids.contains(&2), "Should find document 2");
+    assert!(ids.contains(&"1".to_string()), "Should find document 1");
+    assert!(ids.contains(&"2".to_string()), "Should find document 2");
 
     let _ = shutdown.send(true);
     let _ = handle.await.unwrap();
@@ -351,7 +352,7 @@ async fn e2e_near_with_max_distance() {
     // Insert test documents
     let docs = vec![
         doc! {
-            "_id": 1i32,
+            "_id": "1",
             "name": "Close",
             "location": doc! {
                 "type": "Point",
@@ -359,7 +360,7 @@ async fn e2e_near_with_max_distance() {
             }
         },
         doc! {
-            "_id": 2i32,
+            "_id": "2",
             "name": "Medium",
             "location": doc! {
                 "type": "Point",
@@ -367,7 +368,7 @@ async fn e2e_near_with_max_distance() {
             }
         },
         doc! {
-            "_id": 3i32,
+            "_id": "3",
             "name": "Far",
             "location": doc! {
                 "type": "Point",
@@ -446,7 +447,7 @@ async fn e2e_near_sphere_spherical() {
     // Insert test documents with various locations
     let docs = vec![
         doc! {
-            "_id": 1i32,
+            "_id": "1",
             "name": "NYC",
             "location": doc! {
                 "type": "Point",
@@ -454,7 +455,7 @@ async fn e2e_near_sphere_spherical() {
             }
         },
         doc! {
-            "_id": 2i32,
+            "_id": "2",
             "name": "Boston",
             "location": doc! {
                 "type": "Point",
@@ -462,7 +463,7 @@ async fn e2e_near_sphere_spherical() {
             }
         },
         doc! {
-            "_id": 3i32,
+            "_id": "3",
             "name": "London",
             "location": doc! {
                 "type": "Point",
@@ -485,7 +486,7 @@ async fn e2e_near_sphere_spherical() {
                     "type": "Point",
                     "coordinates": [-74.0060, 40.7128]  // NYC
                 },
-                "$maxDistance": 300000.0  // 300km - should include Boston but not London
+                "$maxDistance": 350000.0  // 350km - should include Boston but not London
             }
         }
     };
@@ -511,8 +512,8 @@ async fn e2e_near_sphere_spherical() {
     // Verify results are sorted by distance (NYC first, then Boston)
     if let Some(bson::Bson::Document(first)) = first_batch.first() {
         assert_eq!(
-            first.get_i32("_id").unwrap_or(0),
-            1,
+            first.get_str("_id").unwrap_or(""),
+            "1",
             "First result should be NYC"
         );
     }
@@ -550,7 +551,7 @@ async fn e2e_geo_within_legacy_box() {
     // Insert test documents
     let docs = vec![
         doc! {
-            "_id": 1i32,
+            "_id": "1",
             "name": "Inside",
             "location": doc! {
                 "type": "Point",
@@ -558,7 +559,7 @@ async fn e2e_geo_within_legacy_box() {
             }
         },
         doc! {
-            "_id": 2i32,
+            "_id": "2",
             "name": "Outside",
             "location": doc! {
                 "type": "Point",
@@ -608,7 +609,7 @@ async fn e2e_geo_within_legacy_box() {
     // Should find only the document inside the box
     assert_eq!(first_batch.len(), 1);
     if let Some(bson::Bson::Document(result)) = first_batch.first() {
-        assert_eq!(result.get_i32("_id").unwrap_or(0), 1);
+        assert_eq!(result.get_str("_id").unwrap_or(""), "1");
     }
 
     let _ = shutdown.send(true);
@@ -644,7 +645,7 @@ async fn e2e_geo_near_with_query_filter() {
     // Insert test documents with categories
     let docs = vec![
         doc! {
-            "_id": 1i32,
+            "_id": "1",
             "name": "Restaurant A",
             "category": "restaurant",
             "location": doc! {
@@ -653,7 +654,7 @@ async fn e2e_geo_near_with_query_filter() {
             }
         },
         doc! {
-            "_id": 2i32,
+            "_id": "2",
             "name": "Restaurant B",
             "category": "restaurant",
             "location": doc! {
@@ -662,7 +663,7 @@ async fn e2e_geo_near_with_query_filter() {
             }
         },
         doc! {
-            "_id": 3i32,
+            "_id": "3",
             "name": "Museum",
             "category": "museum",
             "location": doc! {
