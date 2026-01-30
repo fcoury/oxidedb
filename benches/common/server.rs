@@ -1,7 +1,6 @@
 use oxidedb::config::Config;
 use oxidedb::server::spawn_with_shutdown;
 use std::net::SocketAddr;
-use tokio::net::TcpStream;
 
 use super::postgres::TestDb;
 
@@ -62,10 +61,6 @@ impl BenchServer {
 
     pub fn dbname(&self) -> &str {
         &self.testdb.dbname
-    }
-
-    pub async fn connect(&self) -> TcpStream {
-        TcpStream::connect(self.addr).await.unwrap()
     }
 }
 
