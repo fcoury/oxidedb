@@ -1,0 +1,33 @@
+pub mod add_fields;
+pub mod bucket;
+pub mod bucket_auto;
+pub mod count;
+pub mod densify;
+pub mod facet;
+pub mod fill;
+pub mod geo_near;
+pub mod group;
+pub mod limit;
+pub mod lookup;
+pub mod match_stage;
+pub mod merge;
+pub mod out;
+pub mod project;
+pub mod redact;
+pub mod replace_root;
+pub mod sample;
+pub mod set;
+pub mod set_window_fields;
+pub mod skip;
+pub mod sort;
+pub mod sort_by_count;
+pub mod union_with;
+pub mod unset;
+pub mod unwind;
+
+// Re-export stage specs
+pub use densify::DensifySpec;
+pub use fill::FillSpec;
+pub use geo_near::GeoNearSpec;
+pub use merge::MergeSpec;
+pub use set_window_fields::SetWindowFieldsSpec;

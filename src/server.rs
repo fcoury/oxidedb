@@ -9,7 +9,7 @@ use crate::session::{
 use crate::shadow::{ShadowSession, compare_docs};
 use crate::store::PgStore;
 use bson::{Document, doc};
-use rand::seq::SliceRandom;
+
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3562,916 +3562,95 @@ async fn delete_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
 }
 
 async fn aggregate_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Document {
-    let dbname = match db {
-        Some(d) => d,
-        None => return error_doc(59, "Missing $db"),
+    // Extract database name from $db field or use the db parameter
+    let dbname = match cmd.get_str("$db") {
+        Ok(d) => d.to_string(),
+        Err(_) => match db {
+            Some(d) => d.to_string(),
+            None => return error_doc(59, "Missing $db"),
+        },
     };
+
+    // Extract collection name from aggregate field
     let coll = match cmd.get_str("aggregate") {
-        Ok(c) => c,
+        Ok(c) => c.to_string(),
         Err(_) => return error_doc(9, "Invalid aggregate"),
     };
-    let pipeline = match cmd.get_array("pipeline") {
-        Ok(a) => a,
-        Err(_) => {
-            tracing::warn!(collection=%coll, cmd=?cmd, "aggregate missing 'pipeline' array");
-            return error_doc(9, "Missing pipeline");
-        }
-    };
-    let cursor_spec = cmd.get_document("cursor").unwrap_or(&doc! {}).clone();
-    let batch_size = cursor_spec.get_i32("batchSize").unwrap_or(101) as i64;
 
+    // Check storage is configured
     if state.store.is_none() {
         return error_doc(13, "No storage configured");
     }
     let pg = state.store.as_ref().unwrap();
 
-    // First pass: scan for special stages that affect execution ($count, $facet, $out, $merge)
-    // These need to be handled specially and may short-circuit normal execution
-    let mut count_field: Option<String> = None;
-    let mut facet_pipelines: Option<Vec<(String, Vec<bson::Bson>)>> = None;
-    let mut out_coll: Option<String> = None;
-    let mut merge_spec: Option<Document> = None;
-    let mut stage_count = 0;
-    for st in pipeline {
-        stage_count += 1;
-        if let bson::Bson::Document(stage) = st {
-            if let Ok(cf) = stage.get_str("$count") {
-                count_field = Some(cf.to_string());
-                continue;
-            }
-            // $geoNear: must be the first stage in the pipeline
-            if stage.contains_key("$geoNear") && stage_count > 1 {
-                return error_doc(9, "$geoNear is only valid as the first stage in a pipeline");
-            }
-            // $facet: document with sub-pipelines (must be last stage)
-            if let Ok(facet_doc) = stage.get_document("$facet") {
-                if stage_count < pipeline.len() {
-                    return error_doc(9, "$facet must be the last stage in the pipeline");
-                }
-                // Parse facet sub-pipelines
-                let mut parsed_facets: Vec<(String, Vec<bson::Bson>)> = Vec::new();
-                for (facet_name, facet_pipeline_bson) in facet_doc.iter() {
-                    if let bson::Bson::Array(arr) = facet_pipeline_bson {
-                        parsed_facets.push((facet_name.clone(), arr.clone()));
-                    } else {
-                        return error_doc(
-                            9,
-                            format!(
-                                "$facet field '{}' must be an array of pipeline stages",
-                                facet_name
-                            ),
-                        );
-                    }
-                }
-                if parsed_facets.is_empty() {
-                    return error_doc(9, "$facet must have at least one sub-pipeline");
-                }
-                facet_pipelines = Some(parsed_facets);
-                continue;
-            }
-            // $out: can be string or document with "coll" field
-            if let Some(out_val) = stage.get("$out") {
-                if stage_count < pipeline.len() {
-                    return error_doc(9, "$out must be the last stage in the pipeline");
-                }
-                if let bson::Bson::String(s) = out_val {
-                    out_coll = Some(s.clone());
-                } else if let bson::Bson::Document(d) = out_val {
-                    if let Ok(coll) = d.get_str("coll") {
-                        out_coll = Some(coll.to_string());
-                    } else {
-                        return error_doc(9, "$out document must have a 'coll' field");
-                    }
-                } else {
-                    return error_doc(9, "$out must be a string or document");
-                }
-                continue;
-            }
-            // $merge: document with required "into" field
-            if let Ok(merge_doc) = stage.get_document("$merge") {
-                if stage_count < pipeline.len() {
-                    return error_doc(9, "$merge must be the last stage in the pipeline");
-                }
-                merge_spec = Some(merge_doc.clone());
-                continue;
-            }
+    // Parse the pipeline using the new aggregation system
+    let pipeline = match crate::aggregation::Pipeline::parse(cmd) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(collection=%coll, error=%e, "Failed to parse aggregation pipeline");
+            return error_doc(9, format!("Failed to parse pipeline: {}", e));
         }
-    }
-
-    // Handle $count early: compute count from filter and adjust with skip/limit
-    // Note: $count is a terminal stage that returns a single document with the count
-    if let Some(field) = count_field {
-        // Parse the pipeline to extract filter, skip, and limit for count calculation
-        let mut filter: Option<bson::Document> = None;
-        let mut skip: Option<i64> = None;
-        let mut limit: Option<i64> = None;
-        let mut match_stage_position: Option<usize> = None;
-        for (idx, st) in pipeline.iter().enumerate() {
-            if let bson::Bson::Document(stage) = st {
-                if let Ok(m) = stage.get_document("$match")
-                    && filter.is_none()
-                {
-                    filter = Some(m.clone());
-                    match_stage_position = Some(idx);
-                }
-                if let Some(sk) = stage
-                    .get_i64("$skip")
-                    .ok()
-                    .or(stage.get_i32("$skip").ok().map(|v| v as i64))
-                {
-                    skip = Some(sk);
-                }
-                if let Some(l) = stage
-                    .get_i64("$limit")
-                    .ok()
-                    .or(stage.get_i32("$limit").ok().map(|v| v as i64))
-                {
-                    limit = Some(l);
-                }
-            }
-        }
-
-        // Check if filter contains $text
-        let total = if let Some(ref f) = filter {
-            match extract_text_search_params(f) {
-                Ok(Some((search, language, case_sensitive, diacritic_sensitive))) => {
-                    // $text is present - validate it's in the first stage (MongoDB restriction)
-                    if match_stage_position != Some(0) {
-                        return error_doc(
-                            2,
-                            "$match with $text is only allowed as the first pipeline stage",
-                        );
-                    }
-
-                    // Get text index fields
-                    match pg.get_text_index_fields(dbname, coll).await {
-                        Ok(fields) if !fields.is_empty() => {
-                            // Use find_with_text_search and count results
-                            let text_docs = match pg
-                                .find_with_text_search(
-                                    dbname,
-                                    coll,
-                                    &search,
-                                    &language,
-                                    case_sensitive,
-                                    diacritic_sensitive,
-                                    100_000,
-                                    &fields,
-                                )
-                                .await
-                            {
-                                Ok(docs) => docs,
-                                Err(e) => {
-                                    return error_doc(2, format!("text search failed: {}", e));
-                                }
-                            };
-
-                            // Apply remaining filters (non-$text) if any
-                            let mut remaining_doc = f.clone();
-                            remaining_doc.remove("$text");
-                            if remaining_doc.is_empty() {
-                                text_docs.len() as i64
-                            } else {
-                                text_docs
-                                    .into_iter()
-                                    .filter(|d| document_matches_filter(d, &remaining_doc))
-                                    .count() as i64
-                            }
-                        }
-                        Ok(_) => {
-                            return error_doc(2, "text index required for $text query");
-                        }
-                        Err(e) => {
-                            return error_doc(2, format!("failed to get text index: {}", e));
-                        }
-                    }
-                }
-                Ok(None) => {
-                    // No $text operator, use regular count
-                    match pg.count_docs(dbname, coll, Some(f)).await {
-                        Ok(n) => n,
-                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
-                    }
-                }
-                Err(err_doc) => return err_doc,
-            }
-        } else {
-            // No filter, count all documents
-            match pg.count_docs(dbname, coll, None).await {
-                Ok(n) => n,
-                Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
-            }
-        };
-
-        let mut n = total;
-        if let Some(sk) = skip {
-            n = (n - sk).max(0);
-        }
-        if let Some(l) = limit {
-            n = n.min(l);
-        }
-        // Match MongoDB's typical small-int behavior when it fits in 32-bit.
-        let d = if n <= i32::MAX as i64 {
-            doc! { field: (n as i32) }
-        } else {
-            doc! { field: n }
-        };
-        return doc! { "cursor": {"id": 0i64, "ns": format!("{}.{}", dbname, coll), "firstBatch": [d] }, "ok": 1.0 };
-    }
-
-    // Execute pipeline stages in order, handling $unionWith correctly
-    // $unionWith concatenates union collection docs, and subsequent stages apply to the combined set
-    let mut docs: Vec<Document> = Vec::new();
-    let mut main_coll_fetched = false;
-
-    for st in pipeline {
-        if let bson::Bson::Document(stage) = st {
-            // $match: filter current docs (or fetch main collection if not yet fetched)
-            if let Ok(filter) = stage.get_document("$match") {
-                if !main_coll_fetched {
-                    // First $match before any $unionWith: fetch from main collection with filter
-                    docs = match pg
-                        .find_docs(dbname, coll, Some(filter), None, None, batch_size * 10)
-                        .await
-                    {
-                        Ok(v) => v,
-                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
-                    };
-                    main_coll_fetched = true;
-                } else {
-                    // $match after $unionWith: filter the combined docs
-                    docs.retain(|d| document_matches_filter(d, filter));
-                }
-                continue;
-            }
-
-            // $unionWith: fetch from union collection and concatenate
-            if stage.contains_key("$unionWith") {
-                // Fetch main collection if not yet fetched (no filter)
-                if !main_coll_fetched {
-                    docs = match pg
-                        .find_docs(dbname, coll, None, None, None, batch_size * 10)
-                        .await
-                    {
-                        Ok(v) => v,
-                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
-                    };
-                    main_coll_fetched = true;
-                }
-
-                // Parse $unionWith specification
-                let (union_coll, union_pipeline): (String, Vec<bson::Bson>) = if let Ok(union_doc) =
-                    stage.get_document("$unionWith")
-                {
-                    // Document format: { $unionWith: { coll: "name", pipeline: [...] } }
-                    let coll_name = match union_doc.get_str("coll") {
-                        Ok(c) => c.to_string(),
-                        Err(_) => {
-                            return error_doc(9, "$unionWith document must have a 'coll' field");
-                        }
-                    };
-                    let pipeline = union_doc
-                        .get_array("pipeline")
-                        .ok()
-                        .cloned()
-                        .unwrap_or_default();
-                    (coll_name, pipeline)
-                } else if let Ok(coll_name) = stage.get_str("$unionWith") {
-                    // String format: { $unionWith: "collName" }
-                    (coll_name.to_string(), Vec::new())
-                } else {
-                    return error_doc(9, "$unionWith must be a string or document");
-                };
-
-                // Fetch all documents from the union collection (no filter)
-                let union_docs = match pg
-                    .find_docs(dbname, &union_coll, None, None, None, 100_000)
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        // MongoDB returns empty results if collection doesn't exist
-                        tracing::debug!(error = %e, collection=%union_coll, "unionWith collection not found, returning empty");
-                        Vec::new()
-                    }
-                };
-
-                // If a pipeline is specified, execute it on the union collection documents
-                let union_docs = if !union_pipeline.is_empty() {
-                    match execute_sub_pipeline(union_docs, &union_pipeline) {
-                        Ok(v) => v,
-                        Err(err_msg) => {
-                            return error_doc(9, format!("$unionWith pipeline error: {}", err_msg));
-                        }
-                    }
-                } else {
-                    union_docs
-                };
-
-                // Concatenate union results to current docs (current docs first, then union docs)
-                docs.extend(union_docs);
-                continue;
-            }
-
-            // $geoNear: geospatial near query with distance calculation
-            if let Ok(geo_doc) = stage.get_document("$geoNear") {
-                // Parse "near" field (GeoJSON Point)
-                let near_doc = match geo_doc.get_document("near") {
-                    Ok(d) => d,
-                    Err(_) => {
-                        return error_doc(9, "$geoNear requires 'near' field");
-                    }
-                };
-                // Try to get geometry from $geometry field, or use near_doc directly if it's GeoJSON
-                let geometry = match near_doc.get_document("$geometry") {
-                    Ok(d) => d,
-                    Err(_) => {
-                        // Check if near_doc itself is a GeoJSON object (has 'type' and 'coordinates')
-                        if near_doc.contains_key("type") && near_doc.contains_key("coordinates") {
-                            near_doc
-                        } else {
-                            return error_doc(
-                                9,
-                                "$geoNear 'near' must have '$geometry' field or be a GeoJSON object",
-                            );
-                        }
-                    }
-                };
-                let coords = match geometry.get_array("coordinates") {
-                    Ok(a) => a,
-                    Err(_) => {
-                        return error_doc(9, "$geoNear geometry must have 'coordinates'");
-                    }
-                };
-                if coords.len() < 2 {
-                    return error_doc(9, "$geoNear coordinates must have at least 2 elements");
-                }
-                let near_lon = coords[0]
-                    .as_f64()
-                    .or_else(|| coords[0].as_i64().map(|v| v as f64))
-                    .unwrap_or(0.0);
-                let near_lat = coords[1]
-                    .as_f64()
-                    .or_else(|| coords[1].as_i64().map(|v| v as f64))
-                    .unwrap_or(0.0);
-
-                // Parse required fields
-                let distance_field = match geo_doc.get_str("distanceField") {
-                    Ok(s) => s.to_string(),
-                    Err(_) => {
-                        return error_doc(9, "$geoNear requires 'distanceField'");
-                    }
-                };
-                let key = geo_doc.get_str("key").unwrap_or("location").to_string();
-                let max_distance = geo_doc
-                    .get_f64("maxDistance")
-                    .ok()
-                    .or_else(|| geo_doc.get_i64("maxDistance").ok().map(|v| v as f64));
-                let spherical = geo_doc.get_bool("spherical").unwrap_or(true);
-                let query_filter = geo_doc.get_document("query").ok().cloned();
-
-                // Build filter for geospatial query
-                let geo_filter = doc! {
-                    key.clone(): doc! {
-                        "$near": doc! {
-                            "$geometry": doc! {
-                                "type": "Point",
-                                "coordinates": [near_lon, near_lat]
-                            },
-                            "$maxDistance": max_distance.unwrap_or(100000.0)
-                        }
-                    }
-                };
-
-                // Merge query filter with geo filter if present
-                let combined_filter = if let Some(q) = query_filter {
-                    doc! {
-                        "$and": vec![bson::Bson::Document(geo_filter), bson::Bson::Document(q)]
-                    }
-                } else {
-                    geo_filter
-                };
-
-                // Fetch documents with geospatial query
-                docs = match pg
-                    .find_docs(
-                        dbname,
-                        coll,
-                        Some(&combined_filter),
-                        None,
-                        None,
-                        batch_size * 10,
-                    )
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return error_doc(59, format!("aggregate $geoNear failed: {}", e));
-                    }
-                };
-                main_coll_fetched = true;
-
-                // Calculate and add distance field to each document
-                for d in docs.iter_mut() {
-                    let dist = if spherical {
-                        // Haversine distance in meters
-                        let doc_lon = d
-                            .get_document(&key)
-                            .ok()
-                            .and_then(|loc| loc.get_array("coordinates").ok())
-                            .and_then(|coords| coords.first())
-                            .and_then(|c| c.as_f64())
-                            .unwrap_or(0.0);
-                        let doc_lat = d
-                            .get_document(&key)
-                            .ok()
-                            .and_then(|loc| loc.get_array("coordinates").ok())
-                            .and_then(|coords| coords.get(1))
-                            .and_then(|c| c.as_f64())
-                            .unwrap_or(0.0);
-
-                        // Haversine formula
-                        let r = 6371000.0; // Earth radius in meters
-                        let d_lat = (doc_lat - near_lat).to_radians();
-                        let d_lon = (doc_lon - near_lon).to_radians();
-                        let a = (d_lat / 2.0).sin().powi(2)
-                            + near_lat.to_radians().cos()
-                                * doc_lat.to_radians().cos()
-                                * (d_lon / 2.0).sin().powi(2);
-                        let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
-                        r * c
-                    } else {
-                        // Euclidean distance (in degrees)
-                        let doc_lon = d
-                            .get_document(&key)
-                            .ok()
-                            .and_then(|loc| loc.get_array("coordinates").ok())
-                            .and_then(|coords| coords.first())
-                            .and_then(|c| c.as_f64())
-                            .unwrap_or(0.0);
-                        let doc_lat = d
-                            .get_document(&key)
-                            .ok()
-                            .and_then(|loc| loc.get_array("coordinates").ok())
-                            .and_then(|coords| coords.get(1))
-                            .and_then(|c| c.as_f64())
-                            .unwrap_or(0.0);
-
-                        ((doc_lon - near_lon).powi(2) + (doc_lat - near_lat).powi(2)).sqrt()
-                    };
-                    d.insert(&distance_field, bson::Bson::Double(dist));
-                }
-
-                // Sort by distance
-                docs.sort_by(|a, b| {
-                    let a_dist = a.get_f64(&distance_field).unwrap_or(f64::MAX);
-                    let b_dist = b.get_f64(&distance_field).unwrap_or(f64::MAX);
-                    a_dist
-                        .partial_cmp(&b_dist)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-
-                continue;
-            }
-
-            // $sort: sort current docs
-            if let Ok(sort_spec) = stage.get_document("$sort") {
-                // Fetch main collection if not yet fetched
-                if !main_coll_fetched {
-                    docs = match pg
-                        .find_docs(dbname, coll, None, Some(sort_spec), None, batch_size * 10)
-                        .await
-                    {
-                        Ok(v) => v,
-                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
-                    };
-                    main_coll_fetched = true;
-                } else {
-                    // Sort the current docs in memory
-                    docs.sort_by(|a, b| cmp_multi(a, b, sort_spec));
-                }
-                continue;
-            }
-
-            // $limit: limit current docs
-            if let Some(limit_val) = stage
-                .get_i64("$limit")
-                .ok()
-                .or(stage.get_i32("$limit").ok().map(|v| v as i64))
-            {
-                // Fetch main collection if not yet fetched
-                if !main_coll_fetched {
-                    docs = match pg
-                        .find_docs(dbname, coll, None, None, None, limit_val)
-                        .await
-                    {
-                        Ok(v) => v,
-                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
-                    };
-                    main_coll_fetched = true;
-                } else if limit_val >= 0 && (limit_val as usize) < docs.len() {
-                    docs.truncate(limit_val as usize);
-                }
-                continue;
-            }
-
-            // $skip: skip current docs
-            if let Some(skip_val) = stage
-                .get_i64("$skip")
-                .ok()
-                .or(stage.get_i32("$skip").ok().map(|v| v as i64))
-            {
-                // Fetch main collection if not yet fetched
-                if !main_coll_fetched {
-                    docs = match pg
-                        .find_docs(dbname, coll, None, None, None, skip_val + batch_size * 10)
-                        .await
-                    {
-                        Ok(v) => v,
-                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
-                    };
-                    main_coll_fetched = true;
-                }
-                if skip_val > 0 {
-                    let skip_count = (skip_val as usize).min(docs.len());
-                    docs.drain(0..skip_count);
-                }
-                continue;
-            }
-
-            // $project: project current docs
-            if let Ok(proj) = stage.get_document("$project") {
-                // Check if this is a computed projection (has field refs like "$v" or exprs like {"$add": [...]})
-                let has_computed = proj.iter().any(|(_k, v)| {
-                    !matches!(v, bson::Bson::Int32(n) if *n == 0 || *n == 1)
-                        && !matches!(v, bson::Bson::Boolean(_))
-                });
-                // Fetch main collection if not yet fetched
-                if !main_coll_fetched {
-                    if has_computed {
-                        // Can't push down computed projections - fetch full docs and apply in memory
-                        docs = match pg
-                            .find_docs(dbname, coll, None, None, None, batch_size * 10)
-                            .await
-                        {
-                            Ok(v) => v,
-                            Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
-                        };
-                        main_coll_fetched = true;
-                        // Apply computed projection in memory
-                        for d in docs.iter_mut() {
-                            *d = apply_project_with_expr(d, proj);
-                        }
-                    } else {
-                        // Simple projection - can try SQL pushdown
-                        docs = match pg
-                            .find_docs(dbname, coll, None, None, Some(proj), batch_size * 10)
-                            .await
-                        {
-                            Ok(v) => v,
-                            Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
-                        };
-                        main_coll_fetched = true;
-                    }
-                } else {
-                    // Apply projection in memory to existing docs
-                    for d in docs.iter_mut() {
-                        *d = apply_project_with_expr(d, proj);
-                    }
-                }
-                continue;
-            }
-
-            // $addFields / $set: add fields to current docs
-            if let Ok(af) = stage
-                .get_document("$addFields")
-                .or(stage.get_document("$set"))
-            {
-                // Fetch main collection if not yet fetched
-                if !main_coll_fetched {
-                    docs = match pg
-                        .find_docs(dbname, coll, None, None, None, batch_size * 10)
-                        .await
-                    {
-                        Ok(v) => v,
-                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
-                    };
-                    main_coll_fetched = true;
-                }
-                for d in docs.iter_mut() {
-                    for (k, v) in af.iter() {
-                        let val = eval_expr(d, v).unwrap_or(bson::Bson::Null);
-                        set_path_nested(d, k, val);
-                    }
-                }
-                continue;
-            }
-
-            // $unwind: unwind arrays in current docs
-            if let Ok(u) = stage.get_str("$unwind") {
-                let path = u.trim_start_matches('$').to_string();
-                // Fetch main collection if not yet fetched
-                if !main_coll_fetched {
-                    docs = match pg
-                        .find_docs(dbname, coll, None, None, None, batch_size * 10)
-                        .await
-                    {
-                        Ok(v) => v,
-                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
-                    };
-                    main_coll_fetched = true;
-                }
-                let mut out: Vec<Document> = Vec::new();
-                for d in docs.into_iter() {
-                    if let Some(bson::Bson::Array(arr)) = get_path_bson_value(&d, &path) {
-                        for item in arr {
-                            let mut nd = d.clone();
-                            set_path_nested(&mut nd, &path, item);
-                            out.push(nd);
-                        }
-                    }
-                }
-                docs = out;
-                continue;
-            }
-            if let Ok(ud) = stage.get_document("$unwind")
-                && let Ok(pth) = ud.get_str("path")
-            {
-                let path = pth.trim_start_matches('$').to_string();
-                let preserve = ud.get_bool("preserveNullAndEmptyArrays").unwrap_or(false);
-                let include = ud.get_str("includeArrayIndex").ok().map(|s| s.to_string());
-                // Fetch main collection if not yet fetched
-                if !main_coll_fetched {
-                    docs = match pg
-                        .find_docs(dbname, coll, None, None, None, batch_size * 10)
-                        .await
-                    {
-                        Ok(v) => v,
-                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
-                    };
-                    main_coll_fetched = true;
-                }
-                let mut out: Vec<Document> = Vec::new();
-                for d in docs.into_iter() {
-                    match get_path_bson_value(&d, &path) {
-                        Some(bson::Bson::Array(arr)) => {
-                            if arr.is_empty() {
-                                if preserve {
-                                    let mut nd = d.clone();
-                                    set_path_nested(&mut nd, &path, bson::Bson::Null);
-                                    if let Some(ref fpath) = include {
-                                        set_path_nested(&mut nd, fpath, bson::Bson::Null);
-                                    }
-                                    out.push(nd);
-                                }
-                                continue;
-                            }
-                            for (i, item) in arr.into_iter().enumerate() {
-                                let mut nd = d.clone();
-                                set_path_nested(&mut nd, &path, item);
-                                if let Some(ref fpath) = include {
-                                    set_path_nested(&mut nd, fpath, bson::Bson::Int32(i as i32));
-                                }
-                                out.push(nd);
-                            }
-                        }
-                        None | Some(bson::Bson::Null) => {
-                            if preserve {
-                                let mut nd = d.clone();
-                                set_path_nested(&mut nd, &path, bson::Bson::Null);
-                                if let Some(ref fpath) = include {
-                                    set_path_nested(&mut nd, fpath, bson::Bson::Null);
-                                }
-                                out.push(nd);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                docs = out;
-                continue;
-            }
-
-            // $group: group current docs
-            if let Ok(gspec) = stage.get_document("$group") {
-                // Fetch main collection if not yet fetched
-                if !main_coll_fetched {
-                    docs = match pg
-                        .find_docs(dbname, coll, None, None, None, batch_size * 10)
-                        .await
-                    {
-                        Ok(v) => v,
-                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
-                    };
-                    main_coll_fetched = true;
-                }
-                docs = apply_group(&docs, gspec);
-                continue;
-            }
-
-            // $bucket: bucket current docs
-            if let Ok(b) = stage.get_document("$bucket") {
-                // Parse $bucket specification
-                let group_by = match b.get("groupBy") {
-                    Some(bson::Bson::String(s)) => s.clone(),
-                    _ => {
-                        return error_doc(9, "$bucket requires groupBy expression");
-                    }
-                };
-
-                let boundaries = match b.get_array("boundaries") {
-                    Ok(arr) => arr.clone(),
-                    Err(_) => {
-                        return error_doc(9, "$bucket requires boundaries array");
-                    }
-                };
-
-                if boundaries.len() < 2 {
-                    return error_doc(9, "$bucket boundaries must have at least 2 elements");
-                }
-
-                // Check boundaries are sorted
-                for i in 1..boundaries.len() {
-                    if cmp_bson(&boundaries[i], &boundaries[i - 1]) != std::cmp::Ordering::Greater {
-                        return error_doc(
-                            9,
-                            "$bucket boundaries must be sorted in ascending order",
-                        );
-                    }
-                }
-
-                let default = b.get("default").cloned();
-                let output = b.get_document("output").ok().cloned();
-
-                let bspec = BucketSpec {
-                    group_by,
-                    boundaries,
-                    default,
-                    output,
-                };
-
-                // Fetch main collection if not yet fetched
-                if !main_coll_fetched {
-                    docs = match pg
-                        .find_docs(dbname, coll, None, None, None, batch_size * 10)
-                        .await
-                    {
-                        Ok(v) => v,
-                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
-                    };
-                    main_coll_fetched = true;
-                }
-                docs = apply_bucket(&docs, &bspec);
-                continue;
-            }
-
-            // $lookup: lookup from another collection
-            if let Ok(lspec) = stage.get_document("$lookup") {
-                // Fetch main collection if not yet fetched
-                if !main_coll_fetched {
-                    docs = match pg
-                        .find_docs(dbname, coll, None, None, None, batch_size * 10)
-                        .await
-                    {
-                        Ok(v) => v,
-                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
-                    };
-                    main_coll_fetched = true;
-                }
-                docs = apply_lookup(dbname, pg, docs, lspec)
-                    .await
-                    .unwrap_or_else(|_| Vec::new());
-                continue;
-            }
-
-            // $sample: random sample of current docs
-            if let Ok(sample_doc) = stage.get_document("$sample") {
-                let sample_size = if let Ok(size) = sample_doc.get_i64("size") {
-                    size
-                } else if let Ok(size) = sample_doc.get_i32("size") {
-                    size as i64
-                } else {
-                    return error_doc(9, "$sample must have a numeric 'size' field");
-                };
-
-                // Fetch main collection if not yet fetched
-                if !main_coll_fetched {
-                    docs = match pg
-                        .find_docs(dbname, coll, None, None, None, batch_size * 10)
-                        .await
-                    {
-                        Ok(v) => v,
-                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
-                    };
-                    main_coll_fetched = true;
-                }
-
-                if sample_size <= 0 {
-                    docs.clear();
-                } else {
-                    let n = sample_size as usize;
-                    docs.shuffle(&mut rand::thread_rng());
-                    if n < docs.len() {
-                        docs.truncate(n);
-                    }
-                }
-                continue;
-            }
-
-            // $facet: handled separately after the main loop
-            if stage.contains_key("$facet") {
-                // Fetch main collection if not yet fetched (needed for facet sub-pipelines)
-                if !main_coll_fetched {
-                    docs = match pg
-                        .find_docs(dbname, coll, None, None, None, batch_size * 10)
-                        .await
-                    {
-                        Ok(v) => v,
-                        Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
-                    };
-                    main_coll_fetched = true;
-                }
-                // $facet is processed after the main loop, so just continue here
-                continue;
-            }
-
-            // Unknown $stage: error
-            if stage.keys().any(|k| k.starts_with('$')) {
-                return error_doc(
-                    9,
-                    format!(
-                        "Unsupported pipeline stage: {}",
-                        stage.keys().next().unwrap()
-                    ),
-                );
-            }
-        }
-    }
-
-    // If no stages were processed that fetched the main collection, fetch it now
-    if !main_coll_fetched {
-        docs = match pg
-            .find_docs(dbname, coll, None, None, None, batch_size * 10)
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => return error_doc(59, format!("aggregate failed: {}", e)),
-        };
-    }
-
-    // Handle $facet: execute sub-pipelines and return single document with results
-    if let Some(facets) = facet_pipelines {
-        let mut facet_result = Document::new();
-
-        for (facet_name, sub_pipeline) in facets {
-            match execute_sub_pipeline(docs.clone(), &sub_pipeline) {
-                Ok(facet_docs) => {
-                    let facet_array: Vec<bson::Bson> =
-                        facet_docs.into_iter().map(bson::Bson::Document).collect();
-                    facet_result.insert(facet_name, bson::Bson::Array(facet_array));
-                }
-                Err(err_msg) => {
-                    return error_doc(9, format!("$facet sub-pipeline error: {}", err_msg));
-                }
-            }
-        }
-
-        // $facet always returns a single document with all facet results
-        return doc! {
-            "cursor": {
-                "id": 0i64,
-                "ns": format!("{}.{}", dbname, coll),
-                "firstBatch": [facet_result]
-            },
-            "ok": 1.0
-        };
-    }
-
-    // Handle $out: write results to a new collection
-    if let Some(target_coll) = out_coll {
-        return handle_out_stage(state, dbname, &target_coll, docs).await;
-    }
-
-    // Handle $merge: upsert results into existing collection
-    if let Some(merge_doc) = merge_spec {
-        return handle_merge_stage(state, dbname, &merge_doc, docs).await;
-    }
-
-    let (first_batch, remainder): (Vec<_>, Vec<_>) = docs
-        .into_iter()
-        .enumerate()
-        .partition(|(i, _)| (*i as i64) < batch_size);
-    let first_docs: Vec<Document> = first_batch.into_iter().map(|(_, d)| d).collect();
-    let rest_docs: Vec<Document> = remainder.into_iter().map(|(_, d)| d).collect();
-    let ns = format!("{}.{}", dbname, coll);
-    let mut cursor_doc = doc! { "ns": ns.clone(), "firstBatch": first_docs };
-    let cursor_id = if rest_docs.is_empty() {
-        0i64
-    } else {
-        new_cursor(state, ns, rest_docs).await
     };
-    cursor_doc.insert("id", cursor_id);
-    doc! { "cursor": cursor_doc, "ok": 1.0 }
+
+    // Extract cursor options for batch size
+    let cursor_spec = cmd.get_document("cursor").unwrap_or(&doc! {}).clone();
+    let batch_size = cursor_spec.get_i32("batchSize").unwrap_or(101) as i64;
+
+    // Create execution context
+    let allow_disk_use = pipeline.options.allow_disk_use;
+    let ctx = crate::aggregation::ExecContext::new(
+        Some(pg),
+        dbname.clone(),
+        coll.clone(),
+        allow_disk_use,
+    );
+
+    // Execute the pipeline
+    match crate::aggregation::execute_pipeline(&ctx, pipeline).await {
+        Ok(crate::aggregation::ExecResult::Cursor(docs)) => {
+            // Split results into first batch and remainder
+            let (first_batch, remainder): (Vec<_>, Vec<_>) = docs
+                .into_iter()
+                .enumerate()
+                .partition(|(i, _)| (*i as i64) < batch_size);
+            let first_docs: Vec<Document> = first_batch.into_iter().map(|(_, d)| d).collect();
+            let rest_docs: Vec<Document> = remainder.into_iter().map(|(_, d)| d).collect();
+
+            let ns = format!("{}.{}", dbname, coll);
+            let mut cursor_doc = doc! { "ns": ns.clone(), "firstBatch": first_docs };
+
+            // Create cursor for remaining documents if any
+            let cursor_id = if rest_docs.is_empty() {
+                0i64
+            } else {
+                new_cursor(state, ns, rest_docs).await
+            };
+            cursor_doc.insert("id", cursor_id);
+
+            doc! { "cursor": cursor_doc, "ok": 1.0 }
+        }
+        Ok(crate::aggregation::ExecResult::WriteOut(stats)) => {
+            // Return write statistics for $out/$merge operations
+            let mut result = doc! { "ok": 1.0 };
+            if stats.inserted_count > 0 {
+                result.insert("nInserted", stats.inserted_count as i32);
+            }
+            if stats.modified_count > 0 {
+                result.insert("nModified", stats.modified_count as i32);
+            }
+            if stats.matched_count > 0 {
+                result.insert("nMatched", stats.matched_count as i32);
+            }
+            if stats.deleted_count > 0 {
+                result.insert("nDeleted", stats.deleted_count as i32);
+            }
+            result
+        }
+        Err(e) => {
+            tracing::error!(collection=%coll, error=%e, "Aggregation pipeline execution failed");
+            error_doc(59, format!("aggregate failed: {}", e))
+        }
+    }
 }
 
 async fn handle_out_stage(
