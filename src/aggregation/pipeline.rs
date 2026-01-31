@@ -423,16 +423,28 @@ impl Pipeline {
                 }
             }
             "$sample" => {
-                let size = if let Some(n) = stage_value.as_i32() {
-                    n
-                } else if let Some(n) = stage_value.as_i64() {
-                    n as i32
+                let size_value = if let Some(doc) = stage_value.as_document() {
+                    doc.get("size")
+                        .ok_or_else(|| anyhow::anyhow!("$sample requires a 'size' field"))?
                 } else {
-                    return Err(anyhow::anyhow!("$sample value must be an integer"));
+                    stage_value
                 };
-                if size < 1 {
+
+                let size_i64 = if let Some(n) = size_value.as_i32() {
+                    i64::from(n)
+                } else if let Some(n) = size_value.as_i64() {
+                    n
+                } else {
+                    return Err(anyhow::anyhow!("$sample size must be an integer"));
+                };
+
+                if size_i64 < 1 {
                     return Err(anyhow::anyhow!("$sample size must be >= 1"));
                 }
+
+                let size = i32::try_from(size_i64)
+                    .map_err(|_| anyhow::anyhow!("$sample size is too large"))?;
+
                 Ok(Stage::Sample(size))
             }
             "$facet" => {

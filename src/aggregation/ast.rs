@@ -117,12 +117,19 @@ impl AggregateStage {
                 Ok(AggregateStage::Facet(d.clone()))
             }
             "$sample" => {
-                let n = val
+                let size_value = if let Some(doc) = val.as_document() {
+                    doc.get("size")
+                        .ok_or_else(|| Error::Msg("$sample requires a 'size' field".into()))?
+                } else {
+                    val
+                };
+
+                let n = size_value
                     .as_i64()
-                    .or_else(|| val.as_i32().map(|i| i as i64))
-                    .ok_or_else(|| Error::Msg("$sample must be a number".into()))?;
-                if n <= 0 {
-                    return Err(Error::Msg("$sample must be a positive integer".into()));
+                    .or_else(|| size_value.as_i32().map(|i| i as i64))
+                    .ok_or_else(|| Error::Msg("$sample size must be an integer".into()))?;
+                if n < 1 {
+                    return Err(Error::Msg("$sample size must be >= 1".into()));
                 }
                 Ok(AggregateStage::Sample(n))
             }

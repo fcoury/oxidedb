@@ -3,8 +3,8 @@ use rand::seq::SliceRandom;
 use rand::thread_rng;
 
 pub fn execute(docs: Vec<Document>, size: i32) -> anyhow::Result<Vec<Document>> {
-    if size < 0 {
-        return Err(anyhow::anyhow!("$sample size must be non-negative"));
+    if size < 1 {
+        return Err(anyhow::anyhow!("$sample size must be >= 1"));
     }
 
     let size_usize = size as usize;

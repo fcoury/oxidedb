@@ -163,11 +163,13 @@ async fn e2e_aggregate_sample_size_zero() {
     let msg = encode_op_msg(&agg, 0, 3);
     stream.write_all(&msg).await.unwrap();
     let doc = read_one_op_msg(&mut stream).await;
-    assert_eq!(doc.get_f64("ok").unwrap_or(0.0), 1.0);
-    let cursor = doc.get_document("cursor").unwrap();
-    let fb = cursor.get_array("firstBatch").unwrap();
-    // Should return empty results
-    assert_eq!(fb.len(), 0);
+    assert_eq!(doc.get_f64("ok").unwrap_or(0.0), 0.0);
+    let errmsg = doc.get_str("errmsg").unwrap();
+    assert!(
+        errmsg.contains("size must be >= 1"),
+        "Error message should mention size must be >= 1: {}",
+        errmsg
+    );
 
     let _ = shutdown.send(true);
     let _ = handle.await.unwrap();
@@ -215,11 +217,13 @@ async fn e2e_aggregate_sample_negative_size() {
     let msg = encode_op_msg(&agg, 0, 3);
     stream.write_all(&msg).await.unwrap();
     let doc = read_one_op_msg(&mut stream).await;
-    assert_eq!(doc.get_f64("ok").unwrap_or(0.0), 1.0);
-    let cursor = doc.get_document("cursor").unwrap();
-    let fb = cursor.get_array("firstBatch").unwrap();
-    // Should return empty results for negative size
-    assert_eq!(fb.len(), 0);
+    assert_eq!(doc.get_f64("ok").unwrap_or(0.0), 0.0);
+    let errmsg = doc.get_str("errmsg").unwrap();
+    assert!(
+        errmsg.contains("size must be >= 1"),
+        "Error message should mention size must be >= 1: {}",
+        errmsg
+    );
 
     let _ = shutdown.send(true);
     let _ = handle.await.unwrap();
