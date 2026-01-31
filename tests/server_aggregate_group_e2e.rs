@@ -72,11 +72,11 @@ async fn e2e_group_sum_count() {
     let d0 = fb[0].as_document().unwrap();
     assert_eq!(d0.get_str("_id").unwrap(), "x");
     assert_eq!(d0.get_i32("c").unwrap(), 2);
-    assert_eq!(d0.get_f64("s").unwrap(), 3.0);
+    assert_eq!(d0.get_i32("s").unwrap(), 3);
     let d1 = fb[1].as_document().unwrap();
     assert_eq!(d1.get_str("_id").unwrap(), "y");
     assert_eq!(d1.get_i32("c").unwrap(), 1);
-    assert_eq!(d1.get_f64("s").unwrap(), 4.0);
+    assert_eq!(d1.get_i32("s").unwrap(), 4);
 
     let _ = shutdown.send(true);
     let _ = handle.await.unwrap();
