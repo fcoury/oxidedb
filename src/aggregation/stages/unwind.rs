@@ -30,7 +30,12 @@ pub fn execute(
 
                     // Add array index if specified
                     if let Some(index_field) = include_array_index {
-                        new_doc.insert(index_field, Bson::Int64(idx as i64));
+                        let index_bson = if idx <= i32::MAX as usize {
+                            Bson::Int32(idx as i32)
+                        } else {
+                            Bson::Int64(idx as i64)
+                        };
+                        new_doc.insert(index_field, index_bson);
                     }
 
                     result.push(new_doc);
