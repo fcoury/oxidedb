@@ -1,3 +1,4 @@
+use crate::aggregation::exec::document_matches_filter;
 use crate::aggregation::pipeline::Stage;
 use bson::{Bson, Document};
 use std::collections::HashMap;
@@ -67,47 +68,4 @@ pub fn execute(
     }
 
     Ok(vec![result])
-}
-
-fn document_matches_filter(doc: &Document, filter: &Document) -> bool {
-    for (key, value) in filter.iter() {
-        if key.starts_with('$') {
-            match key.as_str() {
-                "$and" => {
-                    if let Bson::Array(arr) = value {
-                        for cond in arr {
-                            if let Bson::Document(cond_doc) = cond
-                                && !document_matches_filter(doc, cond_doc)
-                            {
-                                return false;
-                            }
-                        }
-                    }
-                }
-                "$or" => {
-                    if let Bson::Array(arr) = value {
-                        let mut any_match = false;
-                        for cond in arr {
-                            if let Bson::Document(cond_doc) = cond
-                                && document_matches_filter(doc, cond_doc)
-                            {
-                                any_match = true;
-                                break;
-                            }
-                        }
-                        if !any_match {
-                            return false;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        } else {
-            let doc_val = doc.get(key);
-            if doc_val != Some(value) {
-                return false;
-            }
-        }
-    }
-    true
 }

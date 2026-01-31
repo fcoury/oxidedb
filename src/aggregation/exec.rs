@@ -280,7 +280,7 @@ pub async fn execute_pipeline(
 
 /// Check if document matches filter (simplified)
 #[allow(clippy::collapsible_if)]
-fn document_matches_filter(doc: &Document, filter: &Document) -> bool {
+pub(crate) fn document_matches_filter(doc: &Document, filter: &Document) -> bool {
     for (key, value) in filter.iter() {
         if key.starts_with('$') {
             // Logical operator
@@ -333,7 +333,7 @@ fn document_matches_filter(doc: &Document, filter: &Document) -> bool {
 }
 
 #[allow(clippy::collapsible_if)]
-fn value_matches(doc_val: Option<&Bson>, filter_val: &Bson) -> bool {
+pub(crate) fn value_matches(doc_val: Option<&Bson>, filter_val: &Bson) -> bool {
     match filter_val {
         Bson::Document(filter_doc) => {
             // Check for operators
