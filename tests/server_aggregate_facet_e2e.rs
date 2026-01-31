@@ -262,7 +262,7 @@ async fn e2e_facet_with_group() {
     let total_sales = facet_result.get_array("totalSales").unwrap();
     assert_eq!(total_sales.len(), 1);
     let total_doc = total_sales[0].as_document().unwrap();
-    assert_eq!(total_doc.get_f64("total").unwrap(), 1000.0);
+    assert_eq!(total_doc.get_i32("total").unwrap(), 1000);
 
     // Check countByRegion (should have 3 groups)
     let count_by_region = facet_result.get_array("countByRegion").unwrap();
