@@ -1,6 +1,7 @@
 use crate::aggregation::pipeline::Stage;
 use crate::store::PgStore;
-use bson::Document;
+use bson::{Bson, Document};
+use std::collections::HashMap;
 
 pub async fn execute(
     docs: Vec<Document>,
@@ -8,6 +9,7 @@ pub async fn execute(
     db: &str,
     coll: &str,
     pipeline: &[Stage],
+    vars: &HashMap<String, Bson>,
 ) -> anyhow::Result<Vec<Document>> {
     let mut result = docs;
 
@@ -23,14 +25,15 @@ pub async fn execute(
             }
             Stage::Project(spec) => {
                 processed_union =
-                    crate::aggregation::stages::project::execute(processed_union, spec)?;
+                    crate::aggregation::stages::project::execute(processed_union, spec, vars)?;
             }
             Stage::AddFields(spec) => {
                 processed_union =
-                    crate::aggregation::stages::add_fields::execute(processed_union, spec)?;
+                    crate::aggregation::stages::add_fields::execute(processed_union, spec, vars)?;
             }
             Stage::Set(spec) => {
-                processed_union = crate::aggregation::stages::set::execute(processed_union, spec)?;
+                processed_union =
+                    crate::aggregation::stages::set::execute(processed_union, spec, vars)?;
             }
             Stage::Unset(fields) => {
                 processed_union =

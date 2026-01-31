@@ -12,6 +12,7 @@ pub fn execute(
     boundaries: &[Bson],
     default: Option<&Bson>,
     output: Option<&Document>,
+    vars: &HashMap<String, Bson>,
 ) -> anyhow::Result<Vec<Document>> {
     if boundaries.len() < 2 {
         return Err(anyhow::anyhow!("$bucket requires at least 2 boundaries"));
@@ -23,7 +24,7 @@ pub fn execute(
 
     // Group documents into buckets
     for doc in &docs {
-        let ctx = ExprEvalContext::new(doc.clone(), doc.clone());
+        let ctx = ExprEvalContext::with_vars(doc.clone(), doc.clone(), vars.clone());
 
         // Evaluate groupBy expression
         let group_val = if let Bson::String(s) = group_by {
@@ -72,7 +73,7 @@ pub fn execute(
                     continue; // count is built-in
                 }
 
-                let final_value = compute_bucket_accumulator(bucket_docs, acc_spec)?;
+                let final_value = compute_bucket_accumulator(bucket_docs, acc_spec, vars)?;
                 bucket_doc.insert(field_name.clone(), final_value);
             }
         }
@@ -94,7 +95,7 @@ pub fn execute(
                         continue;
                     }
 
-                    let final_value = compute_bucket_accumulator(&default_docs, acc_spec)?;
+                    let final_value = compute_bucket_accumulator(&default_docs, acc_spec, vars)?;
                     bucket_doc.insert(field_name.clone(), final_value);
                 }
             }
@@ -125,7 +126,11 @@ fn find_bucket_index(value: &Bson, boundaries: &[Bson]) -> Option<usize> {
     None
 }
 
-fn compute_bucket_accumulator(docs: &[Document], acc_spec: &Bson) -> anyhow::Result<Bson> {
+fn compute_bucket_accumulator(
+    docs: &[Document],
+    acc_spec: &Bson,
+    vars: &HashMap<String, Bson>,
+) -> anyhow::Result<Bson> {
     if let Bson::Document(acc_doc) = acc_spec {
         if let Some((acc_op, acc_val)) = acc_doc.iter().next() {
             let acc_type = parse_accumulator_type(acc_op)?;
@@ -138,7 +143,7 @@ fn compute_bucket_accumulator(docs: &[Document], acc_spec: &Bson) -> anyhow::Res
             };
 
             for doc in docs {
-                let ctx = ExprEvalContext::new(doc.clone(), doc.clone());
+                let ctx = ExprEvalContext::with_vars(doc.clone(), doc.clone(), vars.clone());
                 let expr = parse_expr(acc_val)?;
                 let value = eval_expr(&expr, &ctx)?;
 

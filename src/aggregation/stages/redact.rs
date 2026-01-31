@@ -1,5 +1,6 @@
 use crate::aggregation::expr::{ExprEvalContext, eval_expr, parse_expr};
 use bson::{Bson, Document};
+use std::collections::HashMap;
 
 /// Redaction result
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -9,11 +10,15 @@ enum RedactResult {
     Keep,
 }
 
-pub fn execute(docs: Vec<Document>, expr: &Bson) -> anyhow::Result<Vec<Document>> {
+pub fn execute(
+    docs: Vec<Document>,
+    expr: &Bson,
+    vars: &HashMap<String, Bson>,
+) -> anyhow::Result<Vec<Document>> {
     let mut result = Vec::new();
 
     for doc in docs {
-        let ctx = ExprEvalContext::new(doc.clone(), doc.clone());
+        let ctx = ExprEvalContext::with_vars(doc.clone(), doc.clone(), vars.clone());
         let redacted = redact_document(&doc, expr, &ctx)?;
         if let Some(doc) = redacted {
             result.push(doc);

@@ -6,13 +6,14 @@ pub fn execute(
     docs: Vec<Document>,
     id: &Bson,
     accumulators: &Document,
+    vars: &HashMap<String, Bson>,
 ) -> anyhow::Result<Vec<Document>> {
     // Group key -> (original_key, accumulated values)
     // Use string representation as key since Bson doesn't implement Hash
     let mut groups: HashMap<String, (Bson, HashMap<String, AccumulatorState>)> = HashMap::new();
 
     for doc in &docs {
-        let ctx = ExprEvalContext::new(doc.clone(), doc.clone());
+        let ctx = ExprEvalContext::with_vars(doc.clone(), doc.clone(), vars.clone());
 
         // Compute the _id (group key)
         let group_id = if let Bson::String(s) = id {

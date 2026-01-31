@@ -1,7 +1,7 @@
 use crate::aggregation::memory::MemoryManager;
 use crate::aggregation::pipeline::{Pipeline, Stage};
 use crate::store::PgStore;
-use bson::{Bson, Document, doc};
+use bson::{Bson, Document};
 use std::collections::HashMap;
 
 /// Execution context for pipeline
@@ -71,9 +71,9 @@ pub async fn execute_pipeline(
     let mut main_coll_fetched = false;
 
     for stage in pipeline.stages {
-        // Fetch collection if not yet fetched and this is not a $match stage
+        // Fetch collection if not yet fetched and this is not a $match/$geoNear stage
         if !main_coll_fetched
-            && !matches!(stage, Stage::Match(_))
+            && !matches!(stage, Stage::Match(_) | Stage::GeoNear(_))
             && let Some(pg) = ctx.pg
         {
             docs = pg
@@ -98,22 +98,30 @@ pub async fn execute_pipeline(
                 }
             }
             Stage::Project(spec) => {
-                docs = crate::aggregation::stages::project::execute(docs, &spec)?;
+                docs = crate::aggregation::stages::project::execute(docs, &spec, &ctx.vars)?;
             }
             Stage::AddFields(spec) => {
-                docs = crate::aggregation::stages::add_fields::execute(docs, &spec)?;
+                docs = crate::aggregation::stages::add_fields::execute(docs, &spec, &ctx.vars)?;
             }
             Stage::Set(spec) => {
-                docs = crate::aggregation::stages::set::execute(docs, &spec)?;
+                docs = crate::aggregation::stages::set::execute(docs, &spec, &ctx.vars)?;
             }
             Stage::Unset(fields) => {
                 docs = crate::aggregation::stages::unset::execute(docs, &fields)?;
             }
             Stage::ReplaceRoot { replacement } => {
-                docs = crate::aggregation::stages::replace_root::execute(docs, &replacement)?;
+                docs = crate::aggregation::stages::replace_root::execute(
+                    docs,
+                    &replacement,
+                    &ctx.vars,
+                )?;
             }
             Stage::ReplaceWith(replacement) => {
-                docs = crate::aggregation::stages::replace_root::execute(docs, &replacement)?;
+                docs = crate::aggregation::stages::replace_root::execute(
+                    docs,
+                    &replacement,
+                    &ctx.vars,
+                )?;
             }
             Stage::Sort(spec) => {
                 docs = crate::aggregation::stages::sort::execute(docs, &spec)?;
@@ -125,13 +133,15 @@ pub async fn execute_pipeline(
                 docs = crate::aggregation::stages::skip::execute(docs, n)?;
             }
             Stage::Count(field) => {
-                // Transform docs into a single document with the count
-                // This is NOT terminal - subsequent stages can process the count document
-                let count = docs.len() as i32;
-                docs = vec![doc! { field: count }];
+                docs = crate::aggregation::stages::count::execute(docs, &field)?;
             }
             Stage::Group { id, accumulators } => {
-                docs = crate::aggregation::stages::group::execute(docs, &id, &accumulators)?;
+                docs = crate::aggregation::stages::group::execute(
+                    docs,
+                    &id,
+                    &accumulators,
+                    &ctx.vars,
+                )?;
             }
             Stage::Bucket {
                 group_by,
@@ -145,6 +155,7 @@ pub async fn execute_pipeline(
                     &boundaries,
                     default.as_ref(),
                     output.as_ref(),
+                    &ctx.vars,
                 )?;
             }
             Stage::BucketAuto {
@@ -159,6 +170,7 @@ pub async fn execute_pipeline(
                     buckets,
                     granularity.as_deref(),
                     output.as_ref(),
+                    &ctx.vars,
                 )?;
             }
             Stage::Lookup {
@@ -180,6 +192,7 @@ pub async fn execute_pipeline(
                         &as_field,
                         let_vars.as_ref(),
                         pipeline.as_ref(),
+                        &ctx.vars,
                     )
                     .await?;
                 }
@@ -200,7 +213,7 @@ pub async fn execute_pipeline(
                 docs = crate::aggregation::stages::sample::execute(docs, size)?;
             }
             Stage::Facet(facets) => {
-                docs = crate::aggregation::stages::facet::execute(docs, &facets)?;
+                docs = crate::aggregation::stages::facet::execute(docs, &facets, &ctx.vars)?;
             }
             Stage::UnionWith {
                 coll,
@@ -213,6 +226,7 @@ pub async fn execute_pipeline(
                         &ctx.db,
                         &coll,
                         &union_pipeline,
+                        &ctx.vars,
                     )
                     .await?;
                 }
@@ -223,6 +237,7 @@ pub async fn execute_pipeline(
                         docs, pg, &ctx.db, &ctx.coll, &spec,
                     )
                     .await?;
+                    main_coll_fetched = true;
                 }
             }
             Stage::Out(target_coll) => {
@@ -242,10 +257,11 @@ pub async fn execute_pipeline(
                 }
             }
             Stage::SortByCount(expr) => {
-                docs = crate::aggregation::stages::sort_by_count::execute(docs, &expr)?;
+                docs = crate::aggregation::stages::sort_by_count::execute(docs, &expr, &ctx.vars)?;
             }
             Stage::SetWindowFields(spec) => {
-                docs = crate::aggregation::stages::set_window_fields::execute(docs, &spec)?;
+                docs =
+                    crate::aggregation::stages::set_window_fields::execute(docs, &spec, &ctx.vars)?;
             }
             Stage::Densify(spec) => {
                 docs = crate::aggregation::stages::densify::execute(docs, &spec)?;
@@ -254,7 +270,7 @@ pub async fn execute_pipeline(
                 docs = crate::aggregation::stages::fill::execute(docs, &spec)?;
             }
             Stage::Redact(expr) => {
-                docs = crate::aggregation::stages::redact::execute(docs, &expr)?;
+                docs = crate::aggregation::stages::redact::execute(docs, &expr, &ctx.vars)?;
             }
         }
     }

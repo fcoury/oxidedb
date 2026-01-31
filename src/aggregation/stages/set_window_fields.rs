@@ -1,5 +1,6 @@
 use crate::aggregation::expr::{ExprEvalContext, eval_expr, parse_expr};
 use bson::{Bson, Document};
+use std::collections::HashMap;
 
 /// $setWindowFields stage specification
 #[derive(Debug, Clone)]
@@ -33,7 +34,11 @@ impl SetWindowFieldsSpec {
     }
 }
 
-pub fn execute(docs: Vec<Document>, spec: &SetWindowFieldsSpec) -> anyhow::Result<Vec<Document>> {
+pub fn execute(
+    docs: Vec<Document>,
+    spec: &SetWindowFieldsSpec,
+    vars: &HashMap<String, Bson>,
+) -> anyhow::Result<Vec<Document>> {
     if docs.is_empty() {
         return Ok(docs);
     }
@@ -88,7 +93,7 @@ pub fn execute(docs: Vec<Document>, spec: &SetWindowFieldsSpec) -> anyhow::Resul
                 let mut computed_values: Vec<(usize, Bson)> = Vec::new();
 
                 for (idx, doc) in result.iter().enumerate() {
-                    let ctx = ExprEvalContext::new(doc.clone(), doc.clone());
+                    let ctx = ExprEvalContext::with_vars(doc.clone(), doc.clone(), vars.clone());
 
                     let value = match window_field {
                         "sum" | "avg" | "min" | "max" | "count" => {

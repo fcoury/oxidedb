@@ -11,6 +11,7 @@ pub fn execute(
     buckets: i32,
     _granularity: Option<&str>,
     output: Option<&Document>,
+    vars: &HashMap<String, Bson>,
 ) -> anyhow::Result<Vec<Document>> {
     if buckets < 1 {
         return Err(anyhow::anyhow!("$bucketAuto requires at least 1 bucket"));
@@ -23,7 +24,7 @@ pub fn execute(
     // Collect all group values
     let mut group_values: Vec<Bson> = Vec::new();
     for doc in &docs {
-        let ctx = ExprEvalContext::new(doc.clone(), doc.clone());
+        let ctx = ExprEvalContext::with_vars(doc.clone(), doc.clone(), vars.clone());
 
         let group_val = if let Bson::String(s) = group_by {
             if let Some(field_name) = s.strip_prefix('$') {
@@ -96,7 +97,7 @@ pub fn execute(
                     continue;
                 }
 
-                let final_value = compute_bucket_accumulator(bucket_docs, acc_spec)?;
+                let final_value = compute_bucket_accumulator(bucket_docs, acc_spec, vars)?;
                 bucket_doc.insert(field_name.clone(), final_value);
             }
         }
@@ -107,7 +108,11 @@ pub fn execute(
     Ok(result)
 }
 
-fn compute_bucket_accumulator(docs: &[Document], acc_spec: &Bson) -> anyhow::Result<Bson> {
+fn compute_bucket_accumulator(
+    docs: &[Document],
+    acc_spec: &Bson,
+    vars: &HashMap<String, Bson>,
+) -> anyhow::Result<Bson> {
     if let Bson::Document(acc_doc) = acc_spec {
         if let Some((acc_op, acc_val)) = acc_doc.iter().next() {
             let acc_type = parse_accumulator_type(acc_op)?;
@@ -120,7 +125,7 @@ fn compute_bucket_accumulator(docs: &[Document], acc_spec: &Bson) -> anyhow::Res
             };
 
             for doc in docs {
-                let ctx = ExprEvalContext::new(doc.clone(), doc.clone());
+                let ctx = ExprEvalContext::with_vars(doc.clone(), doc.clone(), vars.clone());
                 let expr = parse_expr(acc_val)?;
                 let value = eval_expr(&expr, &ctx)?;
 

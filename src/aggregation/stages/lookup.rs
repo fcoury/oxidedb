@@ -16,6 +16,7 @@ pub async fn execute(
     as_field: &str,
     let_vars: Option<&Document>,
     pipeline: Option<&Vec<Bson>>,
+    outer_vars: &HashMap<String, Bson>,
 ) -> anyhow::Result<Vec<Document>> {
     let mut result = Vec::new();
 
@@ -48,11 +49,11 @@ pub async fn execute(
         // Pipeline form
         for doc in docs {
             // Build variables for the sub-pipeline
-            let mut vars = HashMap::new();
+            let mut vars = outer_vars.clone();
 
             if let Some(let_doc) = let_vars {
                 for (key, value) in let_doc.iter() {
-                    let ctx = ExprEvalContext::new(doc.clone(), doc.clone());
+                    let ctx = ExprEvalContext::with_vars(doc.clone(), doc.clone(), vars.clone());
                     let expr = parse_expr(value)?;
                     let evaluated = eval_expr(&expr, &ctx)?;
                     vars.insert(key.clone(), evaluated);
@@ -84,8 +85,13 @@ pub async fn execute(
             }
 
             // Execute the sub-pipeline on the foreign collection
-            let _ctx =
-                ExecContext::with_vars(Some(pg), db.to_string(), from.to_string(), false, vars);
+            let _ctx = ExecContext::with_vars(
+                Some(pg),
+                db.to_string(),
+                from.to_string(),
+                false,
+                vars.clone(),
+            );
 
             // First, get all documents from the foreign collection
             let foreign_docs = pg.find_docs(db, from, None, None, None, 100_000).await?;
@@ -98,8 +104,11 @@ pub async fn execute(
                         pipeline_docs.retain(|d| document_matches_filter(d, &filter));
                     }
                     Stage::Project(spec) => {
-                        pipeline_docs =
-                            crate::aggregation::stages::project::execute(pipeline_docs, &spec)?;
+                        pipeline_docs = crate::aggregation::stages::project::execute(
+                            pipeline_docs,
+                            &spec,
+                            &vars,
+                        )?;
                     }
                     _ => {}
                 }

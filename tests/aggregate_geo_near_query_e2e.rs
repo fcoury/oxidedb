@@ -29,7 +29,7 @@ async fn read_one_op_msg(stream: &mut TcpStream) -> bson::Document {
 }
 
 #[tokio::test]
-async fn e2e_geo_near_simple() {
+async fn e2e_geo_near_applies_query_filter() {
     let testdb = match pg::TestDb::provision_from_env().await {
         Some(db) => db,
         None => {
@@ -45,88 +45,68 @@ async fn e2e_geo_near_simple() {
     let (_state, addr, shutdown, handle) = spawn_with_shutdown(cfg).await.unwrap();
     let mut stream = TcpStream::connect(addr).await.unwrap();
 
-    let dbname = format!("geo_{}", rand_suffix(6));
+    let dbname = format!("geo_query_{}", rand_suffix(6));
 
-    // create collection
     let create = doc! {"create": "places", "$db": &dbname};
     let msg = encode_op_msg(&create, 0, 1);
     stream.write_all(&msg).await.unwrap();
-    let doc = read_one_op_msg(&mut stream).await;
-    eprintln!("Create response: {:?}", doc);
-    assert_eq!(doc.get_f64("ok").unwrap_or(0.0), 1.0);
+    let _ = read_one_op_msg(&mut stream).await;
 
-    // Insert test documents with GeoJSON Point locations
     let docs = vec![
         doc! {
             "_id": "1",
             "name": "Central Park",
-            "location": doc! {
-                "type": "Point",
-                "coordinates": [-73.9654, 40.7829]  // NYC
-            }
+            "type": "park",
+            "location": {"type": "Point", "coordinates": [-73.9654, 40.7829]}
         },
         doc! {
             "_id": "2",
-            "name": "Times Square",
-            "location": doc! {
-                "type": "Point",
-                "coordinates": [-73.9857, 40.7589]  // NYC
-            }
+            "name": "Bryant Park",
+            "type": "park",
+            "location": {"type": "Point", "coordinates": [-73.9832, 40.7536]}
+        },
+        doc! {
+            "_id": "3",
+            "name": "Mall",
+            "type": "mall",
+            "location": {"type": "Point", "coordinates": [-73.9857, 40.7589]}
         },
     ];
 
     let insert = doc! {"insert": "places", "documents": docs, "$db": &dbname};
     let msg = encode_op_msg(&insert, 0, 2);
     stream.write_all(&msg).await.unwrap();
-    let doc = read_one_op_msg(&mut stream).await;
-    eprintln!("Insert response: {:?}", doc);
-    assert_eq!(doc.get_f64("ok").unwrap_or(0.0), 1.0);
+    let _ = read_one_op_msg(&mut stream).await;
 
-    // Test $geoNear aggregation stage
     let pipeline = vec![bson::Bson::Document(doc! {
-        "$geoNear": doc! {
-            "near": doc! {
-                "$geometry": doc! {
-                    "type": "Point",
-                    "coordinates": [-73.9857, 40.7589]  // Times Square
-                }
-            },
+        "$geoNear": {
+            "near": {"$geometry": {"type": "Point", "coordinates": [-73.9857, 40.7589]}},
             "distanceField": "distance",
-            "maxDistance": 10000.0,  // 10km in meters
             "spherical": true,
-            "key": "location"
+            "key": "location",
+            "query": {"type": "park"}
         }
     })];
 
     let aggregate = doc! {
         "aggregate": "places",
         "pipeline": pipeline,
-        "cursor": doc! {},
+        "cursor": {},
         "$db": &dbname
     };
     let msg = encode_op_msg(&aggregate, 0, 3);
     stream.write_all(&msg).await.unwrap();
     let doc = read_one_op_msg(&mut stream).await;
 
-    eprintln!("Aggregate response: {:?}", doc);
-
-    // Check if there's an error
-    if let Some(errmsg) = doc.get_str("errmsg").ok() {
-        eprintln!("Error message: {}", errmsg);
-    }
-
     assert_eq!(doc.get_f64("ok").unwrap_or(0.0), 1.0);
-
-    // Check that we got results with distance field
     let cursor = doc.get_document("cursor").unwrap();
     let first_batch = cursor.get_array("firstBatch").unwrap();
 
-    eprintln!("Found {} documents", first_batch.len());
-    for (i, result) in first_batch.iter().enumerate() {
-        eprintln!("Result {}: {:?}", i, result);
+    assert_eq!(first_batch.len(), 2);
+    for result in first_batch {
+        let result_doc = result.as_document().unwrap();
+        assert_eq!(result_doc.get_str("type").unwrap(), "park");
     }
-
-    assert!(!first_batch.is_empty(), "Should find nearby locations");
 
     let _ = shutdown.send(true);
     let _ = handle.await.unwrap();

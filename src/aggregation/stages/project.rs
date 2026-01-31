@@ -1,7 +1,12 @@
 use crate::aggregation::expr::{ExprEvalContext, eval_expr, parse_expr};
 use bson::{Bson, Document};
+use std::collections::HashMap;
 
-pub fn execute(docs: Vec<Document>, spec: &Document) -> anyhow::Result<Vec<Document>> {
+pub fn execute(
+    docs: Vec<Document>,
+    spec: &Document,
+    vars: &HashMap<String, Bson>,
+) -> anyhow::Result<Vec<Document>> {
     let mut has_inclusion = false;
     let mut has_exclusion = false;
     let mut id_spec = None;
@@ -32,7 +37,7 @@ pub fn execute(docs: Vec<Document>, spec: &Document) -> anyhow::Result<Vec<Docum
     let mut result = Vec::new();
 
     for doc in docs {
-        let ctx = ExprEvalContext::new(doc.clone(), doc.clone());
+        let ctx = ExprEvalContext::with_vars(doc.clone(), doc.clone(), vars.clone());
         let mut projected = Document::new();
 
         if is_exclusion_mode {

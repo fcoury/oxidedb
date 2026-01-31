@@ -3,13 +3,17 @@ use crate::aggregation::values::bson_cmp;
 use bson::{Bson, Document};
 use std::collections::HashMap;
 
-pub fn execute(docs: Vec<Document>, expr: &Bson) -> anyhow::Result<Vec<Document>> {
+pub fn execute(
+    docs: Vec<Document>,
+    expr: &Bson,
+    vars: &HashMap<String, Bson>,
+) -> anyhow::Result<Vec<Document>> {
     // Group by expression value and count
     // Use string representation of Bson as key since Bson doesn't implement Hash
     let mut counts: HashMap<String, (Bson, i64)> = HashMap::new();
 
     for doc in &docs {
-        let ctx = ExprEvalContext::new(doc.clone(), doc.clone());
+        let ctx = ExprEvalContext::with_vars(doc.clone(), doc.clone(), vars.clone());
         let expr_val = if let Bson::String(s) = expr {
             if let Some(field_name) = s.strip_prefix('$') {
                 doc.get(field_name).cloned().unwrap_or(Bson::Null)
