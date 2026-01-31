@@ -134,16 +134,31 @@ pub fn compute_accumulator(state: &AccumulatorState) -> anyhow::Result<Bson> {
         AccumulatorType::Last => Ok(state.last_value.clone().unwrap_or(Bson::Null)),
         AccumulatorType::Push => Ok(Bson::Array(state.values.clone())),
         AccumulatorType::Sum => {
-            let mut sum: f64 = 0.0;
+            let mut sum_i128: i128 = 0;
+            let mut has_double = false;
+            let mut sum_double: f64 = 0.0;
+
             for val in &state.values {
                 match val {
-                    Bson::Int32(n) => sum += *n as f64,
-                    Bson::Int64(n) => sum += *n as f64,
-                    Bson::Double(n) => sum += *n,
+                    Bson::Int32(n) => sum_i128 += *n as i128,
+                    Bson::Int64(n) => sum_i128 += *n as i128,
+                    Bson::Double(n) => {
+                        has_double = true;
+                        sum_double += *n;
+                    }
                     _ => {}
                 }
             }
-            Ok(Bson::Double(sum))
+
+            if has_double {
+                Ok(Bson::Double(sum_double + sum_i128 as f64))
+            } else if sum_i128 >= i32::MIN as i128 && sum_i128 <= i32::MAX as i128 {
+                Ok(Bson::Int32(sum_i128 as i32))
+            } else if sum_i128 >= i64::MIN as i128 && sum_i128 <= i64::MAX as i128 {
+                Ok(Bson::Int64(sum_i128 as i64))
+            } else {
+                Ok(Bson::Double(sum_i128 as f64))
+            }
         }
         AccumulatorType::Avg => {
             if state.values.is_empty() {
