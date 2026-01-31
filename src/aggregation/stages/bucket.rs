@@ -64,7 +64,7 @@ pub fn execute(
 
         // Add count by default
         let bucket_docs = buckets.get(&i).map(|v| v.as_slice()).unwrap_or(&[]);
-        bucket_doc.insert("count", Bson::Int64(bucket_docs.len() as i64));
+        bucket_doc.insert("count", count_bson(bucket_docs.len() as i64));
 
         // Process output accumulators if specified
         if let Some(output_spec) = output {
@@ -86,7 +86,7 @@ pub fn execute(
         if !default_docs.is_empty() {
             let mut bucket_doc = Document::new();
             bucket_doc.insert("_id", default_id.clone());
-            bucket_doc.insert("count", Bson::Int64(default_docs.len() as i64));
+            bucket_doc.insert("count", count_bson(default_docs.len() as i64));
 
             // Process output accumulators for default bucket
             if let Some(output_spec) = output {
@@ -147,7 +147,6 @@ fn compute_bucket_accumulator(
                 let expr = parse_expr(acc_val)?;
                 let value = eval_expr(&expr, &ctx)?;
 
-                // Update accumulator state
                 match acc_type {
                     AccumulatorType::First => {
                         if state.first_value.is_none() {
@@ -167,11 +166,55 @@ fn compute_bucket_accumulator(
                 }
             }
 
-            compute_accumulator(&state)
+            compute_bucket_accumulator_result(&state)
         } else {
             Ok(Bson::Null)
         }
     } else {
         Ok(acc_spec.clone())
+    }
+}
+
+fn compute_bucket_accumulator_result(state: &AccumulatorState) -> anyhow::Result<Bson> {
+    match state.acc_type {
+        AccumulatorType::Sum => {
+            let mut sum_i128: i128 = 0;
+            let mut has_double = false;
+            let mut sum_double: f64 = 0.0;
+            for val in &state.values {
+                match val {
+                    Bson::Int32(n) => sum_i128 += *n as i128,
+                    Bson::Int64(n) => sum_i128 += *n as i128,
+                    Bson::Double(n) => {
+                        has_double = true;
+                        sum_double += *n;
+                    }
+                    _ => {}
+                }
+            }
+            if has_double {
+                Ok(Bson::Double(sum_double + sum_i128 as f64))
+            } else if sum_i128 >= i32::MIN as i128 && sum_i128 <= i32::MAX as i128 {
+                Ok(Bson::Int32(sum_i128 as i32))
+            } else if sum_i128 >= i64::MIN as i128 && sum_i128 <= i64::MAX as i128 {
+                Ok(Bson::Int64(sum_i128 as i64))
+            } else {
+                Ok(Bson::Double(sum_i128 as f64))
+            }
+        }
+        AccumulatorType::Avg => compute_accumulator(state),
+        AccumulatorType::Min => compute_accumulator(state),
+        AccumulatorType::Max => compute_accumulator(state),
+        AccumulatorType::First => compute_accumulator(state),
+        AccumulatorType::Last => compute_accumulator(state),
+        AccumulatorType::Push => compute_accumulator(state),
+    }
+}
+
+fn count_bson(count: i64) -> Bson {
+    if count >= i32::MIN as i64 && count <= i32::MAX as i64 {
+        Bson::Int32(count as i32)
+    } else {
+        Bson::Int64(count)
     }
 }

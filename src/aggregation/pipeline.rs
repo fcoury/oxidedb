@@ -321,7 +321,18 @@ impl Pipeline {
 
                 // Validate boundaries
                 if boundaries.len() < 2 {
-                    return Err(anyhow::anyhow!("$bucket requires at least 2 boundaries"));
+                    return Err(anyhow::anyhow!(
+                        "$bucket boundaries must have at least 2 elements"
+                    ));
+                }
+                for i in 1..boundaries.len() {
+                    if crate::aggregation::bson_cmp(&boundaries[i], &boundaries[i - 1])
+                        != std::cmp::Ordering::Greater
+                    {
+                        return Err(anyhow::anyhow!(
+                            "$bucket boundaries must be sorted in ascending order"
+                        ));
+                    }
                 }
 
                 Ok(Stage::Bucket {
