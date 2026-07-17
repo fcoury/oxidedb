@@ -604,9 +604,11 @@ pub fn json_value_from_bson(v: &bson::Bson) -> Option<serde_json::Value> {
 }
 
 pub fn jsonpath_path(key: &str) -> String {
+    // Backslashes and double quotes are escaped for the jsonpath string layer;
+    // SQL-layer escaping (single quotes) happens in escape_single.
     let mut out = String::from("$");
     for seg in key.split('.') {
-        let esc = seg.replace('"', "\\\"");
+        let esc = seg.replace('\\', "\\\\").replace('"', "\\\"");
         out.push_str(".\"");
         out.push_str(&esc);
         out.push('"');
@@ -621,7 +623,11 @@ pub fn json_literal_from_bson(v: &bson::Bson) -> Option<String> {
         bson::Bson::Int32(n) => Some(n.to_string()),
         bson::Bson::Int64(n) => Some(n.to_string()),
         bson::Bson::Double(n) => Some(n.to_string()),
-        bson::Bson::String(s) => Some((serde_json::to_string(s).ok()?).to_string()),
+        bson::Bson::String(s) => {
+            // serde_json produces a jsonpath double-quoted string literal; double
+            // single quotes so the value survives inside a SQL '...' literal.
+            Some(serde_json::to_string(s).ok()?.replace('\'', "''"))
+        }
         _ => None,
     }
 }
@@ -684,8 +690,14 @@ pub fn build_elem_match_pred(_path: &str, em: &bson::Document) -> Option<String>
     }
 }
 
+/// Escape a string for embedding inside a single-quoted SQL string literal.
+///
+/// With `standard_conforming_strings = on` (the PostgreSQL default) backslashes
+/// are literal and must not be doubled; only single quotes need doubling.
+/// Double quotes are intentionally preserved: they carry meaning inside
+/// jsonpath double-quoted strings and are harmless at the SQL string layer.
 pub fn escape_single(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "''")
+    s.replace('\'', "''")
 }
 
 pub fn translate_expression(expr: &bson::Bson) -> Option<String> {
@@ -1078,4 +1090,58 @@ fn extract_bounding_box(ring: &bson::Array) -> (f64, f64, f64, f64) {
     }
 
     (min_lon, max_lon, min_lat, max_lat)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bson::doc;
+
+    #[test]
+    fn escape_single_doubles_apostrophes_only() {
+        assert_eq!(escape_single("O'Brien"), "O''Brien");
+        // Double quotes are preserved (jsonpath string delimiters must survive)
+        assert_eq!(escape_single("$.\"a\""), "$.\"a\"");
+        // Backslashes are literal under standard_conforming_strings=on
+        assert_eq!(escape_single("a\\b"), "a\\b");
+    }
+
+    #[test]
+    fn json_literal_escapes_apostrophe_for_sql() {
+        let lit = json_literal_from_bson(&bson::Bson::String("O'Brien".into())).unwrap();
+        assert_eq!(lit, "\"O''Brien\"");
+    }
+
+    #[test]
+    fn where_clause_with_apostrophe_value_is_sql_safe() {
+        let filter = doc! {"name": "O'Brien"};
+        let sql = build_where_from_filter(&filter);
+        assert_eq!(
+            sql,
+            "(jsonb_path_exists(doc, '$.\"name\" ? (@ == \"O''Brien\" )') OR jsonb_path_exists(doc, '$.\"name\"[*] ? (@ == \"O''Brien\" )'))"
+        );
+    }
+
+    #[test]
+    fn where_clause_with_apostrophe_in_field_name() {
+        let filter = doc! {"a'b": 1};
+        let sql = build_where_from_filter(&filter);
+        assert!(
+            sql.contains("jsonb_path_exists(doc, '$.\"a''b\" ? (@ == 1 )')"),
+            "got: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn jsonpath_path_escapes_quotes_and_backslashes() {
+        assert_eq!(jsonpath_path("we\"ird"), "$.\"we\\\"ird\"");
+        assert_eq!(jsonpath_path("a\\b"), "$.\"a\\\\b\"");
+    }
+
+    #[test]
+    fn translate_expression_string_literal_is_escaped() {
+        let expr = translate_expression(&bson::Bson::String("it's".into())).unwrap();
+        assert_eq!(expr, "'it''s'");
+    }
 }
