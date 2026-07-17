@@ -1,4 +1,6 @@
-use crate::aggregation::exec::{ExecContext, document_matches_filter};
+use crate::aggregation::exec::{
+    ExecContext, MATERIALIZED_FETCH_LIMIT, document_matches_filter, ensure_document_limit,
+};
 use crate::aggregation::expr::{ExprEvalContext, eval_expr, parse_expr};
 use crate::aggregation::pipeline::Stage;
 use crate::store::PgStore;
@@ -32,8 +34,18 @@ pub async fn execute(
                 filter.insert(foreign.to_string(), val.clone());
 
                 // Query the foreign collection
-                pg.find_docs(db, from, Some(&filter), None, None, 100_000)
-                    .await?
+                let matches = pg
+                    .find_docs(
+                        db,
+                        from,
+                        Some(&filter),
+                        None,
+                        None,
+                        MATERIALIZED_FETCH_LIMIT,
+                    )
+                    .await?;
+                ensure_document_limit(&matches)?;
+                matches
             } else {
                 Vec::new()
             };
@@ -94,14 +106,17 @@ pub async fn execute(
             );
 
             // First, get all documents from the foreign collection
-            let foreign_docs = pg.find_docs(db, from, None, None, None, 100_000).await?;
+            let foreign_docs = pg
+                .find_docs(db, from, None, None, None, MATERIALIZED_FETCH_LIMIT)
+                .await?;
+            ensure_document_limit(&foreign_docs)?;
 
             // Execute the pipeline on foreign docs
             let mut pipeline_docs = foreign_docs;
             for stage in stages {
                 match stage {
                     Stage::Match(filter) => {
-                        pipeline_docs.retain(|d| document_matches_filter(d, &filter));
+                        pipeline_docs.retain(|d| document_matches_filter(d, &filter, &vars));
                     }
                     Stage::Project(spec) => {
                         pipeline_docs = crate::aggregation::stages::project::execute(
