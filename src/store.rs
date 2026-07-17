@@ -155,6 +155,14 @@ impl PgStore {
             )
             .await
             .map_err(err_msg)?;
+        client
+            .execute(
+                "DELETE FROM mdb_meta.indexes WHERE db = $1 AND coll = $2",
+                &[&db, &coll],
+            )
+            .await
+            .map_err(err_msg)?;
+        self.forget_collection(db, coll).await;
         Ok(())
     }
 
@@ -169,9 +177,14 @@ impl PgStore {
             .await
             .map_err(err_msg)?;
         client
+            .execute("DELETE FROM mdb_meta.indexes WHERE db = $1", &[&db])
+            .await
+            .map_err(err_msg)?;
+        client
             .execute("DELETE FROM mdb_meta.databases WHERE db = $1", &[&db])
             .await
             .map_err(err_msg)?;
+        self.forget_database(db).await;
         Ok(())
     }
 
@@ -1084,6 +1097,35 @@ impl PgStore {
         limit: i64,
         fields: &[String],
     ) -> Result<Vec<bson::Document>> {
+        let client = self.pool.get().await.map_err(err_msg)?;
+        self.find_with_text_search_with_client(
+            &client,
+            db,
+            coll,
+            search_text,
+            language,
+            _case_sensitive,
+            _diacritic_sensitive,
+            limit,
+            fields,
+        )
+        .await
+    }
+
+    /// Find documents using full-text search on a session-pinned connection.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn find_with_text_search_with_client(
+        &self,
+        client: &tokio_postgres::Client,
+        db: &str,
+        coll: &str,
+        search_text: &str,
+        language: &str,
+        _case_sensitive: bool,
+        _diacritic_sensitive: bool,
+        limit: i64,
+        fields: &[String],
+    ) -> Result<Vec<bson::Document>> {
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
@@ -1140,7 +1182,6 @@ impl PgStore {
             q_schema, q_table, safe_language, tsvector_expr, safe_language, escaped_search, limit
         );
 
-        let client = self.pool.get().await.map_err(err_msg)?;
         let rows = client.query(&sql, &[]).await.map_err(err_msg)?;
 
         let mut results = Vec::with_capacity(rows.len());
@@ -1284,6 +1325,54 @@ impl PgStore {
         Ok(Some((id, doc)))
     }
 
+    /// Find one matching document using a session-pinned transaction connection.
+    pub async fn find_one_for_update_with_client(
+        &self,
+        client: &tokio_postgres::Client,
+        db: &str,
+        coll: &str,
+        filter: &bson::Document,
+    ) -> Result<Option<(Vec<u8>, bson::Document)>> {
+        if filter.contains_key("$text") {
+            return Err(Error::Msg(
+                "$text is not supported in update operations".into(),
+            ));
+        }
+
+        let schema = schema_name(db);
+        let q_schema = q_ident(&schema);
+        let q_table = q_ident(coll);
+        let (sql, id) = if let Some(id) = filter.get("_id").and_then(id_bytes_from_bson) {
+            (
+                format!(
+                    "SELECT id, doc_bson, doc FROM {}.{} \
+                     WHERE id = $1 LIMIT 1 FOR UPDATE",
+                    q_schema, q_table
+                ),
+                Some(id),
+            )
+        } else {
+            (
+                format!(
+                    "SELECT id, doc_bson, doc FROM {}.{} \
+                     WHERE {} ORDER BY id ASC LIMIT 1 FOR UPDATE",
+                    q_schema,
+                    q_table,
+                    build_where_from_filter(filter)
+                ),
+                None,
+            )
+        };
+
+        let rows = match id {
+            Some(id) => client.query(&sql, &[&id]).await,
+            None => client.query(&sql, &[]).await,
+        }
+        .map_err(err_msg)?;
+
+        rows.first().map(decode_stored_document).transpose()
+    }
+
     /// Overwrite the full document by id (updates both doc_bson and doc JSON).
     pub async fn update_doc_by_id(
         &self,
@@ -1309,6 +1398,30 @@ impl PgStore {
             .map_err(err_msg)?;
         tracing::debug!(op="update_doc_by_id", db=%db, coll=%coll, elapsed_ms=?t.elapsed().as_millis());
         Ok(n)
+    }
+
+    /// Overwrite a document using a session-pinned transaction connection.
+    pub async fn update_doc_by_id_with_client(
+        &self,
+        client: &tokio_postgres::Client,
+        db: &str,
+        coll: &str,
+        id: &[u8],
+        new_doc: &bson::Document,
+    ) -> Result<u64> {
+        let schema = schema_name(db);
+        let q_schema = q_ident(&schema);
+        let q_table = q_ident(coll);
+        let sql = format!(
+            "UPDATE {}.{} SET doc_bson = $1, doc = $2 WHERE id = $3",
+            q_schema, q_table
+        );
+        let bson_bytes = bson::to_vec(new_doc).map_err(err_msg)?;
+        let json = serde_json::to_value(new_doc).map_err(err_msg)?;
+        client
+            .execute(&sql, &[&bson_bytes, &json, &id])
+            .await
+            .map_err(err_msg)
     }
 
     /// Delete one matching row based on filter; returns number of rows deleted (0 or 1).
@@ -1378,6 +1491,73 @@ impl PgStore {
         tracing::debug!(op="delete_many_by_filter", db=%db, coll=%coll, elapsed_ms=?t.elapsed().as_millis());
         Ok(n)
     }
+
+    pub async fn delete_one_by_filter_with_client(
+        &self,
+        client: &tokio_postgres::Client,
+        db: &str,
+        coll: &str,
+        filter: &bson::Document,
+    ) -> Result<u64> {
+        let found = self
+            .find_one_for_update_with_client(client, db, coll, filter)
+            .await?;
+        match found {
+            Some((id, _)) => self.delete_by_id_with_client(client, db, coll, &id).await,
+            None => Ok(0),
+        }
+    }
+
+    pub async fn delete_many_by_filter_with_client(
+        &self,
+        client: &tokio_postgres::Client,
+        db: &str,
+        coll: &str,
+        filter: &bson::Document,
+    ) -> Result<u64> {
+        if filter.contains_key("$text") {
+            return Err(Error::Msg(
+                "$text is not supported in delete operations".into(),
+            ));
+        }
+        let schema = schema_name(db);
+        let q_schema = q_ident(&schema);
+        let q_table = q_ident(coll);
+        let sql = format!(
+            "DELETE FROM {}.{} WHERE {}",
+            q_schema,
+            q_table,
+            build_where_from_filter(filter)
+        );
+        client.execute(&sql, &[]).await.map_err(err_msg)
+    }
+
+    async fn delete_by_id_with_client(
+        &self,
+        client: &tokio_postgres::Client,
+        db: &str,
+        coll: &str,
+        id: &[u8],
+    ) -> Result<u64> {
+        let schema = schema_name(db);
+        let q_schema = q_ident(&schema);
+        let q_table = q_ident(coll);
+        let sql = format!("DELETE FROM {}.{} WHERE id = $1", q_schema, q_table);
+        client.execute(&sql, &[&id]).await.map_err(err_msg)
+    }
+}
+
+fn decode_stored_document(row: &tokio_postgres::Row) -> Result<(Vec<u8>, bson::Document)> {
+    let id: Vec<u8> = row.get(0);
+    if let Ok(bytes) = row.try_get::<usize, Vec<u8>>(1)
+        && let Ok(document) = bson::Document::from_reader(&mut std::io::Cursor::new(bytes))
+    {
+        return Ok((id, document));
+    }
+
+    let json: serde_json::Value = row.get(2);
+    let document = to_doc_from_json(json);
+    Ok((id, document))
 }
 
 fn schema_name(db: &str) -> String {
@@ -1839,13 +2019,8 @@ fn build_order_by(sort: Option<&bson::Document>) -> String {
             let dir = match v {
                 bson::Bson::Int32(n) => *n,
                 bson::Bson::Int64(n) => *n as i32,
-                bson::Bson::Double(f) => {
-                    if *f < 0.0 {
-                        -1
-                    } else {
-                        1
-                    }
-                }
+                bson::Bson::Double(f) if *f < 0.0 => -1,
+                bson::Bson::Double(_) => 1,
                 _ => 1,
             };
             let ord = if dir < 0 { "DESC" } else { "ASC" };
@@ -2535,6 +2710,18 @@ impl PgStore {
     async fn mark_collection_known(&self, db: &str, coll: &str) {
         let mut g = self.collections_cache.write().await;
         g.insert((db.to_string(), coll.to_string()));
+    }
+    async fn forget_collection(&self, db: &str, coll: &str) {
+        let mut collections = self.collections_cache.write().await;
+        collections.remove(&(db.to_string(), coll.to_string()));
+    }
+    async fn forget_database(&self, db: &str) {
+        let mut databases = self.databases_cache.write().await;
+        databases.remove(db);
+        drop(databases);
+
+        let mut collections = self.collections_cache.write().await;
+        collections.retain(|(known_db, _)| known_db != db);
     }
 }
 

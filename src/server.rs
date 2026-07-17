@@ -4,7 +4,8 @@ use crate::protocol::{
     MessageHeader, OP_MSG, OP_QUERY, decode_op_query, encode_op_msg, encode_op_reply,
 };
 use crate::session::{
-    ERROR_ILLEGAL_OPERATION, ERROR_NO_SUCH_TRANSACTION, ERROR_TRANSACTION_EXPIRED, SessionManager,
+    ERROR_ILLEGAL_OPERATION, ERROR_NO_SUCH_TRANSACTION, ERROR_TRANSACTION_EXPIRED, Session,
+    SessionManager,
 };
 use crate::shadow::{ShadowSession, compare_docs};
 use crate::store::PgStore;
@@ -27,10 +28,12 @@ struct BucketSpec {
 }
 
 static REQ_ID: AtomicI32 = AtomicI32::new(1);
+const MAX_WIRE_MESSAGE_BYTES: usize = 48_000_000;
+const MAX_MATERIALIZED_DOCUMENTS: i64 = 100_000;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 struct CursorEntry {
     ns: String,
@@ -63,6 +66,37 @@ pub struct AppState {
 }
 
 impl AppState {
+    async fn from_config(cfg: &Config) -> Result<Self> {
+        let store = match cfg.postgres_url.as_deref() {
+            Some(url) => {
+                let store = PgStore::connect(url).await?;
+                store.bootstrap().await?;
+                Some(store)
+            }
+            None => None,
+        };
+
+        Ok(Self {
+            store,
+            started_at: Instant::now(),
+            cursors: Mutex::new(HashMap::new()),
+            shadow: cfg.shadow.as_ref().map(|s| Arc::new(s.clone())),
+            shadow_attempts: AtomicU64::new(0),
+            shadow_matches: AtomicU64::new(0),
+            shadow_mismatches: AtomicU64::new(0),
+            shadow_timeouts: AtomicU64::new(0),
+            session_manager: Arc::new(SessionManager::new()),
+            request_count: AtomicU64::new(0),
+            request_duration_ms: AtomicU64::new(0),
+            query_count: AtomicU64::new(0),
+            insert_count: AtomicU64::new(0),
+            update_count: AtomicU64::new(0),
+            delete_count: AtomicU64::new(0),
+            error_count: AtomicU64::new(0),
+            active_connections: AtomicU32::new(0),
+        })
+    }
+
     /// Record a request with its duration
     pub fn record_request(&self, duration: Duration) {
         self.request_count.fetch_add(1, Ordering::Relaxed);
@@ -123,80 +157,11 @@ impl AppState {
 }
 
 pub async fn run(cfg: Config) -> Result<()> {
+    cfg.validate()?;
     let listener = TcpListener::bind(&cfg.listen_addr).await?;
     tracing::info!(listen_addr = %cfg.listen_addr, "oxidedb listening");
 
-    let state = if let Some(url) = cfg.postgres_url.clone() {
-        match PgStore::connect(&url).await {
-            Ok(pg) => {
-                if let Err(e) = pg.bootstrap().await {
-                    tracing::error!(error = %format!("{e:?}"), "failed to bootstrap metadata");
-                }
-                AppState {
-                    store: Some(pg),
-                    started_at: Instant::now(),
-                    cursors: Mutex::new(HashMap::new()),
-                    shadow: cfg.shadow.as_ref().map(|s| std::sync::Arc::new(s.clone())),
-                    shadow_attempts: std::sync::atomic::AtomicU64::new(0),
-                    shadow_matches: std::sync::atomic::AtomicU64::new(0),
-                    shadow_mismatches: std::sync::atomic::AtomicU64::new(0),
-                    shadow_timeouts: std::sync::atomic::AtomicU64::new(0),
-                    session_manager: std::sync::Arc::new(SessionManager::new()),
-                    request_count: AtomicU64::new(0),
-                    request_duration_ms: AtomicU64::new(0),
-                    query_count: AtomicU64::new(0),
-                    insert_count: AtomicU64::new(0),
-                    update_count: AtomicU64::new(0),
-                    delete_count: AtomicU64::new(0),
-                    error_count: AtomicU64::new(0),
-                    active_connections: AtomicU32::new(0),
-                }
-            }
-            Err(e) => {
-                tracing::error!(error = %format!("{e:?}"), "failed to connect to postgres; continuing without store");
-                AppState {
-                    store: None,
-                    started_at: Instant::now(),
-                    cursors: Mutex::new(HashMap::new()),
-                    shadow: cfg.shadow.as_ref().map(|s| std::sync::Arc::new(s.clone())),
-                    shadow_attempts: std::sync::atomic::AtomicU64::new(0),
-                    shadow_matches: std::sync::atomic::AtomicU64::new(0),
-                    shadow_mismatches: std::sync::atomic::AtomicU64::new(0),
-                    shadow_timeouts: std::sync::atomic::AtomicU64::new(0),
-                    session_manager: std::sync::Arc::new(SessionManager::new()),
-                    request_count: AtomicU64::new(0),
-                    request_duration_ms: AtomicU64::new(0),
-                    query_count: AtomicU64::new(0),
-                    insert_count: AtomicU64::new(0),
-                    update_count: AtomicU64::new(0),
-                    delete_count: AtomicU64::new(0),
-                    error_count: AtomicU64::new(0),
-                    active_connections: AtomicU32::new(0),
-                }
-            }
-        }
-    } else {
-        AppState {
-            store: None,
-            started_at: Instant::now(),
-            cursors: Mutex::new(HashMap::new()),
-            shadow: cfg.shadow.as_ref().map(|s| std::sync::Arc::new(s.clone())),
-            shadow_attempts: std::sync::atomic::AtomicU64::new(0),
-            shadow_matches: std::sync::atomic::AtomicU64::new(0),
-            shadow_mismatches: std::sync::atomic::AtomicU64::new(0),
-            shadow_timeouts: std::sync::atomic::AtomicU64::new(0),
-            session_manager: std::sync::Arc::new(SessionManager::new()),
-            request_count: AtomicU64::new(0),
-            request_duration_ms: AtomicU64::new(0),
-            query_count: AtomicU64::new(0),
-            insert_count: AtomicU64::new(0),
-            update_count: AtomicU64::new(0),
-            delete_count: AtomicU64::new(0),
-            error_count: AtomicU64::new(0),
-            active_connections: AtomicU32::new(0),
-        }
-    };
-    let state = Arc::new(state);
+    let state = Arc::new(AppState::from_config(&cfg).await?);
 
     // Create shutdown channel
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
@@ -325,82 +290,12 @@ pub async fn spawn_with_shutdown(
 )> {
     use tokio::sync::watch;
 
+    cfg.validate()?;
     // Allow ephemeral port usage in tests (e.g., 127.0.0.1:0)
     let listener = TcpListener::bind(&cfg.listen_addr).await?;
     let local_addr = listener.local_addr()?;
 
-    // Build state (mirrors run())
-    let state = if let Some(url) = cfg.postgres_url.clone() {
-        match PgStore::connect(&url).await {
-            Ok(pg) => {
-                if let Err(e) = pg.bootstrap().await {
-                    tracing::error!(error = %format!("{e:?}"), "failed to bootstrap metadata");
-                }
-                AppState {
-                    store: Some(pg),
-                    started_at: Instant::now(),
-                    cursors: Mutex::new(HashMap::new()),
-                    shadow: cfg.shadow.as_ref().map(|s| std::sync::Arc::new(s.clone())),
-                    shadow_attempts: std::sync::atomic::AtomicU64::new(0),
-                    shadow_matches: std::sync::atomic::AtomicU64::new(0),
-                    shadow_mismatches: std::sync::atomic::AtomicU64::new(0),
-                    shadow_timeouts: std::sync::atomic::AtomicU64::new(0),
-                    session_manager: std::sync::Arc::new(SessionManager::new()),
-                    request_count: AtomicU64::new(0),
-                    request_duration_ms: AtomicU64::new(0),
-                    query_count: AtomicU64::new(0),
-                    insert_count: AtomicU64::new(0),
-                    update_count: AtomicU64::new(0),
-                    delete_count: AtomicU64::new(0),
-                    error_count: AtomicU64::new(0),
-                    active_connections: AtomicU32::new(0),
-                }
-            }
-            Err(e) => {
-                tracing::error!(error = %format!("{e:?}"), "failed to connect to postgres; continuing without store");
-                AppState {
-                    store: None,
-                    started_at: Instant::now(),
-                    cursors: Mutex::new(HashMap::new()),
-                    shadow: cfg.shadow.as_ref().map(|s| std::sync::Arc::new(s.clone())),
-                    shadow_attempts: std::sync::atomic::AtomicU64::new(0),
-                    shadow_matches: std::sync::atomic::AtomicU64::new(0),
-                    shadow_mismatches: std::sync::atomic::AtomicU64::new(0),
-                    shadow_timeouts: std::sync::atomic::AtomicU64::new(0),
-                    session_manager: std::sync::Arc::new(SessionManager::new()),
-                    request_count: AtomicU64::new(0),
-                    request_duration_ms: AtomicU64::new(0),
-                    query_count: AtomicU64::new(0),
-                    insert_count: AtomicU64::new(0),
-                    update_count: AtomicU64::new(0),
-                    delete_count: AtomicU64::new(0),
-                    error_count: AtomicU64::new(0),
-                    active_connections: AtomicU32::new(0),
-                }
-            }
-        }
-    } else {
-        AppState {
-            store: None,
-            started_at: Instant::now(),
-            cursors: Mutex::new(HashMap::new()),
-            shadow: cfg.shadow.as_ref().map(|s| std::sync::Arc::new(s.clone())),
-            shadow_attempts: std::sync::atomic::AtomicU64::new(0),
-            shadow_matches: std::sync::atomic::AtomicU64::new(0),
-            shadow_mismatches: std::sync::atomic::AtomicU64::new(0),
-            shadow_timeouts: std::sync::atomic::AtomicU64::new(0),
-            session_manager: std::sync::Arc::new(SessionManager::new()),
-            request_count: AtomicU64::new(0),
-            request_duration_ms: AtomicU64::new(0),
-            query_count: AtomicU64::new(0),
-            insert_count: AtomicU64::new(0),
-            update_count: AtomicU64::new(0),
-            delete_count: AtomicU64::new(0),
-            error_count: AtomicU64::new(0),
-            active_connections: AtomicU32::new(0),
-        }
-    };
-    let state = std::sync::Arc::new(state);
+    let state = Arc::new(AppState::from_config(&cfg).await?);
 
     // Sweeper with shutdown
     let ttl = Duration::from_secs(cfg.cursor_timeout_secs.unwrap_or(300));
@@ -454,10 +349,12 @@ pub async fn spawn_with_shutdown(
                     };
                     tracing::debug!(%addr, "accepted connection");
                     let state = state_accept.clone();
+                    state.increment_connections();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(state, socket).await {
+                        if let Err(e) = handle_connection(state.clone(), socket).await {
                             tracing::debug!(error = %format!("{e:?}"), "connection closed with error");
                         }
+                        state.decrement_connections();
                     });
                 }
                 _ = shutdown_rx.changed() => {
@@ -504,6 +401,14 @@ async fn handle_connection(state: Arc<AppState>, mut socket: TcpStream) -> Resul
             break;
         }
         let body_len = (hdr.message_length as usize).saturating_sub(16);
+        if body_len > MAX_WIRE_MESSAGE_BYTES - 16 {
+            tracing::warn!(
+                message_length = hdr.message_length,
+                max_message_length = MAX_WIRE_MESSAGE_BYTES,
+                "wire message exceeds configured maximum"
+            );
+            break;
+        }
         let mut body = vec![0u8; body_len];
         if body_len > 0 {
             socket.read_exact(&mut body).await?;
@@ -699,9 +604,14 @@ async fn handle_connection(state: Arc<AppState>, mut socket: TcpStream) -> Resul
 }
 
 async fn handle_command(state: &AppState, db: Option<&str>, mut cmd: Document) -> Document {
+    let started_at = Instant::now();
     // command name is the first key in the doc
-    let cmd_name = cmd.iter().next().map(|(k, _)| k.as_str()).unwrap_or("");
-    match cmd_name {
+    let cmd_name = cmd
+        .iter()
+        .next()
+        .map(|(k, _)| k.clone())
+        .unwrap_or_default();
+    let reply = match cmd_name.as_str() {
         "hello" | "ismaster" | "isMaster" => hello_reply(),
         "ping" => doc! { "ok": 1.0 },
         "buildInfo" | "buildinfo" => build_info_reply(),
@@ -734,7 +644,20 @@ async fn handle_command(state: &AppState, db: Option<&str>, mut cmd: Document) -
             tracing::debug!(cmd = ?cmd, "unrecognized command; replying ok:0");
             error_doc(59, format!("Command '{}' not implemented", cmd_name))
         }
+    };
+
+    state.record_request(started_at.elapsed());
+    match cmd_name.as_str() {
+        "find" | "aggregate" | "getMore" => state.record_query(),
+        "insert" => state.record_insert(),
+        "update" | "findAndModify" | "findandmodify" => state.record_update(),
+        "delete" => state.record_delete(),
+        _ => {}
     }
+    if reply.get_f64("ok").unwrap_or(0.0) == 0.0 {
+        state.record_error();
+    }
+    reply
 }
 
 fn hello_reply() -> Document {
@@ -1078,41 +1001,21 @@ async fn insert_reply(state: &AppState, db: Option<&str>, cmd: &mut Document) ->
         }
     };
     if let Some(ref pg) = state.store {
-        // Check if we're in a transaction
-        let in_transaction = if let Some(lsid) = extract_lsid(cmd) {
-            if let Some(autocommit) = extract_autocommit(cmd) {
-                if !autocommit {
-                    if let Some(session_arc) = state.session_manager.get_session(lsid).await {
-                        let session = session_arc.lock().await;
-                        session.in_transaction
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            false
+        let transaction_session = match active_transaction_session(state, cmd).await {
+            Ok(session) => session,
+            Err(error) => return error,
         };
 
         let mut inserted = 0u32;
         let mut write_errors: Vec<Document> = Vec::new();
 
-        if in_transaction {
-            // In transaction - get session and perform all inserts with transaction client
-            if let Some(lsid) = extract_lsid(cmd)
-                && let Some(session_arc) = state.session_manager.get_session(lsid).await
-            {
-                let session = session_arc.lock().await;
-                if let Some(ref client) = session.postgres_client {
-                    for (i, b) in docs_bson.iter().enumerate() {
-                        if let bson::Bson::Document(d0) = b {
-                            let mut d = d0.clone();
-                            ensure_id(&mut d);
-                            match id_bytes(d.get("_id")) {
+        if let Some(session) = transaction_session {
+            if let Some(ref client) = session.postgres_client {
+                for (i, b) in docs_bson.iter().enumerate() {
+                    if let bson::Bson::Document(d0) = b {
+                        let mut d = d0.clone();
+                        ensure_id(&mut d);
+                        match id_bytes(d.get("_id")) {
                                     Some(idb) => {
                                         let json = match serde_json::to_value(&d) {
                                             Ok(v) => v,
@@ -1156,12 +1059,11 @@ async fn insert_reply(state: &AppState, db: Option<&str>, cmd: &mut Document) ->
                                     None => write_errors.push(
                                         doc! {"index": i as i32, "code": 2i32, "errmsg": "unsupported _id type"},
                                     ),
-                                }
-                        } else {
-                            write_errors.push(
-                                    doc! {"index": i as i32, "code": 2i32, "errmsg": "document must be object"},
-                                );
                         }
+                    } else {
+                        write_errors.push(
+                            doc! {"index": i as i32, "code": 2i32, "errmsg": "document must be object"},
+                        );
                     }
                 }
             }
@@ -1227,6 +1129,41 @@ async fn insert_reply(state: &AppState, db: Option<&str>, cmd: &mut Document) ->
     }
 }
 
+async fn active_transaction_session(
+    state: &AppState,
+    cmd: &Document,
+) -> std::result::Result<Option<OwnedMutexGuard<Session>>, Document> {
+    if extract_autocommit(cmd) != Some(false) {
+        return Ok(None);
+    }
+    let lsid = extract_lsid(cmd)
+        .ok_or_else(|| error_doc(ERROR_ILLEGAL_OPERATION, "Missing or invalid lsid"))?;
+    let session = state
+        .session_manager
+        .get_session(lsid)
+        .await
+        .ok_or_else(|| error_doc(ERROR_NO_SUCH_TRANSACTION, "Session not found"))?;
+    let txn_number = extract_txn_number(cmd)
+        .ok_or_else(|| error_doc(ERROR_ILLEGAL_OPERATION, "Missing txnNumber"))?;
+    let session_state = session.lock_owned().await;
+    if !session_state.in_transaction {
+        return Err(error_doc(
+            ERROR_NO_SUCH_TRANSACTION,
+            "No transaction in progress",
+        ));
+    }
+    if txn_number != session_state.txn_number {
+        return Err(error_doc(
+            ERROR_NO_SUCH_TRANSACTION,
+            format!(
+                "Transaction number {} does not match active transaction {}",
+                txn_number, session_state.txn_number
+            ),
+        ));
+    }
+    Ok(Some(session_state))
+}
+
 async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Document {
     let dbname = match db {
         Some(d) => d,
@@ -1250,6 +1187,15 @@ async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
         return error_doc(13, "No storage configured");
     }
     let pg = state.store.as_ref().unwrap();
+    let transaction_session = match active_transaction_session(state, cmd).await {
+        Ok(session) => session,
+        Err(error) => return error,
+    };
+    let transaction_guard = transaction_session;
+    let transaction_client = transaction_guard
+        .as_ref()
+        .and_then(|session| session.postgres_client.as_deref())
+        .map(|client| &**client);
 
     let mut matched_total = 0i32;
     let mut modified_total = 0i32;
@@ -1350,10 +1296,25 @@ async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
 
         if multi {
             // Fetch docs by filter and update each
-            let docs = match pg
-                .find_docs(dbname, coll, Some(&filter), None, None, 10_000)
-                .await
-            {
+            let docs_result = match transaction_client {
+                Some(client) => {
+                    pg.find_docs_with_client(
+                        client,
+                        dbname,
+                        coll,
+                        Some(&filter),
+                        None,
+                        None,
+                        10_000,
+                    )
+                    .await
+                }
+                None => {
+                    pg.find_docs(dbname, coll, Some(&filter), None, None, 10_000)
+                        .await
+                }
+            };
+            let docs = match docs_result {
                 Ok(v) => v,
                 Err(e) => return error_doc(59, format!("find failed: {}", e)),
             };
@@ -1425,7 +1386,21 @@ async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
                         Ok(v) => v,
                         Err(e) => return error_doc(2, e.to_string()),
                     };
-                    match pg.insert_one(dbname, coll, &idb, &bson_bytes, &json).await {
+                    let insert_result = match transaction_client {
+                        Some(client) => {
+                            pg.insert_one_with_client(
+                                client,
+                                dbname,
+                                coll,
+                                &idb,
+                                &bson_bytes,
+                                &json,
+                            )
+                            .await
+                        }
+                        None => pg.insert_one(dbname, coll, &idb, &bson_bytes, &json).await,
+                    };
+                    match insert_result {
                         Ok(n) => {
                             if n == 1 {
                                 matched_total += 1;
@@ -1486,7 +1461,14 @@ async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
                         apply_pull(&mut d, k, v.clone());
                     }
                 }
-                if let Err(e) = pg.update_doc_by_id(dbname, coll, &idb, &d).await {
+                let update_result = match transaction_client {
+                    Some(client) => {
+                        pg.update_doc_by_id_with_client(client, dbname, coll, &idb, &d)
+                            .await
+                    }
+                    None => pg.update_doc_by_id(dbname, coll, &idb, &d).await,
+                };
+                if let Err(e) = update_result {
                     tracing::warn!("update_doc_by_id failed: {}", e);
                 } else {
                     matched_total += 1;
@@ -1497,7 +1479,14 @@ async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
             }
         } else {
             // Single
-            let found = match pg.find_one_for_update(dbname, coll, &filter).await {
+            let found_result = match transaction_client {
+                Some(client) => {
+                    pg.find_one_for_update_with_client(client, dbname, coll, &filter)
+                        .await
+                }
+                None => pg.find_one_for_update(dbname, coll, &filter).await,
+            };
+            let found = match found_result {
                 Ok(v) => v,
                 Err(e) => return error_doc(59, format!("find failed: {}", e)),
             };
@@ -1539,7 +1528,14 @@ async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
                         apply_pull(&mut doc0, k, v.clone());
                     }
                 }
-                match pg.update_doc_by_id(dbname, coll, &idb, &doc0).await {
+                let update_result = match transaction_client {
+                    Some(client) => {
+                        pg.update_doc_by_id_with_client(client, dbname, coll, &idb, &doc0)
+                            .await
+                    }
+                    None => pg.update_doc_by_id(dbname, coll, &idb, &doc0).await,
+                };
+                match update_result {
                     Ok(_n) => {
                         matched_total += 1;
                         if doc0 != orig {
@@ -1614,7 +1610,14 @@ async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
                     Ok(v) => v,
                     Err(e) => return error_doc(2, e.to_string()),
                 };
-                match pg.insert_one(dbname, coll, &idb, &bson_bytes, &json).await {
+                let insert_result = match transaction_client {
+                    Some(client) => {
+                        pg.insert_one_with_client(client, dbname, coll, &idb, &bson_bytes, &json)
+                            .await
+                    }
+                    None => pg.insert_one(dbname, coll, &idb, &bson_bytes, &json).await,
+                };
+                match insert_result {
                     Ok(n) => {
                         if n == 1 {
                             matched_total += 1; // emulate n=1 for upsert
@@ -2356,13 +2359,8 @@ fn cmp_multi(a: &Document, b: &Document, spec: &Document) -> std::cmp::Ordering 
         let dir = match v {
             bson::Bson::Int32(n) => *n,
             bson::Bson::Int64(n) => *n as i32,
-            bson::Bson::Double(f) => {
-                if *f < 0.0 {
-                    -1
-                } else {
-                    1
-                }
-            }
+            bson::Bson::Double(f) if *f < 0.0 => -1,
+            bson::Bson::Double(_) => 1,
             _ => 1,
         };
         let av = get_path_bson_value(a, k);
@@ -3083,15 +3081,13 @@ fn execute_sub_pipeline(
                                 out.push(nd);
                             }
                         }
-                        None | Some(bson::Bson::Null) => {
-                            if preserve {
-                                let mut nd = d.clone();
-                                set_path_nested(&mut nd, &path, bson::Bson::Null);
-                                if let Some(ref fpath) = include {
-                                    set_path_nested(&mut nd, fpath, bson::Bson::Null);
-                                }
-                                out.push(nd);
+                        None | Some(bson::Bson::Null) if preserve => {
+                            let mut nd = d.clone();
+                            set_path_nested(&mut nd, &path, bson::Bson::Null);
+                            if let Some(ref fpath) = include {
+                                set_path_nested(&mut nd, fpath, bson::Bson::Null);
                             }
+                            out.push(nd);
                         }
                         _ => {}
                     }
@@ -3555,13 +3551,37 @@ async fn delete_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
         return error_doc(13, "No storage configured");
     }
     let pg = state.store.as_ref().unwrap();
+    let transaction_session = match active_transaction_session(state, cmd).await {
+        Ok(session) => session,
+        Err(error) => return error,
+    };
+    let transaction_guard = transaction_session;
+    let transaction_client = transaction_guard
+        .as_ref()
+        .and_then(|session| session.postgres_client.as_deref())
+        .map(|client| &**client);
+
     if limit == 0 {
-        match pg.delete_many_by_filter(dbname, coll, &filter).await {
+        let delete_result = match transaction_client {
+            Some(client) => {
+                pg.delete_many_by_filter_with_client(client, dbname, coll, &filter)
+                    .await
+            }
+            None => pg.delete_many_by_filter(dbname, coll, &filter).await,
+        };
+        match delete_result {
             Ok(n) => doc! {"n": (n as i32), "ok": 1.0},
             Err(e) => error_doc(59, format!("delete failed: {}", e)),
         }
     } else if limit == 1 {
-        match pg.delete_one_by_filter(dbname, coll, &filter).await {
+        let delete_result = match transaction_client {
+            Some(client) => {
+                pg.delete_one_by_filter_with_client(client, dbname, coll, &filter)
+                    .await
+            }
+            None => pg.delete_one_by_filter(dbname, coll, &filter).await,
+        };
+        match delete_result {
             Ok(n) => doc! {"n": (n as i32), "ok": 1.0},
             Err(e) => error_doc(59, format!("delete failed: {}", e)),
         }
@@ -3930,6 +3950,42 @@ async fn handle_merge_stage(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn fetch_find_documents(
+    pg: &PgStore,
+    client: Option<&tokio_postgres::Client>,
+    db: &str,
+    coll: &str,
+    filter: Option<&Document>,
+    sort: Option<&Document>,
+    projection: Option<&Document>,
+    limit: i64,
+) -> crate::error::Result<Vec<Document>> {
+    if let Some(id) = filter
+        .and_then(|filter| filter.get("_id"))
+        .and_then(id_bytes_bson)
+    {
+        return match client {
+            Some(client) => {
+                pg.find_by_id_docs_with_client(client, db, coll, &id, limit)
+                    .await
+            }
+            None => pg.find_by_id_docs(db, coll, &id, limit).await,
+        };
+    }
+
+    match client {
+        Some(client) => {
+            pg.find_docs_with_client(client, db, coll, filter, sort, projection, limit)
+                .await
+        }
+        None => {
+            pg.find_docs(db, coll, filter, sort, projection, limit)
+                .await
+        }
+    }
+}
+
 async fn find_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Document {
     let dbname = match db {
         Some(d) => d,
@@ -3949,13 +4005,23 @@ async fn find_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Docum
         .ok()
         .or(cmd.get_i32("batchSize").ok().map(|v| v as i64))
         .unwrap_or(0);
-    let first_batch_limit = if limit > 0 {
-        limit
-    } else if batch_size > 0 {
-        batch_size
-    } else {
-        101
+    if limit > MAX_MATERIALIZED_DOCUMENTS {
+        return error_doc(
+            2,
+            format!(
+                "find limit exceeds in-memory cursor limit of {} documents",
+                MAX_MATERIALIZED_DOCUMENTS
+            ),
+        );
+    }
+    let total_limit = (limit > 0).then_some(limit);
+    let first_batch_limit = match (total_limit, batch_size > 0) {
+        (Some(total), true) => total.min(batch_size),
+        (Some(total), false) => total,
+        (None, true) => batch_size,
+        (None, false) => 101,
     };
+    let fetch_limit = total_limit.unwrap_or(MAX_MATERIALIZED_DOCUMENTS + 1);
     let filter = cmd
         .get_document("filter")
         .ok()
@@ -3964,6 +4030,16 @@ async fn find_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Docum
     let projection = cmd.get_document("projection").ok();
 
     if let Some(ref pg) = state.store {
+        let transaction_session = match active_transaction_session(state, cmd).await {
+            Ok(session) => session,
+            Err(error) => return error,
+        };
+        let transaction_guard = transaction_session;
+        let transaction_client = transaction_guard
+            .as_ref()
+            .and_then(|session| session.postgres_client.as_deref())
+            .map(|client| &**client);
+
         // Check for $text query and handle it specially
         let text_query_result = if let Some(f) = filter {
             match extract_text_search_params(f) {
@@ -3972,26 +4048,36 @@ async fn find_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Docum
                     match pg.get_text_index_fields(dbname, coll).await {
                         Ok(fields) if !fields.is_empty() => {
                             // Route to find_with_text_search
-                            let limit_val = if limit > 0 {
-                                limit
-                            } else if batch_size > 0 {
-                                batch_size
-                            } else {
-                                101
+                            let result = match transaction_client {
+                                Some(client) => {
+                                    pg.find_with_text_search_with_client(
+                                        client,
+                                        dbname,
+                                        coll,
+                                        &search,
+                                        &language,
+                                        case_sensitive,
+                                        diacritic_sensitive,
+                                        fetch_limit,
+                                        &fields,
+                                    )
+                                    .await
+                                }
+                                None => {
+                                    pg.find_with_text_search(
+                                        dbname,
+                                        coll,
+                                        &search,
+                                        &language,
+                                        case_sensitive,
+                                        diacritic_sensitive,
+                                        fetch_limit,
+                                        &fields,
+                                    )
+                                    .await
+                                }
                             };
-                            match pg
-                                .find_with_text_search(
-                                    dbname,
-                                    coll,
-                                    &search,
-                                    &language,
-                                    case_sensitive,
-                                    diacritic_sensitive,
-                                    limit_val * 10,
-                                    &fields,
-                                )
-                                .await
-                            {
+                            match result {
                                 Ok(docs) => {
                                     // Apply remaining filters (non-$text) if any
                                     let mut remaining_doc = f.clone();
@@ -4032,6 +4118,15 @@ async fn find_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Docum
         };
 
         if let Some(docs) = text_query_result {
+            if total_limit.is_none() && docs.len() as i64 > MAX_MATERIALIZED_DOCUMENTS {
+                return error_doc(
+                    2,
+                    format!(
+                        "find result exceeds in-memory cursor limit of {} documents",
+                        MAX_MATERIALIZED_DOCUMENTS
+                    ),
+                );
+            }
             // Process results for $text query (same as normal path)
             let mut first_batch: Vec<Document> = Vec::new();
             let mut remainder: Vec<Document> = Vec::new();
@@ -4059,186 +4154,30 @@ async fn find_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Docum
             return doc! { "ok": 1.0, "cursor": cursor_doc };
         }
 
-        // Check if we're in a transaction
-        let in_transaction = if let Some(lsid) = extract_lsid(cmd) {
-            if let Some(autocommit) = extract_autocommit(cmd) {
-                if !autocommit {
-                    if let Some(session_arc) = state.session_manager.get_session(lsid).await {
-                        let session = session_arc.lock().await;
-                        session.in_transaction
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            false
+        let docs = match fetch_find_documents(
+            pg,
+            transaction_client,
+            dbname,
+            coll,
+            filter,
+            sort,
+            projection,
+            fetch_limit,
+        )
+        .await
+        {
+            Ok(docs) => docs,
+            Err(error) => return error_doc(59, format!("find failed: {}", error)),
         };
-
-        let docs: Vec<Document> = if in_transaction {
-            // In transaction - get session and perform find with transaction client
-            if let Some(lsid) = extract_lsid(cmd) {
-                if let Some(session_arc) = state.session_manager.get_session(lsid).await {
-                    let session = session_arc.lock().await;
-                    if let Some(ref client) = session.postgres_client {
-                        if let Some(f) = filter {
-                            if let Some(idv) = f.get("_id") {
-                                if let Some(idb) = id_bytes_bson(idv) {
-                                    match pg
-                                        .find_by_id_docs_with_client(
-                                            client,
-                                            dbname,
-                                            coll,
-                                            &idb,
-                                            first_batch_limit * 10,
-                                        )
-                                        .await
-                                    {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            tracing::warn!("find_by_id_with_client failed: {}", e);
-                                            Vec::new()
-                                        }
-                                    }
-                                } else {
-                                    match pg
-                                        .find_docs_with_client(
-                                            client,
-                                            dbname,
-                                            coll,
-                                            Some(f),
-                                            sort,
-                                            projection,
-                                            first_batch_limit * 10,
-                                        )
-                                        .await
-                                    {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            tracing::warn!("find_docs_with_client failed: {}", e);
-                                            Vec::new()
-                                        }
-                                    }
-                                }
-                            } else {
-                                match pg
-                                    .find_docs_with_client(
-                                        client,
-                                        dbname,
-                                        coll,
-                                        Some(f),
-                                        sort,
-                                        projection,
-                                        first_batch_limit * 10,
-                                    )
-                                    .await
-                                {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        tracing::warn!("find_docs_with_client failed: {}", e);
-                                        Vec::new()
-                                    }
-                                }
-                            }
-                        } else {
-                            match pg
-                                .find_docs_with_client(
-                                    client,
-                                    dbname,
-                                    coll,
-                                    None,
-                                    sort,
-                                    projection,
-                                    first_batch_limit * 10,
-                                )
-                                .await
-                            {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    tracing::warn!("find_docs_with_client failed: {}", e);
-                                    Vec::new()
-                                }
-                            }
-                        }
-                    } else {
-                        Vec::new()
-                    }
-                } else {
-                    Vec::new()
-                }
-            } else {
-                Vec::new()
-            }
-        } else {
-            // Not in transaction - use pool
-            if let Some(f) = filter {
-                if let Some(idv) = f.get("_id") {
-                    if let Some(idb) = id_bytes_bson(idv) {
-                        match pg
-                            .find_by_id_docs(dbname, coll, &idb, first_batch_limit * 10)
-                            .await
-                        {
-                            Ok(v) => v,
-                            Err(e) => {
-                                tracing::warn!("find_by_id failed: {}", e);
-                                Vec::new()
-                            }
-                        }
-                    } else {
-                        match pg
-                            .find_docs(
-                                dbname,
-                                coll,
-                                Some(f),
-                                sort,
-                                projection,
-                                first_batch_limit * 10,
-                            )
-                            .await
-                        {
-                            Ok(v) => v,
-                            Err(e) => {
-                                tracing::warn!("find_docs failed: {}", e);
-                                Vec::new()
-                            }
-                        }
-                    }
-                } else {
-                    match pg
-                        .find_docs(
-                            dbname,
-                            coll,
-                            Some(f),
-                            sort,
-                            projection,
-                            first_batch_limit * 10,
-                        )
-                        .await
-                    {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::warn!("find_docs failed: {}", e);
-                            Vec::new()
-                        }
-                    }
-                }
-            } else {
-                match pg
-                    .find_docs(dbname, coll, None, sort, projection, first_batch_limit * 10)
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!("find_docs failed: {}", e);
-                        Vec::new()
-                    }
-                }
-            }
-        };
+        if total_limit.is_none() && docs.len() as i64 > MAX_MATERIALIZED_DOCUMENTS {
+            return error_doc(
+                2,
+                format!(
+                    "find result exceeds in-memory cursor limit of {} documents",
+                    MAX_MATERIALIZED_DOCUMENTS
+                ),
+            );
+        }
 
         let mut first_batch: Vec<Document> = Vec::new();
         let mut remainder: Vec<Document> = Vec::new();

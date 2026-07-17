@@ -484,13 +484,8 @@ pub fn build_order_by_with_collation(
             let dir = match v {
                 bson::Bson::Int32(n) => *n,
                 bson::Bson::Int64(n) => *n as i32,
-                bson::Bson::Double(f) => {
-                    if *f < 0.0 {
-                        -1
-                    } else {
-                        1
-                    }
-                }
+                bson::Bson::Double(f) if *f < 0.0 => -1,
+                bson::Bson::Double(_) => 1,
                 _ => 1,
             };
             let ord = if dir < 0 { "DESC" } else { "ASC" };

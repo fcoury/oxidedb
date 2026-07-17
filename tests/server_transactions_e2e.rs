@@ -607,3 +607,381 @@ async fn e2e_transaction_missing_lsid() {
     let _ = shutdown.send(true);
     let _ = handle.await.unwrap();
 }
+
+#[tokio::test]
+async fn e2e_transaction_update_and_delete_abort() {
+    let testdb = match pg::TestDb::provision_from_env().await {
+        Some(db) => db,
+        None => {
+            eprintln!("skipping: set OXIDEDB_TEST_POSTGRES_URL");
+            return;
+        }
+    };
+
+    let mut cfg = Config::default();
+    cfg.listen_addr = "127.0.0.1:0".into();
+    cfg.postgres_url = Some(testdb.url.clone());
+
+    let (_state, addr, shutdown, handle) = spawn_with_shutdown(cfg).await.unwrap();
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let dbname = format!("txn_update_delete_{}", rand_suffix(6));
+    let lsid = create_lsid();
+
+    let create = doc! {"create": "items", "$db": &dbname};
+    stream
+        .write_all(&encode_op_msg(&create, 0, 1))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_one_op_msg(&mut stream)
+            .await
+            .get_f64("ok")
+            .unwrap_or(0.0),
+        1.0
+    );
+
+    let insert = doc! {
+        "insert": "items",
+        "documents": [
+            {"_id": "update-me", "value": 1i32},
+            {"_id": "delete-me", "value": 2i32}
+        ],
+        "$db": &dbname
+    };
+    stream
+        .write_all(&encode_op_msg(&insert, 0, 2))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_one_op_msg(&mut stream).await.get_i32("n").unwrap_or(0),
+        2
+    );
+
+    let start = doc! {
+        "startTransaction": 1i32,
+        "lsid": lsid.clone(),
+        "txnNumber": 1i64,
+        "autocommit": false,
+        "$db": &dbname
+    };
+    stream
+        .write_all(&encode_op_msg(&start, 0, 3))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_one_op_msg(&mut stream)
+            .await
+            .get_f64("ok")
+            .unwrap_or(0.0),
+        1.0
+    );
+
+    let update = doc! {
+        "update": "items",
+        "updates": [{"q": {"_id": "update-me"}, "u": {"$inc": {"value": 10i32}}}],
+        "lsid": lsid.clone(),
+        "txnNumber": 1i64,
+        "autocommit": false,
+        "$db": &dbname
+    };
+    stream
+        .write_all(&encode_op_msg(&update, 0, 4))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_one_op_msg(&mut stream)
+            .await
+            .get_i32("nModified")
+            .unwrap_or(0),
+        1
+    );
+
+    let delete = doc! {
+        "delete": "items",
+        "deletes": [{"q": {"_id": "delete-me"}, "limit": 1i32}],
+        "lsid": lsid.clone(),
+        "txnNumber": 1i64,
+        "autocommit": false,
+        "$db": &dbname
+    };
+    stream
+        .write_all(&encode_op_msg(&delete, 0, 5))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_one_op_msg(&mut stream).await.get_i32("n").unwrap_or(0),
+        1
+    );
+
+    let abort = doc! {
+        "abortTransaction": 1i32,
+        "lsid": lsid,
+        "txnNumber": 1i64,
+        "autocommit": false,
+        "$db": &dbname
+    };
+    stream
+        .write_all(&encode_op_msg(&abort, 0, 6))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_one_op_msg(&mut stream)
+            .await
+            .get_f64("ok")
+            .unwrap_or(0.0),
+        1.0
+    );
+
+    let find = doc! {"find": "items", "filter": {}, "sort": {"_id": 1i32}, "$db": &dbname};
+    stream.write_all(&encode_op_msg(&find, 0, 7)).await.unwrap();
+    let reply = read_one_op_msg(&mut stream).await;
+    let documents = reply
+        .get_document("cursor")
+        .unwrap()
+        .get_array("firstBatch")
+        .unwrap();
+    assert_eq!(documents.len(), 2);
+    let update_me = documents
+        .iter()
+        .filter_map(bson::Bson::as_document)
+        .find(|document| document.get_str("_id") == Ok("update-me"))
+        .unwrap();
+    assert_eq!(update_me.get_i32("value").unwrap(), 1);
+
+    let _ = shutdown.send(true);
+    let _ = handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn e2e_transaction_rejects_mismatched_txn_number_for_crud() {
+    let testdb = match pg::TestDb::provision_from_env().await {
+        Some(db) => db,
+        None => {
+            eprintln!("skipping: set OXIDEDB_TEST_POSTGRES_URL");
+            return;
+        }
+    };
+
+    let mut cfg = Config::default();
+    cfg.listen_addr = "127.0.0.1:0".into();
+    cfg.postgres_url = Some(testdb.url.clone());
+
+    let (_state, addr, shutdown, handle) = spawn_with_shutdown(cfg).await.unwrap();
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let dbname = format!("txn_number_{}", rand_suffix(6));
+    let lsid = create_lsid();
+
+    let create = doc! {"create": "items", "$db": &dbname};
+    stream
+        .write_all(&encode_op_msg(&create, 0, 1))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_one_op_msg(&mut stream)
+            .await
+            .get_f64("ok")
+            .unwrap_or(0.0),
+        1.0
+    );
+
+    let start = doc! {
+        "startTransaction": 1i32,
+        "lsid": lsid.clone(),
+        "txnNumber": 1i64,
+        "autocommit": false,
+        "$db": &dbname
+    };
+    stream
+        .write_all(&encode_op_msg(&start, 0, 2))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_one_op_msg(&mut stream)
+            .await
+            .get_f64("ok")
+            .unwrap_or(0.0),
+        1.0
+    );
+
+    let commands = vec![
+        doc! {
+            "insert": "items",
+            "documents": [{"_id": "wrong-transaction"}],
+            "lsid": lsid.clone(),
+            "txnNumber": 2i64,
+            "autocommit": false,
+            "$db": &dbname
+        },
+        doc! {
+            "find": "items",
+            "filter": {},
+            "lsid": lsid.clone(),
+            "txnNumber": 2i64,
+            "autocommit": false,
+            "$db": &dbname
+        },
+        doc! {
+            "update": "items",
+            "updates": [{"q": {}, "u": {"$set": {"value": 1i32}}}],
+            "lsid": lsid.clone(),
+            "txnNumber": 2i64,
+            "autocommit": false,
+            "$db": &dbname
+        },
+        doc! {
+            "delete": "items",
+            "deletes": [{"q": {}, "limit": 1i32}],
+            "lsid": lsid.clone(),
+            "txnNumber": 2i64,
+            "autocommit": false,
+            "$db": &dbname
+        },
+    ];
+
+    for (index, command) in commands.iter().enumerate() {
+        stream
+            .write_all(&encode_op_msg(command, 0, 3 + index as i32))
+            .await
+            .unwrap();
+        let reply = read_one_op_msg(&mut stream).await;
+        assert_eq!(reply.get_f64("ok").unwrap_or(1.0), 0.0, "{reply:?}");
+        assert_eq!(reply.get_i32("code").unwrap_or_default(), 251, "{reply:?}");
+    }
+
+    let abort = doc! {
+        "abortTransaction": 1i32,
+        "lsid": lsid,
+        "txnNumber": 1i64,
+        "autocommit": false,
+        "$db": &dbname
+    };
+    stream
+        .write_all(&encode_op_msg(&abort, 0, 7))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_one_op_msg(&mut stream)
+            .await
+            .get_f64("ok")
+            .unwrap_or(0.0),
+        1.0
+    );
+
+    let _ = shutdown.send(true);
+    let _ = handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn e2e_transaction_text_find_sees_uncommitted_insert() {
+    let testdb = match pg::TestDb::provision_from_env().await {
+        Some(db) => db,
+        None => {
+            eprintln!("skipping: set OXIDEDB_TEST_POSTGRES_URL");
+            return;
+        }
+    };
+
+    let mut cfg = Config::default();
+    cfg.listen_addr = "127.0.0.1:0".into();
+    cfg.postgres_url = Some(testdb.url.clone());
+
+    let (state, addr, shutdown, handle) = spawn_with_shutdown(cfg).await.unwrap();
+    let dbname = format!("txn_text_{}", rand_suffix(6));
+    let store = state.store.as_ref().unwrap();
+    store.ensure_collection(&dbname, "articles").await.unwrap();
+    store
+        .create_index_text(
+            &dbname,
+            "articles",
+            "title_text",
+            &["title".to_string()],
+            "english",
+            &serde_json::json!({"key": {"title": "text"}, "name": "title_text"}),
+        )
+        .await
+        .unwrap();
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let lsid = create_lsid();
+    let start = doc! {
+        "startTransaction": 1i32,
+        "lsid": lsid.clone(),
+        "txnNumber": 1i64,
+        "autocommit": false,
+        "$db": &dbname
+    };
+    stream
+        .write_all(&encode_op_msg(&start, 0, 1))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_one_op_msg(&mut stream)
+            .await
+            .get_f64("ok")
+            .unwrap_or(0.0),
+        1.0
+    );
+
+    let insert = doc! {
+        "insert": "articles",
+        "documents": [{"_id": "uncommitted", "title": "transaction visibility sentinel"}],
+        "lsid": lsid.clone(),
+        "txnNumber": 1i64,
+        "autocommit": false,
+        "$db": &dbname
+    };
+    stream
+        .write_all(&encode_op_msg(&insert, 0, 2))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_one_op_msg(&mut stream).await.get_i32("n").unwrap_or(0),
+        1
+    );
+
+    let find = doc! {
+        "find": "articles",
+        "filter": {"$text": {"$search": "sentinel"}},
+        "lsid": lsid.clone(),
+        "txnNumber": 1i64,
+        "autocommit": false,
+        "$db": &dbname
+    };
+    stream.write_all(&encode_op_msg(&find, 0, 3)).await.unwrap();
+    let reply = read_one_op_msg(&mut stream).await;
+    assert_eq!(reply.get_f64("ok").unwrap_or(0.0), 1.0, "{reply:?}");
+    let batch = reply
+        .get_document("cursor")
+        .unwrap()
+        .get_array("firstBatch")
+        .unwrap();
+    assert_eq!(batch.len(), 1, "{reply:?}");
+    assert_eq!(
+        batch[0]
+            .as_document()
+            .and_then(|document| document.get_str("_id").ok()),
+        Some("uncommitted")
+    );
+
+    let abort = doc! {
+        "abortTransaction": 1i32,
+        "lsid": lsid,
+        "txnNumber": 1i64,
+        "autocommit": false,
+        "$db": &dbname
+    };
+    stream
+        .write_all(&encode_op_msg(&abort, 0, 4))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_one_op_msg(&mut stream)
+            .await
+            .get_f64("ok")
+            .unwrap_or(0.0),
+        1.0
+    );
+
+    let _ = shutdown.send(true);
+    let _ = handle.await.unwrap();
+}

@@ -4,6 +4,8 @@ use crate::store::PgStore;
 use bson::{Bson, Document};
 use std::collections::HashMap;
 
+const MAX_MATERIALIZED_DOCUMENTS: i64 = 100_000;
+
 /// Execution context for pipeline
 pub struct ExecContext<'a> {
     pub pg: Option<&'a PgStore>,
@@ -77,8 +79,16 @@ pub async fn execute_pipeline(
             && let Some(pg) = ctx.pg
         {
             docs = pg
-                .find_docs(&ctx.db, &ctx.coll, None, None, None, 100_000)
+                .find_docs(
+                    &ctx.db,
+                    &ctx.coll,
+                    None,
+                    None,
+                    None,
+                    MAX_MATERIALIZED_DOCUMENTS + 1,
+                )
                 .await?;
+            ensure_document_limit(&docs)?;
             main_coll_fetched = true;
         }
 
@@ -88,8 +98,16 @@ pub async fn execute_pipeline(
                     // First match - fetch from collection with filter
                     if let Some(pg) = ctx.pg {
                         docs = pg
-                            .find_docs(&ctx.db, &ctx.coll, Some(&filter), None, None, 100_000)
+                            .find_docs(
+                                &ctx.db,
+                                &ctx.coll,
+                                Some(&filter),
+                                None,
+                                None,
+                                MAX_MATERIALIZED_DOCUMENTS + 1,
+                            )
                             .await?;
+                        ensure_document_limit(&docs)?;
                         main_coll_fetched = true;
                     }
                 } else {
@@ -276,6 +294,16 @@ pub async fn execute_pipeline(
     }
 
     Ok(ExecResult::Cursor(docs))
+}
+
+fn ensure_document_limit(docs: &[Document]) -> anyhow::Result<()> {
+    if docs.len() as i64 > MAX_MATERIALIZED_DOCUMENTS {
+        anyhow::bail!(
+            "aggregation input exceeds in-memory limit of {} documents",
+            MAX_MATERIALIZED_DOCUMENTS
+        );
+    }
+    Ok(())
 }
 
 /// Check if document matches filter (simplified)

@@ -50,7 +50,10 @@ impl Config {
                 Ok(cfg) => Ok(cfg),
                 Err(e) => Err(Error::Msg(format!("Failed to parse {}: {}", path, e))),
             },
-            Err(_e) => Ok(Self::default()),
+            Err(error) if path_opt.is_some() => {
+                Err(Error::Msg(format!("Failed to read {}: {}", path, error)))
+            }
+            Err(_) => Ok(Self::default()),
         }
     }
 

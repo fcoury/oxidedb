@@ -106,9 +106,33 @@ async fn e2e_cursors_find_getmore_kill() {
     assert_eq!(next_batch2.len(), 1);
     assert_eq!(id3, 0);
 
+    // A total limit must apply across the first batch and getMore calls.
+    let limited_find =
+        doc! {"find": "u", "filter": {}, "limit": 3i64, "batchSize": 2i32, "$db": &dbname};
+    stream
+        .write_all(&encode_op_msg(&limited_find, 0, 6))
+        .await
+        .unwrap();
+    let doc = read_one_op_msg(&mut stream).await;
+    let cursor = doc.get_document("cursor").unwrap();
+    let limited_id = cursor.get_i64("id").unwrap();
+    assert_eq!(cursor.get_array("firstBatch").unwrap().len(), 2);
+    assert_ne!(limited_id, 0);
+
+    let limited_get_more =
+        doc! {"getMore": limited_id, "collection": "u", "batchSize": 10i32, "$db": &dbname};
+    stream
+        .write_all(&encode_op_msg(&limited_get_more, 0, 7))
+        .await
+        .unwrap();
+    let doc = read_one_op_msg(&mut stream).await;
+    let cursor = doc.get_document("cursor").unwrap();
+    assert_eq!(cursor.get_array("nextBatch").unwrap().len(), 1);
+    assert_eq!(cursor.get_i64("id").unwrap(), 0);
+
     // New cursor to test killCursors
     let find2 = doc! {"find": "u", "filter": {}, "batchSize": 1i32, "$db": &dbname};
-    let msg = encode_op_msg(&find2, 0, 6);
+    let msg = encode_op_msg(&find2, 0, 8);
     stream.write_all(&msg).await.unwrap();
     let doc = read_one_op_msg(&mut stream).await;
     let cursor = doc.get_document("cursor").unwrap();

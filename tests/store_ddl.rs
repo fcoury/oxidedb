@@ -36,8 +36,24 @@ async fn create_drop_collection_and_database_updates_metadata() {
     let cols = store.list_collections("testdb").await.expect("list colls");
     assert!(!cols.iter().any(|c| c == "c1"));
 
+    // Recreate after drop to verify the positive cache was invalidated.
+    store
+        .ensure_collection("testdb", "c1")
+        .await
+        .expect("recreate collection");
+    let cols = store.list_collections("testdb").await.expect("list colls");
+    assert!(cols.iter().any(|c| c == "c1"));
+
     // Drop database and verify metadata updated
     store.drop_database("testdb").await.expect("drop db");
     let dbs = store.list_databases().await.expect("list dbs");
     assert!(!dbs.iter().any(|d| d == "testdb"));
+
+    // Recreate after dropping the database for the same cache-invalidation case.
+    store
+        .ensure_collection("testdb", "c2")
+        .await
+        .expect("recreate database");
+    let cols = store.list_collections("testdb").await.expect("list colls");
+    assert!(cols.iter().any(|c| c == "c2"));
 }
