@@ -1097,6 +1097,35 @@ impl PgStore {
         limit: i64,
         fields: &[String],
     ) -> Result<Vec<bson::Document>> {
+        let client = self.pool.get().await.map_err(err_msg)?;
+        self.find_with_text_search_with_client(
+            &client,
+            db,
+            coll,
+            search_text,
+            language,
+            _case_sensitive,
+            _diacritic_sensitive,
+            limit,
+            fields,
+        )
+        .await
+    }
+
+    /// Find documents using full-text search on a session-pinned connection.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn find_with_text_search_with_client(
+        &self,
+        client: &tokio_postgres::Client,
+        db: &str,
+        coll: &str,
+        search_text: &str,
+        language: &str,
+        _case_sensitive: bool,
+        _diacritic_sensitive: bool,
+        limit: i64,
+        fields: &[String],
+    ) -> Result<Vec<bson::Document>> {
         let schema = schema_name(db);
         let q_schema = q_ident(&schema);
         let q_table = q_ident(coll);
@@ -1153,7 +1182,6 @@ impl PgStore {
             q_schema, q_table, safe_language, tsvector_expr, safe_language, escaped_search, limit
         );
 
-        let client = self.pool.get().await.map_err(err_msg)?;
         let rows = client.query(&sql, &[]).await.map_err(err_msg)?;
 
         let mut results = Vec::with_capacity(rows.len());
@@ -1985,13 +2013,8 @@ fn build_order_by(sort: Option<&bson::Document>) -> String {
             let dir = match v {
                 bson::Bson::Int32(n) => *n,
                 bson::Bson::Int64(n) => *n as i32,
-                bson::Bson::Double(f) => {
-                    if *f < 0.0 {
-                        -1
-                    } else {
-                        1
-                    }
-                }
+                bson::Bson::Double(f) if *f < 0.0 => -1,
+                bson::Bson::Double(_) => 1,
                 _ => 1,
             };
             let ord = if dir < 0 { "DESC" } else { "ASC" };

@@ -33,7 +33,7 @@ const MAX_MATERIALIZED_DOCUMENTS: i64 = 100_000;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 struct CursorEntry {
     ns: String,
@@ -1010,7 +1010,6 @@ async fn insert_reply(state: &AppState, db: Option<&str>, cmd: &mut Document) ->
         let mut write_errors: Vec<Document> = Vec::new();
 
         if let Some(session) = transaction_session {
-            let session = session.lock().await;
             if let Some(ref client) = session.postgres_client {
                 for (i, b) in docs_bson.iter().enumerate() {
                     if let bson::Bson::Document(d0) = b {
@@ -1133,7 +1132,7 @@ async fn insert_reply(state: &AppState, db: Option<&str>, cmd: &mut Document) ->
 async fn active_transaction_session(
     state: &AppState,
     cmd: &Document,
-) -> std::result::Result<Option<Arc<Mutex<Session>>>, Document> {
+) -> std::result::Result<Option<OwnedMutexGuard<Session>>, Document> {
     if extract_autocommit(cmd) != Some(false) {
         return Ok(None);
     }
@@ -1144,14 +1143,25 @@ async fn active_transaction_session(
         .get_session(lsid)
         .await
         .ok_or_else(|| error_doc(ERROR_NO_SUCH_TRANSACTION, "Session not found"))?;
-    let in_transaction = session.lock().await.in_transaction;
-    if !in_transaction {
+    let txn_number = extract_txn_number(cmd)
+        .ok_or_else(|| error_doc(ERROR_ILLEGAL_OPERATION, "Missing txnNumber"))?;
+    let session_state = session.lock_owned().await;
+    if !session_state.in_transaction {
         return Err(error_doc(
             ERROR_NO_SUCH_TRANSACTION,
             "No transaction in progress",
         ));
     }
-    Ok(Some(session))
+    if txn_number != session_state.txn_number {
+        return Err(error_doc(
+            ERROR_NO_SUCH_TRANSACTION,
+            format!(
+                "Transaction number {} does not match active transaction {}",
+                txn_number, session_state.txn_number
+            ),
+        ));
+    }
+    Ok(Some(session_state))
 }
 
 async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Document {
@@ -1181,10 +1191,7 @@ async fn update_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
         Ok(session) => session,
         Err(error) => return error,
     };
-    let transaction_guard = match transaction_session.as_ref() {
-        Some(session) => Some(session.lock().await),
-        None => None,
-    };
+    let transaction_guard = transaction_session;
     let transaction_client = transaction_guard
         .as_ref()
         .and_then(|session| session.postgres_client.as_deref())
@@ -2352,13 +2359,8 @@ fn cmp_multi(a: &Document, b: &Document, spec: &Document) -> std::cmp::Ordering 
         let dir = match v {
             bson::Bson::Int32(n) => *n,
             bson::Bson::Int64(n) => *n as i32,
-            bson::Bson::Double(f) => {
-                if *f < 0.0 {
-                    -1
-                } else {
-                    1
-                }
-            }
+            bson::Bson::Double(f) if *f < 0.0 => -1,
+            bson::Bson::Double(_) => 1,
             _ => 1,
         };
         let av = get_path_bson_value(a, k);
@@ -3079,15 +3081,13 @@ fn execute_sub_pipeline(
                                 out.push(nd);
                             }
                         }
-                        None | Some(bson::Bson::Null) => {
-                            if preserve {
-                                let mut nd = d.clone();
-                                set_path_nested(&mut nd, &path, bson::Bson::Null);
-                                if let Some(ref fpath) = include {
-                                    set_path_nested(&mut nd, fpath, bson::Bson::Null);
-                                }
-                                out.push(nd);
+                        None | Some(bson::Bson::Null) if preserve => {
+                            let mut nd = d.clone();
+                            set_path_nested(&mut nd, &path, bson::Bson::Null);
+                            if let Some(ref fpath) = include {
+                                set_path_nested(&mut nd, fpath, bson::Bson::Null);
                             }
+                            out.push(nd);
                         }
                         _ => {}
                     }
@@ -3555,10 +3555,7 @@ async fn delete_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Doc
         Ok(session) => session,
         Err(error) => return error,
     };
-    let transaction_guard = match transaction_session.as_ref() {
-        Some(session) => Some(session.lock().await),
-        None => None,
-    };
+    let transaction_guard = transaction_session;
     let transaction_client = transaction_guard
         .as_ref()
         .and_then(|session| session.postgres_client.as_deref())
@@ -4033,6 +4030,16 @@ async fn find_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Docum
     let projection = cmd.get_document("projection").ok();
 
     if let Some(ref pg) = state.store {
+        let transaction_session = match active_transaction_session(state, cmd).await {
+            Ok(session) => session,
+            Err(error) => return error,
+        };
+        let transaction_guard = transaction_session;
+        let transaction_client = transaction_guard
+            .as_ref()
+            .and_then(|session| session.postgres_client.as_deref())
+            .map(|client| &**client);
+
         // Check for $text query and handle it specially
         let text_query_result = if let Some(f) = filter {
             match extract_text_search_params(f) {
@@ -4041,19 +4048,36 @@ async fn find_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Docum
                     match pg.get_text_index_fields(dbname, coll).await {
                         Ok(fields) if !fields.is_empty() => {
                             // Route to find_with_text_search
-                            match pg
-                                .find_with_text_search(
-                                    dbname,
-                                    coll,
-                                    &search,
-                                    &language,
-                                    case_sensitive,
-                                    diacritic_sensitive,
-                                    fetch_limit,
-                                    &fields,
-                                )
-                                .await
-                            {
+                            let result = match transaction_client {
+                                Some(client) => {
+                                    pg.find_with_text_search_with_client(
+                                        client,
+                                        dbname,
+                                        coll,
+                                        &search,
+                                        &language,
+                                        case_sensitive,
+                                        diacritic_sensitive,
+                                        fetch_limit,
+                                        &fields,
+                                    )
+                                    .await
+                                }
+                                None => {
+                                    pg.find_with_text_search(
+                                        dbname,
+                                        coll,
+                                        &search,
+                                        &language,
+                                        case_sensitive,
+                                        diacritic_sensitive,
+                                        fetch_limit,
+                                        &fields,
+                                    )
+                                    .await
+                                }
+                            };
+                            match result {
                                 Ok(docs) => {
                                     // Apply remaining filters (non-$text) if any
                                     let mut remaining_doc = f.clone();
@@ -4130,18 +4154,6 @@ async fn find_reply(state: &AppState, db: Option<&str>, cmd: &Document) -> Docum
             return doc! { "ok": 1.0, "cursor": cursor_doc };
         }
 
-        let transaction_session = match active_transaction_session(state, cmd).await {
-            Ok(session) => session,
-            Err(error) => return error,
-        };
-        let transaction_guard = match transaction_session.as_ref() {
-            Some(session) => Some(session.lock().await),
-            None => None,
-        };
-        let transaction_client = transaction_guard
-            .as_ref()
-            .and_then(|session| session.postgres_client.as_deref())
-            .map(|client| &**client);
         let docs = match fetch_find_documents(
             pg,
             transaction_client,
