@@ -345,11 +345,8 @@ pub(crate) fn document_matches_filter(
                         }
                     }
                 }
-                "$expr" => {
-                    if !eval_match_expr(doc, value, vars) {
-                        return false;
-                    }
-                }
+                "$expr" if !eval_match_expr(doc, value, vars) => return false,
+                "$expr" => {}
                 _ => {}
             }
         } else {

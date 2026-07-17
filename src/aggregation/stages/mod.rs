@@ -9,7 +9,6 @@ pub mod geo_near;
 pub mod group;
 pub mod limit;
 pub mod lookup;
-pub mod match_stage;
 pub mod merge;
 pub mod out;
 pub mod project;
