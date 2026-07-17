@@ -244,54 +244,52 @@ impl SessionManager {
 
     /// End (remove) a session
     pub async fn end_session(&self, lsid: Uuid) {
-        let mut sessions = self.sessions.lock().await;
-        if let Some(session) = sessions.remove(&lsid) {
-            // Abort any in-progress transaction
-            if let Ok(mut s) = session.try_lock()
-                && s.in_transaction
+        let session = self.sessions.lock().await.remove(&lsid);
+        if let Some(session) = session {
+            let mut session = session.lock().await;
+            if session.in_transaction
+                && let Err(error) = session.abort_transaction().await
             {
-                #[allow(clippy::let_underscore_future)]
-                let _ = s.abort_transaction();
+                tracing::warn!(%lsid, %error, "failed to abort transaction while ending session");
             }
         }
     }
 
     /// Clean up expired sessions
     pub async fn cleanup_expired_sessions(&self) -> usize {
-        let mut sessions = self.sessions.lock().await;
-        let before_count = sessions.len();
+        let expired_sessions = {
+            let mut sessions = self.sessions.lock().await;
+            let expired_ids: Vec<Uuid> = sessions
+                .iter()
+                .filter_map(|(id, session)| {
+                    let session = session.try_lock().ok()?;
+                    let session_expired = session.is_expired(self.timeout);
+                    let transaction_expired = session.in_transaction
+                        && session.is_transaction_expired(self.transaction_timeout);
+                    (session_expired || transaction_expired).then_some(*id)
+                })
+                .collect();
 
-        // Collect expired session IDs
-        let expired: Vec<Uuid> = sessions
-            .iter()
-            .filter(|(_, session)| {
-                if let Ok(s) = session.try_lock() {
-                    // Check if session has expired
-                    if s.is_expired(self.timeout) {
-                        return true;
-                    }
-                    // Check if transaction has expired
-                    if s.in_transaction && s.is_transaction_expired(self.transaction_timeout) {
-                        return true;
-                    }
-                }
-                false
-            })
-            .map(|(id, _)| *id)
-            .collect();
+            expired_ids
+                .into_iter()
+                .filter_map(|id| sessions.remove(&id).map(|session| (id, session)))
+                .collect::<Vec<_>>()
+        };
 
-        // Remove expired sessions
-        for id in &expired {
-            if let Some(session) = sessions.remove(id)
-                && let Ok(mut s) = session.try_lock()
-                && s.in_transaction
+        for (lsid, session) in &expired_sessions {
+            let mut session = session.lock().await;
+            if session.in_transaction
+                && let Err(error) = session.abort_transaction().await
             {
-                #[allow(clippy::let_underscore_future)]
-                let _ = s.abort_transaction();
+                tracing::warn!(
+                    %lsid,
+                    %error,
+                    "failed to abort transaction while cleaning expired session"
+                );
             }
         }
 
-        before_count - sessions.len()
+        expired_sessions.len()
     }
 
     /// Get the number of active sessions

@@ -33,9 +33,7 @@ async fn main() -> anyhow::Result<()> {
         .compact()
         .init();
 
-    if let Err(e) = cfg_file_res.as_ref() {
-        tracing::warn!(error = %format!("{e:?}"), "invalid config; using defaults");
-    }
+    let cfg_file = cfg_file_res?;
 
     // Load from config file (if present), then override with CLI/env.
     let cfg = cfg_file.with_overrides(
@@ -48,13 +46,10 @@ async fn main() -> anyhow::Result<()> {
         cli.shadow_timeout_ms,
         cli.shadow_sample_rate,
     );
+    cfg.validate()?;
     tracing::info!(listen_addr = %cfg.listen_addr, "starting oxidedb");
 
-    if let Err(e) = server::run(cfg).await {
-        tracing::error!(error = %format!("{e:?}"), "server terminated with error");
-    }
-
-    Ok(())
+    server::run(cfg).await.map_err(Into::into)
 }
 
 #[derive(Debug, Parser, Clone)]
