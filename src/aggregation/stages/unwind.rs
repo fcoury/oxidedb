@@ -52,32 +52,25 @@ pub fn execute(
 
                 result.push(new_doc);
             }
-            Some(_) if preserve_null_and_empty_arrays => {
-                // Non-array value - treat as single-element array
-                result.push(doc);
-            }
-            None if preserve_null_and_empty_arrays => {
-                // Missing field - preserve as null
-                let mut new_doc = doc.clone();
-                set_field_by_path(&mut new_doc, field_path, Bson::Null);
+            Some(Bson::Array(_)) | Some(Bson::Null) | None => {
+                if preserve_null_and_empty_arrays {
+                    // Missing field or null - preserve as null
+                    let mut new_doc = doc.clone();
+                    set_field_by_path(&mut new_doc, field_path, Bson::Null);
 
-                if let Some(index_field) = include_array_index {
-                    new_doc.insert(index_field, Bson::Null);
+                    if let Some(index_field) = include_array_index {
+                        new_doc.insert(index_field, Bson::Null);
+                    }
+
+                    result.push(new_doc);
                 }
-
-                result.push(new_doc);
-            }
-            Some(Bson::Array(_)) | None => {
-                // Skip documents with empty arrays or missing fields
-                // when preserve_null_and_empty_arrays is false
+                // Otherwise: skip documents with empty arrays, nulls or
+                // missing fields
             }
             Some(_) => {
-                // Non-array value and preserve is false - error
-                return Err(anyhow::anyhow!(
-                    "$unwind field '{}' must be an array, got {:?}",
-                    field_path,
-                    field_val
-                ));
+                // Non-array scalar: treated as a single-element array, so the
+                // document passes through unchanged (MongoDB >= 3.2)
+                result.push(doc);
             }
         }
     }
@@ -125,4 +118,42 @@ fn set_field_by_path(doc: &mut Document, path: &str, value: Bson) {
 
     // Set the final field
     current.insert(parts[parts.len() - 1].to_string(), value);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::execute;
+    use bson::{Bson, doc};
+
+    #[test]
+    fn non_array_scalar_passes_through() {
+        let docs = vec![doc! { "_id": 1, "v": 42i32 }];
+        let out = execute(docs, "$v", None, false).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].get_i32("v").unwrap(), 42);
+    }
+
+    #[test]
+    fn null_field_dropped_without_preserve() {
+        let docs = vec![doc! { "_id": 1, "v": Bson::Null }];
+        let out = execute(docs, "$v", None, false).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn null_field_kept_with_preserve() {
+        let docs = vec![doc! { "_id": 1, "v": Bson::Null }];
+        let out = execute(docs, "$v", None, true).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains_key("v"));
+    }
+
+    #[test]
+    fn array_still_unwinds() {
+        let docs = vec![doc! { "_id": 1, "v": [1i32, 2i32] }];
+        let out = execute(docs, "$v", None, false).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].get_i32("v").unwrap(), 1);
+        assert_eq!(out[1].get_i32("v").unwrap(), 2);
+    }
 }

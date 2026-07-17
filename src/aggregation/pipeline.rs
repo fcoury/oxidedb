@@ -114,8 +114,6 @@ impl Pipeline {
             .map_err(|_| anyhow::anyhow!("aggregate command requires pipeline array"))?;
 
         let mut stages = Vec::new();
-        #[allow(unused_variables)]
-        let _has_geo_near = false;
         let mut has_out = false;
         let mut has_merge = false;
         let mut has_facet = false;

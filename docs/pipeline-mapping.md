@@ -1,5 +1,12 @@
 # Aggregation Pipeline Mapping (MongoDB → PostgreSQL)
 
+> **Status: design reference, not current behavior.**
+> The runtime aggregation executor runs stages in memory in Rust
+> (`src/aggregation/exec.rs`); the only SQL pushdown today is a **first-stage
+> `$match`**, which is translated to a WHERE clause by the shared filter
+> translation in `src/translate.rs`. This document describes a possible future
+> SQL-pushdown design and the semantic edge cases it would need to handle.
+
 This document details how each MongoDB aggregation stage and common expressions map to PostgreSQL constructs when using `jsonb` as the primary storage format. It also calls out edge cases, semantic gaps, and when the execution will fall back to the in-engine pipeline executor instead of SQL pushdown.
 
 Legend:

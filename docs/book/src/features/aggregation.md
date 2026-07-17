@@ -1,6 +1,6 @@
 # Aggregation Pipeline
 
-The aggregation pipeline is a powerful framework for data aggregation and transformation. OxideDB translates aggregation stages into PostgreSQL SQL queries when possible, falling back to in-memory processing for complex operations.
+The aggregation pipeline is a powerful framework for data aggregation and transformation. OxideDB executes pipeline stages in memory in document order. When the pipeline starts with a `$match` stage, that filter is pushed down to a PostgreSQL WHERE clause so only matching documents are read.
 
 ## Pipeline Overview
 
@@ -39,7 +39,7 @@ db.orders.aggregate([
 ])
 ```
 
-**Execution:** SQL pushdown to PostgreSQL WHERE clause
+**Execution:** SQL pushdown to a PostgreSQL WHERE clause when it is the first pipeline stage; subsequent `$match` stages filter in memory
 
 ### $project (Projection)
 
@@ -80,7 +80,7 @@ db.orders.aggregate([
 ])
 ```
 
-**Execution:** SQL pushdown when using simple field inclusion/exclusion
+**Execution:** In-memory
 
 ### $sort (Sorting)
 
@@ -104,7 +104,7 @@ db.products.aggregate([
 ])
 ```
 
-**Execution:** SQL pushdown to ORDER BY clause
+**Execution:** In-memory sort
 
 ### $limit (Limit)
 
@@ -125,7 +125,7 @@ db.users.aggregate([
 ])
 ```
 
-**Execution:** SQL pushdown to LIMIT clause
+**Execution:** In-memory
 
 ### $skip (Skip)
 
@@ -140,7 +140,7 @@ db.users.aggregate([
 ])
 ```
 
-**Execution:** SQL pushdown to OFFSET clause
+**Execution:** In-memory
 
 ### $group (Grouping)
 
@@ -195,7 +195,7 @@ db.users.aggregate([
 ])
 ```
 
-**Execution:** SQL pushdown with GROUP BY and aggregate functions
+**Execution:** In-memory grouping
 
 ### $unwind (Unwind Arrays)
 
@@ -226,7 +226,7 @@ db.users.aggregate([
 ])
 ```
 
-**Execution:** SQL pushdown using LATERAL JOIN with jsonb_array_elements
+**Execution:** In-memory
 
 ### $lookup (Join)
 
@@ -264,7 +264,7 @@ db.orders.aggregate([
 ])
 ```
 
-**Execution:** Engine execution (SQL join optimization planned)
+**Execution:** Engine execution; equality joins issue one query per input document
 
 ### $addFields (Add Fields)
 
@@ -294,7 +294,7 @@ db.users.aggregate([
 ])
 ```
 
-**Execution:** SQL pushdown when using supported expressions
+**Execution:** In-memory expression evaluation
 
 ### $replaceRoot (Replace Root)
 
@@ -321,7 +321,7 @@ db.orders.aggregate([
 ])
 ```
 
-**Execution:** SQL pushdown with jsonb_build_object
+**Execution:** In-memory
 
 ### $count (Count)
 
@@ -342,7 +342,7 @@ db.orders.aggregate([
 ])
 ```
 
-**Execution:** SQL pushdown with COUNT(*)
+**Execution:** In-memory
 
 ### $sample (Random Sample)
 
@@ -361,7 +361,7 @@ db.products.aggregate([
 ])
 ```
 
-**Execution:** SQL pushdown with ORDER BY random() LIMIT
+**Execution:** In-memory
 
 ### $facet (Multi-Faceted Aggregation)
 
@@ -777,42 +777,37 @@ db.orders.aggregate([
 ])
 ```
 
-## SQL Pushdown vs Engine Execution
+## Execution Model
 
-### SQL Pushdown Stages
+### SQL pushdown
 
-These stages are translated directly to PostgreSQL SQL:
+A `$match` stage is pushed down to a PostgreSQL WHERE clause only when it is the **first** stage of the pipeline. In that case the filter is translated to SQL and only matching documents are read from the collection (indexes apply as usual).
 
-| Stage | SQL Equivalent | Performance |
-|-------|---------------|-------------|
-| $match | WHERE clause | Fast - uses indexes |
-| $project | SELECT with jsonb_build_object | Fast |
-| $sort | ORDER BY | Fast - uses indexes |
-| $limit | LIMIT | Fast |
-| $skip | OFFSET | Fast |
-| $group | GROUP BY with aggregates | Fast |
-| $unwind | LATERAL JOIN | Medium |
-| $sample | ORDER BY random() LIMIT | Medium |
+All other stages execute in memory: documents are read from the collection once and then transformed stage by stage by the OxideDB engine.
 
-### Engine Execution Stages
+### In-memory stages
 
-These stages require in-memory processing:
+These stages process documents in memory:
 
-| Stage | Reason | Performance |
-|-------|--------|-------------|
-| $facet | Multiple parallel pipelines | Slower |
-| $unionWith | UNION ALL between collections | Medium |
-| $lookup | Cross-collection joins | Medium |
-| $out | Write to new collection | Slow |
-| $merge | Upsert operations | Slow |
-| $bucket | Complex bucketing logic | Medium |
+| Stage | Notes |
+|-------|-------|
+| $match (after the first stage) | Filtered by the engine matcher |
+| $project / $addFields / $set / $unset | Expression evaluation per document |
+| $sort / $limit / $skip | Full result set is materialized for sorting |
+| $group / $bucket / $bucketAuto / $sortByCount | Hash-based grouping |
+| $unwind | Array expansion per document |
+| $lookup | One foreign query per input document (equality form) |
+| $sample | Random selection from the materialized set |
+| $facet | Sub-pipelines run in memory over the same input |
+| $unionWith | Reads the union collection and concatenates |
+| $out / $merge | Buffered writes to the target collection |
 
 ### Optimization Tips
 
-1. **Order matters**: Place `$match` early to filter data
-2. **Use indexes**: Create indexes on fields used in `$match` and `$sort`
+1. **Order matters**: Place `$match` first so it runs in PostgreSQL and reduces the data read
+2. **Use indexes**: Create indexes on fields used in the first `$match`
 3. **Minimize data**: Use `$project` early to reduce document size
-4. **Avoid engine stages**: Use SQL pushdown stages when possible
+4. **Be mindful of memory**: Everything after the first stage is buffered in memory, so large collections need an early `$match` and/or `$limit`
 
 ```javascript
 // Good: Filter first, then process

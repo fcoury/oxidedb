@@ -1,4 +1,6 @@
-use crate::aggregation::exec::document_matches_filter;
+use crate::aggregation::exec::{
+    MATERIALIZED_FETCH_LIMIT, document_matches_filter, ensure_document_limit,
+};
 use crate::aggregation::pipeline::Stage;
 use crate::store::PgStore;
 use bson::{Bson, Document};
@@ -15,14 +17,17 @@ pub async fn execute(
     let mut result = docs;
 
     // Fetch documents from the other collection
-    let union_docs = pg.find_docs(db, coll, None, None, None, 100_000).await?;
+    let union_docs = pg
+        .find_docs(db, coll, None, None, None, MATERIALIZED_FETCH_LIMIT)
+        .await?;
+    ensure_document_limit(&union_docs)?;
 
     // Apply optional pipeline to the union collection documents
     let mut processed_union = union_docs;
     for stage in pipeline {
         match stage {
             Stage::Match(filter) => {
-                processed_union.retain(|d| document_matches_filter(d, filter));
+                processed_union.retain(|d| document_matches_filter(d, filter, vars));
             }
             Stage::Project(spec) => {
                 processed_union =

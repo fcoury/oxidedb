@@ -100,8 +100,18 @@ pub async fn execute(
     let docs = if docs.is_empty() {
         // Build query filter if specified
         let filter = spec.query.clone();
-        pg.find_docs(db, coll, filter.as_ref(), None, None, 100_000)
-            .await?
+        let docs = pg
+            .find_docs(
+                db,
+                coll,
+                filter.as_ref(),
+                None,
+                None,
+                crate::aggregation::exec::MATERIALIZED_FETCH_LIMIT,
+            )
+            .await?;
+        crate::aggregation::exec::ensure_document_limit(&docs)?;
+        docs
     } else {
         docs
     };

@@ -18,7 +18,7 @@ pub fn execute(
         for stage in stages {
             match stage {
                 Stage::Match(filter) => {
-                    facet_docs.retain(|d| document_matches_filter(d, filter));
+                    facet_docs.retain(|d| document_matches_filter(d, filter, vars));
                 }
                 Stage::Project(spec) => {
                     facet_docs =
